@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import sys
 from enum import Enum
 from typing import Optional
@@ -77,14 +78,20 @@ def get_api_url() -> str:
 
 def save_api_key(api_key: str, api_url: str | None = None) -> str:
     """Save API key to config file. Returns the path saved to."""
-    os.makedirs(CONFIG_DIR, exist_ok=True)
+    os.makedirs(CONFIG_DIR, mode=0o700, exist_ok=True)
 
     # Use provided URL or default
     url_to_save = api_url or DEFAULT_API_URL
 
-    with open(CONFIG_PATH, "w") as f:
-        f.write(f"export TURINGMIND_API_KEY={api_key}\n")
-        f.write(f"export TURINGMIND_API_URL={url_to_save}\n")
+    # Write config file with restrictive permissions (0600 = owner read/write only)
+    config_content = f"export TURINGMIND_API_KEY={api_key}\nexport TURINGMIND_API_URL={url_to_save}\n"
+    
+    # Use os.open with explicit permissions for security
+    fd = os.open(CONFIG_PATH, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.write(fd, config_content.encode())
+    finally:
+        os.close(fd)
 
     # Also set in environment for current session
     os.environ["TURINGMIND_API_KEY"] = api_key
@@ -513,13 +520,13 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                             text=(
                                 f"✅ **Login Successful!**\n\n"
                                 f"API key has been saved to `{config_path}`\n\n"
-                                f"**API Key:** `{access_token[:20]}...`\n\n"
+                                f"**API Key:** `{access_token[:8]}...{access_token[-4:]}`\n\n"
                                 f"Cloud features are now enabled. You can use:\n"
                                 f"- `turingmind_validate_auth` - Check account status\n"
                                 f"- `turingmind_upload_review` - Upload reviews\n"
                                 f"- `turingmind_get_context` - Get memory context\n"
                                 f"- `turingmind_submit_feedback` - Report false positives\n\n"
-                                f"**Full API Key (for manual config):**\n```\n{access_token}\n```"
+                                f"To view your full API key, run: `cat ~/.turingmind/config`"
                             ),
                         )
                     ]
@@ -633,6 +640,15 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                         )
                     ]
 
+                # Validate repo format (owner/repo)
+                if not re.match(r"^[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+$", review.repo):
+                    return [
+                        TextContent(
+                            type="text",
+                            text=f"❌ **Invalid repo format:** `{review.repo}`\n\nExpected format: `owner/repo`"
+                        )
+                    ]
+
                 # Count issues by severity for auto-summary
                 issues = review.issues or []
                 auto_summary = {
@@ -724,6 +740,15 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                     return [
                         TextContent(type="text", text="❌ **Missing required field:** `repo`")
                     ]
+                
+                # Validate repo format (owner/repo) to prevent path traversal
+                if not re.match(r"^[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+$", repo):
+                    return [
+                        TextContent(
+                            type="text",
+                            text=f"❌ **Invalid repo format:** `{repo}`\n\nExpected format: `owner/repo`"
+                        )
+                    ]
 
                 logger.info(f"Fetching context for {repo}")
 
@@ -809,6 +834,15 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                         TextContent(
                             type="text",
                             text=f"❌ **Invalid input:** {e}\n\nRequired fields: `issue_id`, `action`, `repo`",
+                        )
+                    ]
+
+                # Validate repo format (owner/repo)
+                if not re.match(r"^[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+$", feedback.repo):
+                    return [
+                        TextContent(
+                            type="text",
+                            text=f"❌ **Invalid repo format:** `{feedback.repo}`\n\nExpected format: `owner/repo`"
                         )
                     ]
 
