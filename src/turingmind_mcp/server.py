@@ -1448,8 +1448,10 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 
                     # Store entities in database
                     db = get_db()
+                    entity_id_map = {}  # Map (file_path, name, entity_type) to database entity_id
+                    
                     for entity in result.get("entities", []):
-                        db.create_code_entity(
+                        db_entity_id = db.create_code_entity(
                             repo=repo,
                             file_path=entity["file_path"],
                             entity_type=entity["entity_type"],
@@ -1458,6 +1460,47 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                             end_line=entity.get("end_line"),
                             language=entity.get("language"),
                         )
+                        # Map by composite key for relationship lookup
+                        key = (entity["file_path"], entity["name"], entity["entity_type"])
+                        entity_id_map[key] = db_entity_id
+                        # Also map by indexer's entity_id string if present
+                        indexer_entity_id = entity.get("entity_id")
+                        if indexer_entity_id:
+                            entity_id_map[indexer_entity_id] = db_entity_id
+                    
+                    # Store relationships
+                    for rel in result.get("relationships", []):
+                        source_entity_id_str = rel.get("source_entity_id", "")
+                        source_id = None
+                        
+                        # Try to find source entity by indexer ID or by parsing
+                        if source_entity_id_str in entity_id_map:
+                            source_id = entity_id_map[source_entity_id_str]
+                        else:
+                            # Parse indexer ID format: "file_path:name:type"
+                            if ":" in source_entity_id_str:
+                                parts = source_entity_id_str.split(":")
+                                if len(parts) >= 3:
+                                    file_path = parts[0]
+                                    name = parts[1]
+                                    entity_type = ":".join(parts[2:])  # Handle types with colons
+                                    key = (file_path, name, entity_type)
+                                    source_id = entity_id_map.get(key)
+                        
+                        # Try to find target entity if target_entity_id is provided
+                        target_id = None
+                        target_entity_id_str = rel.get("target_entity_id")
+                        if target_entity_id_str and target_entity_id_str in entity_id_map:
+                            target_id = entity_id_map[target_entity_id_str]
+                        
+                        if source_id:  # Only store if source entity was found
+                            db.create_relationship(
+                                repo=repo,
+                                source_entity_id=source_id,
+                                target_entity_id=target_id,
+                                target_symbol_name=rel.get("target_symbol_name"),
+                                relationship_type=rel.get("relationship_type", "calls"),
+                            )
 
                     return [
                         TextContent(
