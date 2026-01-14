@@ -1,22 +1,24 @@
 """
-Code entity indexing using AST parsing.
+Code entity indexing using tree-sitter AST parsing.
 
 Extracts functions, classes, and files from codebase for relationship tracking.
+Similar to DevContext's indexing service.
 """
 
 from __future__ import annotations
 
-import ast
 import logging
 import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from .parsers import TreeSitterManager, parse_python, parse_javascript, parse_typescript
+
 logger = logging.getLogger("turingmind-mcp")
 
 
 class EntityIndexer:
-    """Indexes code entities from source files."""
+    """Indexes code entities from source files using tree-sitter."""
 
     SUPPORTED_LANGUAGES = ["javascript", "typescript", "python"]
     SUPPORTED_EXTENSIONS = {
@@ -30,6 +32,32 @@ class EntityIndexer:
         self.repo_path = Path(repo_path)
         if not self.repo_path.exists():
             raise ValueError(f"Repository path does not exist: {repo_path}")
+        
+        self.tree_sitter_manager = TreeSitterManager()
+        self.parser_initialized = False
+
+    async def initialize_parsers(self, languages: Optional[List[str]] = None):
+        """Initialize tree-sitter parsers for specified languages."""
+        if self.parser_initialized:
+            return
+
+        if languages is None:
+            languages = self.SUPPORTED_LANGUAGES
+
+        # Map language names to tree-sitter language identifiers
+        ts_languages = []
+        for lang in languages:
+            if lang == "typescript":
+                ts_languages.extend(["typescript", "tsx"])
+            else:
+                ts_languages.append(lang)
+
+        success = self.tree_sitter_manager.initialize_grammars(ts_languages)
+        if success:
+            self.parser_initialized = True
+            logger.info(f"Initialized parsers for: {', '.join(ts_languages)}")
+        else:
+            logger.warning("Some parsers failed to initialize, falling back to basic parsing")
 
     def index_codebase(
         self,
@@ -39,6 +67,22 @@ class EntityIndexer:
         """Index entire codebase."""
         if languages is None:
             languages = self.SUPPORTED_LANGUAGES
+
+        # Initialize parsers synchronously (for now)
+        # In async context, call initialize_parsers first
+        if not self.parser_initialized:
+            try:
+                # Try to initialize synchronously
+                ts_languages = []
+                for lang in languages:
+                    if lang == "typescript":
+                        ts_languages.extend(["typescript", "tsx"])
+                    else:
+                        ts_languages.append(lang)
+                self.tree_sitter_manager.initialize_grammars(ts_languages)
+                self.parser_initialized = True
+            except Exception as e:
+                logger.warning(f"Failed to initialize tree-sitter parsers: {e}. Using fallback parsing.")
 
         entities = []
         relationships = []
@@ -78,20 +122,69 @@ class EntityIndexer:
         return any(part in skip_dirs for part in parts)
 
     def _index_file(self, file_path: str, language: str) -> tuple[List[Dict], List[Dict]]:
-        """Index a single file."""
+        """Index a single file using tree-sitter parser."""
         full_path = self.repo_path / file_path
 
+        try:
+            with open(full_path, "r", encoding="utf-8") as f:
+                content = f.read()
+        except Exception as e:
+            logger.warning(f"Failed to read {file_path}: {e}")
+            return [], []
+
+        # Use tree-sitter parser if available
+        if self.parser_initialized:
+            parser = self.tree_sitter_manager.get_parser_for_language(language)
+            if parser:
+                try:
+                    tree = parser.parse(bytes(content, "utf-8"))
+                    ast_root = tree.root_node
+
+                    # Use language-specific parser
+                    if language == "python":
+                        result = parse_python(ast_root, content)
+                    elif language == "javascript":
+                        result = parse_javascript(ast_root, content)
+                    elif language in ("typescript", "tsx"):
+                        result = parse_typescript(ast_root, content)
+                    else:
+                        return [], []
+
+                    # Add file entity and update file paths
+                    file_entity = {
+                        "entity_id": f"{file_path}:file",
+                        "file_path": file_path,
+                        "entity_type": "file",
+                        "name": Path(file_path).name,
+                        "start_line": 1,
+                        "end_line": len(content.splitlines()),
+                        "language": language,
+                    }
+                    result["entities"].insert(0, file_entity)
+
+                    # Update file paths for all entities
+                    for entity in result["entities"]:
+                        if "file_path" not in entity:
+                            entity["file_path"] = file_path
+
+                    return result["entities"], result["relationships"]
+                except Exception as e:
+                    logger.warning(f"Tree-sitter parsing failed for {file_path}: {e}. Falling back to basic parsing.")
+
+        # Fallback to basic parsing
         if language == "python":
-            return self._index_python_file(file_path, full_path)
+            return self._index_python_file_fallback(file_path, full_path)
         elif language in ("javascript", "typescript"):
-            return self._index_js_file(file_path, full_path, language)
+            return self._index_js_file_fallback(file_path, full_path, language)
         else:
             return [], []
 
-    def _index_python_file(
+    def _index_python_file_fallback(
         self, file_path: str, full_path: Path
     ) -> tuple[List[Dict], List[Dict]]:
-        """Index Python file using AST."""
+        """Fallback Python file indexing using standard library AST."""
+        import ast
+
         entities = []
         relationships = []
 
@@ -170,10 +263,10 @@ class EntityIndexer:
 
         return entities, relationships
 
-    def _index_js_file(
+    def _index_js_file_fallback(
         self, file_path: str, full_path: Path, language: str
     ) -> tuple[List[Dict], List[Dict]]:
-        """Index JavaScript/TypeScript file (simplified - would need proper parser)."""
+        """Fallback JavaScript/TypeScript file indexing using regex (simplified)."""
         entities = []
         relationships = []
 
@@ -194,8 +287,7 @@ class EntityIndexer:
                 "language": language,
             })
 
-            # Simple regex-based extraction (simplified)
-            # Real implementation would use proper JS/TS parser
+            # Simple regex-based extraction (fallback only)
             import re
 
             # Extract function declarations
