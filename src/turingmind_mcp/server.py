@@ -33,6 +33,11 @@ from mcp.server.stdio import stdio_server
 from mcp.types import TextContent, Tool
 from pydantic import BaseModel, Field
 
+# Import new modules
+from .database import MemoryDatabase
+from .memory_manager import MemoryManager
+from .entity_indexer import EntityIndexer, get_repo_path
+
 # ============================================================================
 # LOGGING
 # ============================================================================
@@ -53,7 +58,18 @@ CONFIG_PATH = os.path.expanduser("~/.turingmind/config")
 CONFIG_DIR = os.path.expanduser("~/.turingmind")
 
 # Tools that don't require authentication
-AUTH_FREE_TOOLS = {"turingmind_initiate_login", "turingmind_poll_login"}
+AUTH_FREE_TOOLS = {
+    "turingmind_initiate_login",
+    "turingmind_poll_login",
+    "turingmind_index_codebase",
+    "turingmind_get_related_code",
+    "turingmind_get_project_structure",
+    "turingmind_get_edit_reasoning",
+    "turingmind_list_memory",
+    "turingmind_get_memory",
+    "turingmind_get_memory_stats",
+    "turingmind_explain_decision",
+}
 
 # Package version
 __version__ = "0.2.0"
@@ -200,6 +216,26 @@ class SubmitFeedbackInput(BaseModel):
 # ============================================================================
 
 server = Server("turingmind")
+
+# Initialize database and memory manager (singleton)
+_db_instance: Optional[MemoryDatabase] = None
+_memory_manager_instance: Optional[MemoryManager] = None
+
+
+def get_db() -> MemoryDatabase:
+    """Get or create database instance."""
+    global _db_instance
+    if _db_instance is None:
+        _db_instance = MemoryDatabase()
+    return _db_instance
+
+
+def get_memory_manager() -> MemoryManager:
+    """Get or create memory manager instance."""
+    global _memory_manager_instance
+    if _memory_manager_instance is None:
+        _memory_manager_instance = MemoryManager(get_db())
+    return _memory_manager_instance
 
 
 @server.list_tools()
@@ -394,6 +430,408 @@ async def list_tools() -> list[Tool]:
                     },
                 },
                 "required": ["issue_id", "action", "repo"],
+            },
+        ),
+        # ─────────────────────────────────────────────────────────────
+        # CODE ENTITY INDEXING TOOLS
+        # ─────────────────────────────────────────────────────────────
+        Tool(
+            name="turingmind_index_codebase",
+            description=(
+                "Index codebase using AST parsing to extract code entities "
+                "(functions, classes, files) and relationships. "
+                "Enables relationship-aware code review and impact analysis."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "repo": {
+                        "type": "string",
+                        "description": "Repository identifier (owner/repo)",
+                    },
+                    "branch": {
+                        "type": "string",
+                        "description": "Git branch (default: main)",
+                        "default": "main",
+                    },
+                    "languages": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Languages to parse (js, ts, py)",
+                        "default": ["javascript", "typescript", "python"],
+                    },
+                    "force_reindex": {
+                        "type": "boolean",
+                        "description": "Force reindex even if already indexed",
+                        "default": False,
+                    },
+                },
+                "required": ["repo"],
+            },
+        ),
+        Tool(
+            name="turingmind_get_related_code",
+            description=(
+                "Get code entities related to a specific function/class/file. "
+                "Uses relationship graph to find callers, callees, and imports for impact analysis."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "repo": {"type": "string", "description": "Repository (owner/repo)"},
+                    "file": {"type": "string", "description": "File path"},
+                    "entity_name": {
+                        "type": "string",
+                        "description": "Function/class name (optional)",
+                    },
+                    "relationship_types": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Types: calls, imports (default: both)",
+                    },
+                    "direction": {
+                        "type": "string",
+                        "enum": ["both", "outgoing", "incoming"],
+                        "description": "Relationship direction",
+                        "default": "both",
+                    },
+                },
+                "required": ["repo", "file"],
+            },
+        ),
+        Tool(
+            name="turingmind_get_project_structure",
+            description=(
+                "Get comprehensive project structure summary. "
+                "Returns language distribution, entity type counts, and basic architecture info."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "repo": {"type": "string", "description": "Repository (owner/repo)"}
+                },
+                "required": ["repo"],
+            },
+        ),
+        # ─────────────────────────────────────────────────────────────
+        # DEVELOPER INTENT TOOLS
+        # ─────────────────────────────────────────────────────────────
+        Tool(
+            name="turingmind_get_edit_reasoning",
+            description=(
+                "Get or capture developer reasoning for file changes. "
+                "Extracts intent from commit messages or prompts developer. "
+                "Supports per-file reasoning. Helps code review understand intent and reduce false positives."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "repo": {"type": "string", "description": "Repository (owner/repo)"},
+                    "files": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "file_path": {"type": "string"},
+                                "reasoning": {"type": "string"},
+                                "change_type": {
+                                    "type": "string",
+                                    "enum": ["bug_fix", "feature", "refactoring", "security", "other"],
+                                },
+                                "memory_category": {
+                                    "type": "string",
+                                    "enum": ["repo_fact", "learned_pattern", "explicit_rule", "session_context"],
+                                },
+                                "scope": {"type": "string"},
+                                "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                            },
+                        },
+                        "description": "List of files with optional per-file reasoning",
+                    },
+                    "commit_message": {
+                        "type": "string",
+                        "description": "Optional commit message to parse",
+                    },
+                    "commit_hash": {
+                        "type": "string",
+                        "description": "Optional commit hash for historical lookups",
+                    },
+                    "conversation_id": {
+                        "type": "string",
+                        "description": "Optional conversation ID for context",
+                    },
+                    "interactive": {
+                        "type": "boolean",
+                        "description": "Whether to prompt user if reasoning not found",
+                        "default": False,
+                    },
+                },
+                "required": ["repo", "files"],
+            },
+        ),
+        # ─────────────────────────────────────────────────────────────
+        # MEMORY MANAGEMENT TOOLS
+        # ─────────────────────────────────────────────────────────────
+        Tool(
+            name="turingmind_list_memory",
+            description=(
+                "List memory entries with filtering and pagination. "
+                "Supports filtering by category, status, scope, and security tags."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "repo": {"type": "string", "description": "Repository (owner/repo)"},
+                    "category": {
+                        "type": "string",
+                        "enum": ["repo_fact", "learned_pattern", "explicit_rule", "session_context", "all"],
+                        "description": "Memory category filter",
+                        "default": "all",
+                    },
+                    "status": {
+                        "type": "string",
+                        "enum": ["active", "pending", "conflict", "deprecated", "all"],
+                        "description": "Status filter",
+                        "default": "all",
+                    },
+                    "scope": {"type": "string", "description": "Filter by scope"},
+                    "security_tag": {
+                        "type": "string",
+                        "enum": ["auth", "crypto", "secrets", "compliance"],
+                        "description": "Filter by security tag",
+                    },
+                    "page": {"type": "integer", "description": "Page number", "default": 1},
+                    "limit": {"type": "integer", "description": "Items per page", "default": 50},
+                    "search": {"type": "string", "description": "Search content"},
+                },
+                "required": ["repo"],
+            },
+        ),
+        Tool(
+            name="turingmind_get_memory",
+            description=(
+                "Get detailed information about a specific memory entry including evidence."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "repo": {"type": "string", "description": "Repository (owner/repo)"},
+                    "memory_id": {"type": "string", "description": "Memory entry ID"},
+                },
+                "required": ["repo", "memory_id"],
+            },
+        ),
+        Tool(
+            name="turingmind_save_memory",
+            description=(
+                "Create or update a memory entry. "
+                "Supports learned patterns, explicit rules, and session context."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "repo": {"type": "string", "description": "Repository (owner/repo)"},
+                    "memory_id": {
+                        "type": "string",
+                        "description": "Memory ID (optional for updates)",
+                    },
+                    "type": {
+                        "type": "string",
+                        "enum": ["learned_pattern", "explicit_rule", "session_context"],
+                        "description": "Memory type",
+                    },
+                    "content": {"type": "string", "description": "Memory content"},
+                    "scope": {"type": "string", "description": "Scope (repo, file, function)"},
+                    "confidence": {
+                        "type": "number",
+                        "minimum": 0,
+                        "maximum": 1,
+                        "description": "Confidence score",
+                    },
+                    "evidence": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "type": {"type": "string"},
+                                "content": {"type": "string"},
+                                "file": {"type": "string"},
+                                "line": {"type": "integer"},
+                            },
+                        },
+                        "description": "Evidence snippets",
+                    },
+                    "security_tags": {
+                        "type": "array",
+                        "items": {"type": "string", "enum": ["auth", "crypto", "secrets", "compliance"]},
+                        "description": "Security tags",
+                    },
+                    "yaml_definition": {
+                        "type": "string",
+                        "description": "YAML representation",
+                    },
+                },
+                "required": ["repo", "type", "content", "scope"],
+            },
+        ),
+        Tool(
+            name="turingmind_delete_memory",
+            description=(
+                "Delete or deprecate a memory entry. "
+                "Deprecation preserves history, deletion removes completely."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "repo": {"type": "string", "description": "Repository (owner/repo)"},
+                    "memory_id": {"type": "string", "description": "Memory entry ID"},
+                    "action": {
+                        "type": "string",
+                        "enum": ["delete", "deprecate"],
+                        "description": "Action type",
+                        "default": "deprecate",
+                    },
+                },
+                "required": ["repo", "memory_id"],
+            },
+        ),
+        Tool(
+            name="turingmind_detect_conflicts",
+            description=(
+                "Detect conflicts between memory entries. "
+                "Identifies contradictions, overlaps, and scope conflicts."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "repo": {"type": "string", "description": "Repository (owner/repo)"},
+                    "memory_id": {"type": "string", "description": "New/updated entry ID"},
+                },
+                "required": ["repo", "memory_id"],
+            },
+        ),
+        Tool(
+            name="turingmind_resolve_conflict",
+            description=(
+                "Resolve conflicts between memory entries. "
+                "Supports priority, scope-narrow, time-bound, and merge strategies."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "repo": {"type": "string", "description": "Repository (owner/repo)"},
+                    "conflict_id": {"type": "string", "description": "Conflict ID"},
+                    "strategy": {
+                        "type": "string",
+                        "enum": ["priority", "scope_narrow", "time_bound", "merge"],
+                        "description": "Resolution strategy",
+                    },
+                    "resolution": {
+                        "type": "object",
+                        "properties": {
+                            "keep_memory_ids": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": "Memory IDs to keep",
+                            },
+                            "new_content": {"type": "string", "description": "Merged content"},
+                            "new_scope": {"type": "string", "description": "New scope"},
+                        },
+                    },
+                },
+                "required": ["repo", "conflict_id", "strategy"],
+            },
+        ),
+        Tool(
+            name="turingmind_simulate_impact",
+            description=(
+                "Simulate how memory entries affect code review. "
+                "Shows before/after comparison of review results."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "repo": {"type": "string", "description": "Repository (owner/repo)"},
+                    "memory_ids": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Memory IDs to simulate",
+                    },
+                    "test_files": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Test files to review (optional)",
+                    },
+                },
+                "required": ["repo"],
+            },
+        ),
+        Tool(
+            name="turingmind_explain_decision",
+            description=(
+                "Explain why AI made a specific decision in code review. "
+                "Shows weighted memory contributions and reasoning."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "repo": {"type": "string", "description": "Repository (owner/repo)"},
+                    "issue_id": {
+                        "type": "string",
+                        "description": "Review issue ID (optional)",
+                    },
+                    "file": {"type": "string", "description": "File path (optional)"},
+                    "line": {"type": "integer", "description": "Line number (optional)"},
+                },
+                "required": ["repo"],
+            },
+        ),
+        Tool(
+            name="turingmind_get_memory_stats",
+            description=(
+                "Get statistics about memory entries for a repository. "
+                "Returns counts by category, status, and other metrics."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "repo": {"type": "string", "description": "Repository (owner/repo)"}
+                },
+                "required": ["repo"],
+            },
+        ),
+        Tool(
+            name="turingmind_enable_auto_review",
+            description=(
+                "Enable automatic code review on git commits. "
+                "Monitors repository for new commits and triggers reviews automatically."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "repo": {"type": "string", "description": "Repository (owner/repo)"},
+                    "branch": {
+                        "type": "string",
+                        "description": "Branch to monitor",
+                        "default": "main",
+                    },
+                    "review_type": {
+                        "type": "string",
+                        "enum": ["quick", "deep"],
+                        "description": "Review type",
+                        "default": "quick",
+                    },
+                    "webhook_url": {
+                        "type": "string",
+                        "description": "Optional webhook for notifications",
+                    },
+                    "enabled": {
+                        "type": "boolean",
+                        "description": "Enable/disable monitoring",
+                        "default": True,
+                    },
+                },
+                "required": ["repo"],
             },
         ),
     ]
@@ -686,19 +1124,75 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 
                 if response.status_code in (200, 201):
                     data = response.json()
+                    review_id = data.get('review_id', 'unknown')
+                    
+                    # Track memory usage for explainability
+                    try:
+                        db = get_db()
+                        memory_manager = get_memory_manager()
+                        
+                        # Get active memory entries for this repo
+                        active_memories = db.list_memory_entries(
+                            repo=review.repo, status="active"
+                        )
+                        
+                        # For each issue, determine which memories influenced it
+                        for issue in issues:
+                            issue_file = issue.get("file", "")
+                            issue_line = issue.get("line")
+                            
+                            # Find influencing memories
+                            influencing_memories = []
+                            for memory in active_memories:
+                                # Check scope match
+                                scope = memory.get("scope", "")
+                                if scope == "repo" or scope == issue_file or issue_file.startswith(scope):
+                                    # Calculate weight based on memory type and confidence
+                                    weight = memory.get("confidence", 0.8) * 0.5  # Base weight
+                                    
+                                    if memory.get("type") == "explicit_rule":
+                                        # Explicit rules have higher weight
+                                        weight = memory.get("confidence", 1.0) * 0.8
+                                    elif memory.get("type") == "learned_pattern":
+                                        # Learned patterns filter false positives
+                                        weight = memory.get("confidence", 0.7) * 0.3
+                                    elif memory.get("type") == "session_context":
+                                        # Session context has moderate weight
+                                        weight = memory.get("confidence", 0.8) * 0.4
+                                    
+                                    if weight > 0.1:  # Only track significant influences
+                                        influencing_memories.append({
+                                            "memory_id": memory["memory_id"],
+                                            "weight": weight,
+                                        })
+                            
+                            # Track memory usage for each influencing memory
+                            for mem in influencing_memories:
+                                db.track_memory_usage(
+                                    repo=review.repo,
+                                    memory_id=mem["memory_id"],
+                                    context="code_review",
+                                    weight=mem["weight"],
+                                    issue_id=review_id,  # Use review_id as issue identifier
+                                    file_path=issue_file,
+                                    line_number=issue_line,
+                                )
+                    except Exception as e:
+                        logger.warning(f"Failed to track memory usage: {e}")
+                    
                     return [
                         TextContent(
                             type="text",
                             text=(
                                 f"🧠 **Review Uploaded to TuringMind**\n\n"
-                                f"- **Review ID:** `{data.get('review_id', 'unknown')}`\n"
+                                f"- **Review ID:** `{review_id}`\n"
                                 f"- **Repository:** {review.repo}\n"
                                 f"- **Issues:** {len(issues)}\n"
                                 f"- **Summary:** {auto_summary['critical']} critical, "
                                 f"{auto_summary['high']} high, {auto_summary['medium']} medium, "
                                 f"{auto_summary['low']} low\n\n"
                                 f"Review data is now available in TuringMind cloud for analytics "
-                                f"and future context."
+                                f"and future context. Memory usage tracked for explainability."
                             ),
                         )
                     ]
@@ -927,6 +1421,722 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                             text=f"❌ **Feedback submission failed:** HTTP {response.status_code}\n{response.text[:200]}",
                         )
                     ]
+
+            # ─────────────────────────────────────────────────────────────
+            # CODE ENTITY INDEXING TOOLS
+            # ─────────────────────────────────────────────────────────────
+            elif name == "turingmind_index_codebase":
+                repo = arguments.get("repo", "")
+                if not repo:
+                    return [TextContent(type="text", text="❌ **Missing required field:** `repo`")]
+
+                languages = arguments.get("languages", ["javascript", "typescript", "python"])
+                force_reindex = arguments.get("force_reindex", False)
+
+                try:
+                    repo_path = get_repo_path()
+                    if not repo_path:
+                        return [
+                            TextContent(
+                                type="text",
+                                text="❌ **Could not determine repository path**\n\nRun this from within a git repository.",
+                            )
+                        ]
+
+                    indexer = EntityIndexer(repo_path)
+                    result = indexer.index_codebase(languages=languages, force_reindex=force_reindex)
+
+                    # Store entities in database
+                    db = get_db()
+                    for entity in result.get("entities", []):
+                        db.create_code_entity(
+                            repo=repo,
+                            file_path=entity["file_path"],
+                            entity_type=entity["entity_type"],
+                            name=entity["name"],
+                            start_line=entity.get("start_line"),
+                            end_line=entity.get("end_line"),
+                            language=entity.get("language"),
+                        )
+
+                    return [
+                        TextContent(
+                            type="text",
+                            text=(
+                                f"✅ **Codebase Indexed**\n\n"
+                                f"- **Entities indexed:** {result['indexed']}\n"
+                                f"- **Languages:** {', '.join(languages)}\n"
+                                f"- **Entity types:** {', '.join(f'{k}: {v}' for k, v in result['entities_by_type'].items())}\n"
+                                f"- **Relationships:** {result['relationships']}\n\n"
+                                f"Code entities are now available for relationship-aware reviews."
+                            ),
+                        )
+                    ]
+                except Exception as e:
+                    logger.exception("Indexing failed")
+                    return [
+                        TextContent(
+                            type="text", text=f"❌ **Indexing failed:** {type(e).__name__}: {e}"
+                        )
+                    ]
+
+            elif name == "turingmind_get_related_code":
+                repo = arguments.get("repo", "")
+                file_path = arguments.get("file", "")
+                if not repo or not file_path:
+                    return [
+                        TextContent(
+                            type="text", text="❌ **Missing required fields:** `repo`, `file`"
+                        )
+                    ]
+
+                entity_name = arguments.get("entity_name")
+                relationship_types = arguments.get("relationship_types", ["calls", "imports"])
+                direction = arguments.get("direction", "both")
+
+                try:
+                    db = get_db()
+                    entities = db.get_entities_by_file(repo, file_path)
+
+                    if entity_name:
+                        # Find specific entity
+                        entity = next(
+                            (e for e in entities if e["name"] == entity_name), None
+                        )
+                        if not entity:
+                            return [
+                                TextContent(
+                                    type="text",
+                                    text=f"❌ **Entity not found:** `{entity_name}` in `{file_path}`",
+                                )
+                            ]
+                        related = db.get_related_entities(
+                            entity["entity_id"], relationship_types, direction
+                        )
+                    else:
+                        # Get all related entities for file
+                        related = []
+                        for entity in entities:
+                            related.extend(
+                                db.get_related_entities(
+                                    entity["entity_id"], relationship_types, direction
+                                )
+                            )
+
+                    return [
+                        TextContent(
+                            type="text",
+                            text=(
+                                f"🔗 **Related Code Entities**\n\n"
+                                f"- **File:** `{file_path}`\n"
+                                f"- **Entity:** {entity_name or 'all'}\n"
+                                f"- **Related entities:** {len(related)}\n\n"
+                                + "\n".join(
+                                    f"- `{r['file_path']}:{r['name']}` ({r.get('relationship_type', 'unknown')})"
+                                    for r in related[:20]
+                                )
+                            ),
+                        )
+                    ]
+                except Exception as e:
+                    logger.exception("Get related code failed")
+                    return [
+                        TextContent(
+                            type="text", text=f"❌ **Failed:** {type(e).__name__}: {e}"
+                        )
+                    ]
+
+            elif name == "turingmind_get_project_structure":
+                repo = arguments.get("repo", "")
+                if not repo:
+                    return [TextContent(type="text", text="❌ **Missing required field:** `repo`")]
+
+                try:
+                    db = get_db()
+                    # Get entity counts
+                    cursor = db.conn.cursor()
+                    cursor.execute(
+                        """
+                        SELECT entity_type, language, COUNT(*) as count
+                        FROM code_entities
+                        WHERE repo = ?
+                        GROUP BY entity_type, language
+                        """,
+                        (repo,),
+                    )
+                    stats = cursor.fetchall()
+
+                    structure = {}
+                    for row in stats:
+                        entity_type = row[0]
+                        language = row[1] or "unknown"
+                        count = row[2]
+                        if entity_type not in structure:
+                            structure[entity_type] = {}
+                        structure[entity_type][language] = count
+
+                    return [
+                        TextContent(
+                            type="text",
+                            text=(
+                                f"📊 **Project Structure for {repo}**\n\n"
+                                + "\n".join(
+                                    f"**{et}:**\n"
+                                    + "\n".join(f"  - {lang}: {count}" for lang, count in langs.items())
+                                    for et, langs in structure.items()
+                                )
+                            ),
+                        )
+                    ]
+                except Exception as e:
+                    logger.exception("Get project structure failed")
+                    return [
+                        TextContent(
+                            type="text", text=f"❌ **Failed:** {type(e).__name__}: {e}"
+                        )
+                    ]
+
+            # ─────────────────────────────────────────────────────────────
+            # DEVELOPER INTENT TOOLS
+            # ─────────────────────────────────────────────────────────────
+            elif name == "turingmind_get_edit_reasoning":
+                repo = arguments.get("repo", "")
+                files = arguments.get("files", [])
+                if not repo or not files:
+                    return [
+                        TextContent(
+                            type="text", text="❌ **Missing required fields:** `repo`, `files`"
+                        )
+                    ]
+
+                commit_message = arguments.get("commit_message", "")
+                commit_hash = arguments.get("commit_hash")
+                conversation_id = arguments.get("conversation_id")
+                interactive = arguments.get("interactive", False)
+
+                try:
+                    db = get_db()
+                    memory_manager = get_memory_manager()
+
+                    # Extract reasoning from commit message if available
+                    overall_intent = None
+                    if commit_message:
+                        # Try to extract "Why:" section
+                        if "Why:" in commit_message:
+                            overall_intent = commit_message.split("Why:")[1].strip().split("\n")[0]
+
+                    # Process per-file reasoning
+                    file_reasoning_map = {}
+                    for file_obj in files:
+                        file_path = file_obj.get("file_path")
+                        reasoning = file_obj.get("reasoning")
+
+                        if not reasoning and commit_message:
+                            # Try to infer from commit message
+                            reasoning = overall_intent
+
+                        if reasoning:
+                            file_reasoning_map[file_path] = {
+                                "reasoning": reasoning,
+                                "change_type": file_obj.get("change_type", "other"),
+                                "memory_category": file_obj.get(
+                                    "memory_category", "session_context"
+                                ),
+                                "scope": file_obj.get("scope", file_path),
+                                "confidence": file_obj.get("confidence", 0.8),
+                            }
+
+                            # Create session context
+                            memory_manager.create_session_context(
+                                repo=repo,
+                                content=reasoning,
+                                scope=file_path,
+                                evidence=[
+                                    {
+                                        "type": "commit" if commit_hash else "conversation",
+                                        "content": commit_message or f"File edit: {file_path}",
+                                        "file": file_path,
+                                    }
+                                ],
+                            )
+
+                    # Save edit reasoning
+                    if commit_hash:
+                        db.save_edit_reasoning(
+                            repo=repo,
+                            files=list(file_reasoning_map.values()),
+                            commit_hash=commit_hash,
+                            overall_reasoning=overall_intent,
+                        )
+
+                    return [
+                        TextContent(
+                            type="text",
+                            text=(
+                                f"💡 **Edit Reasoning Captured**\n\n"
+                                f"- **Repository:** {repo}\n"
+                                f"- **Files:** {len(file_reasoning_map)}\n"
+                                f"- **Overall intent:** {overall_intent or 'Not specified'}\n\n"
+                                + "\n".join(
+                                    f"- `{fp}`: {data['reasoning'][:50]}..."
+                                    for fp, data in list(file_reasoning_map.items())[:10]
+                                )
+                            ),
+                        )
+                    ]
+                except Exception as e:
+                    logger.exception("Get edit reasoning failed")
+                    return [
+                        TextContent(
+                            type="text", text=f"❌ **Failed:** {type(e).__name__}: {e}"
+                        )
+                    ]
+
+            # ─────────────────────────────────────────────────────────────
+            # MEMORY MANAGEMENT TOOLS
+            # ─────────────────────────────────────────────────────────────
+            elif name == "turingmind_list_memory":
+                repo = arguments.get("repo", "")
+                if not repo:
+                    return [TextContent(type="text", text="❌ **Missing required field:** `repo`")]
+
+                category = arguments.get("category", "all")
+                status = arguments.get("status", "all")
+                scope = arguments.get("scope")
+                security_tag = arguments.get("security_tag")
+                page = arguments.get("page", 1)
+                limit = arguments.get("limit", 50)
+                search = arguments.get("search")
+
+                try:
+                    db = get_db()
+                    entries = db.list_memory_entries(
+                        repo=repo,
+                        memory_type=category if category != "all" else None,
+                        status=status if status != "all" else None,
+                        scope=scope,
+                        page=page,
+                        limit=limit,
+                        search=search,
+                    )
+
+                    # Filter by security tag if specified
+                    if security_tag:
+                        entries = [
+                            e
+                            for e in entries
+                            if e.get("security_tags") and security_tag in e.get("security_tags", [])
+                        ]
+
+                    return [
+                        TextContent(
+                            type="text",
+                            text=(
+                                f"📚 **Memory Entries ({len(entries)})**\n\n"
+                                + "\n".join(
+                                    f"- **{e['type']}** [{e['status']}]: {e['content'][:60]}... "
+                                    f"(scope: {e['scope']}, confidence: {e['confidence']:.2f})"
+                                    for e in entries[:20]
+                                )
+                            ),
+                        )
+                    ]
+                except Exception as e:
+                    logger.exception("List memory failed")
+                    return [
+                        TextContent(
+                            type="text", text=f"❌ **Failed:** {type(e).__name__}: {e}"
+                        )
+                    ]
+
+            elif name == "turingmind_get_memory":
+                repo = arguments.get("repo", "")
+                memory_id = arguments.get("memory_id", "")
+                if not repo or not memory_id:
+                    return [
+                        TextContent(
+                            type="text", text="❌ **Missing required fields:** `repo`, `memory_id`"
+                        )
+                    ]
+
+                try:
+                    db = get_db()
+                    entry = db.get_memory_entry(memory_id)
+                    if not entry:
+                        return [
+                            TextContent(
+                                type="text", text=f"❌ **Memory entry not found:** `{memory_id}`"
+                            )
+                        ]
+
+                    evidence = db.get_evidence(memory_id)
+
+                    return [
+                        TextContent(
+                            type="text",
+                            text=(
+                                f"📖 **Memory Entry Details**\n\n"
+                                f"- **ID:** {memory_id}\n"
+                                f"- **Type:** {entry['type']}\n"
+                                f"- **Content:** {entry['content']}\n"
+                                f"- **Scope:** {entry['scope']}\n"
+                                f"- **Confidence:** {entry['confidence']:.2f}\n"
+                                f"- **Status:** {entry['status']}\n"
+                                f"- **Evidence:** {len(evidence)} items\n"
+                                + "\n".join(
+                                    f"  - {e['evidence_type']}: {e['content'][:50]}..."
+                                    for e in evidence[:5]
+                                )
+                            ),
+                        )
+                    ]
+                except Exception as e:
+                    logger.exception("Get memory failed")
+                    return [
+                        TextContent(
+                            type="text", text=f"❌ **Failed:** {type(e).__name__}: {e}"
+                        )
+                    ]
+
+            elif name == "turingmind_save_memory":
+                repo = arguments.get("repo", "")
+                memory_type = arguments.get("type")
+                content = arguments.get("content", "")
+                scope = arguments.get("scope", "")
+                if not repo or not memory_type or not content or not scope:
+                    return [
+                        TextContent(
+                            type="text",
+                            text="❌ **Missing required fields:** `repo`, `type`, `content`, `scope`",
+                        )
+                    ]
+
+                try:
+                    memory_manager = get_memory_manager()
+                    memory_id = arguments.get("memory_id")
+
+                    if memory_id:
+                        # Update existing
+                        db = get_db()
+                        success = db.update_memory_entry(
+                            memory_id=memory_id,
+                            content=content,
+                            scope=scope,
+                            confidence=arguments.get("confidence"),
+                            status=arguments.get("status"),
+                            security_tags=arguments.get("security_tags"),
+                            yaml_definition=arguments.get("yaml_definition"),
+                        )
+                        if not success:
+                            return [
+                                TextContent(
+                                    type="text", text=f"❌ **Memory entry not found:** `{memory_id}`"
+                                )
+                            ]
+                    else:
+                        # Create new
+                        if memory_type == "explicit_rule":
+                            result = memory_manager.create_explicit_rule(
+                                repo=repo,
+                                content=content,
+                                scope=scope,
+                                yaml_definition=arguments.get("yaml_definition"),
+                                security_tags=arguments.get("security_tags"),
+                            )
+                            memory_id = result["memory_id"]
+                        elif memory_type == "session_context":
+                            memory_id = memory_manager.create_session_context(
+                                repo=repo,
+                                content=content,
+                                scope=scope,
+                                evidence=arguments.get("evidence", []),
+                            )
+                        else:
+                            db = get_db()
+                            memory_id = db.create_memory_entry(
+                                repo=repo,
+                                memory_type=memory_type,
+                                content=content,
+                                scope=scope,
+                                confidence=arguments.get("confidence", 0.8),
+                                security_tags=arguments.get("security_tags"),
+                                yaml_definition=arguments.get("yaml_definition"),
+                            )
+
+                    # Add evidence if provided
+                    if arguments.get("evidence"):
+                        db = get_db()
+                        for ev in arguments["evidence"]:
+                            db.add_evidence(
+                                memory_id=memory_id,
+                                evidence_type=ev.get("type", "manual"),
+                                content=ev.get("content", ""),
+                                file_path=ev.get("file"),
+                                line_number=ev.get("line"),
+                            )
+
+                    return [
+                        TextContent(
+                            type="text",
+                            text=(
+                                f"✅ **Memory Entry Saved**\n\n"
+                                f"- **ID:** {memory_id}\n"
+                                f"- **Type:** {memory_type}\n"
+                                f"- **Content:** {content[:100]}...\n"
+                                f"- **Scope:** {scope}"
+                            ),
+                        )
+                    ]
+                except Exception as e:
+                    logger.exception("Save memory failed")
+                    return [
+                        TextContent(
+                            type="text", text=f"❌ **Failed:** {type(e).__name__}: {e}"
+                        )
+                    ]
+
+            elif name == "turingmind_delete_memory":
+                repo = arguments.get("repo", "")
+                memory_id = arguments.get("memory_id", "")
+                action = arguments.get("action", "deprecate")
+                if not repo or not memory_id:
+                    return [
+                        TextContent(
+                            type="text", text="❌ **Missing required fields:** `repo`, `memory_id`"
+                        )
+                    ]
+
+                try:
+                    db = get_db()
+                    success = db.delete_memory_entry(memory_id, deprecate=(action == "deprecate"))
+                    if not success:
+                        return [
+                            TextContent(
+                                type="text", text=f"❌ **Memory entry not found:** `{memory_id}`"
+                            )
+                        ]
+
+                    return [
+                        TextContent(
+                            type="text",
+                            text=(
+                                f"✅ **Memory Entry {action}d**\n\n"
+                                f"- **ID:** {memory_id}\n"
+                                f"- **Action:** {action}"
+                            ),
+                        )
+                    ]
+                except Exception as e:
+                    logger.exception("Delete memory failed")
+                    return [
+                        TextContent(
+                            type="text", text=f"❌ **Failed:** {type(e).__name__}: {e}"
+                        )
+                    ]
+
+            elif name == "turingmind_detect_conflicts":
+                repo = arguments.get("repo", "")
+                memory_id = arguments.get("memory_id", "")
+                if not repo or not memory_id:
+                    return [
+                        TextContent(
+                            type="text", text="❌ **Missing required fields:** `repo`, `memory_id`"
+                        )
+                    ]
+
+                try:
+                    memory_manager = get_memory_manager()
+                    conflicts = memory_manager.detect_conflicts(repo, memory_id)
+
+                    if not conflicts:
+                        return [
+                            TextContent(
+                                type="text", text="✅ **No conflicts detected**"
+                            )
+                        ]
+
+                    return [
+                        TextContent(
+                            type="text",
+                            text=(
+                                f"⚠️ **Conflicts Detected ({len(conflicts)})**\n\n"
+                                + "\n".join(
+                                    f"- **{c['type']}** [{c['severity']}]: {c.get('description', 'N/A')}"
+                                    for c in conflicts
+                                )
+                            ),
+                        )
+                    ]
+                except Exception as e:
+                    logger.exception("Detect conflicts failed")
+                    return [
+                        TextContent(
+                            type="text", text=f"❌ **Failed:** {type(e).__name__}: {e}"
+                        )
+                    ]
+
+            elif name == "turingmind_resolve_conflict":
+                repo = arguments.get("repo", "")
+                conflict_id = arguments.get("conflict_id", "")
+                strategy = arguments.get("strategy", "")
+                if not repo or not conflict_id or not strategy:
+                    return [
+                        TextContent(
+                            type="text",
+                            text="❌ **Missing required fields:** `repo`, `conflict_id`, `strategy`",
+                        )
+                    ]
+
+                try:
+                    db = get_db()
+                    success = db.resolve_conflict(conflict_id, strategy)
+                    if not success:
+                        return [
+                            TextContent(
+                                type="text", text=f"❌ **Conflict not found:** `{conflict_id}`"
+                            )
+                        ]
+
+                    return [
+                        TextContent(
+                            type="text",
+                            text=(
+                                f"✅ **Conflict Resolved**\n\n"
+                                f"- **Conflict ID:** {conflict_id}\n"
+                                f"- **Strategy:** {strategy}"
+                            ),
+                        )
+                    ]
+                except Exception as e:
+                    logger.exception("Resolve conflict failed")
+                    return [
+                        TextContent(
+                            type="text", text=f"❌ **Failed:** {type(e).__name__}: {e}"
+                        )
+                    ]
+
+            elif name == "turingmind_simulate_impact":
+                repo = arguments.get("repo", "")
+                memory_ids = arguments.get("memory_ids", [])
+                test_files = arguments.get("test_files")
+
+                if not repo:
+                    return [TextContent(type="text", text="❌ **Missing required field:** `repo`")]
+
+                return [
+                    TextContent(
+                        type="text",
+                        text=(
+                            f"🔮 **Impact Simulation**\n\n"
+                            f"This feature simulates how memory entries affect code review.\n"
+                            f"**Note:** Full simulation requires integration with review engine.\n\n"
+                            f"- **Repository:** {repo}\n"
+                            f"- **Memory IDs:** {len(memory_ids)}\n"
+                            f"- **Test files:** {len(test_files) if test_files else 'auto'}"
+                        ),
+                    )
+                ]
+
+            elif name == "turingmind_explain_decision":
+                repo = arguments.get("repo", "")
+                issue_id = arguments.get("issue_id")
+                file_path = arguments.get("file")
+                line = arguments.get("line")
+
+                if not repo:
+                    return [TextContent(type="text", text="❌ **Missing required field:** `repo`")]
+
+                try:
+                    db = get_db()
+                    usage = db.get_memory_usage(
+                        repo=repo, issue_id=issue_id, file_path=file_path, line_number=line
+                    )
+
+                    if not usage:
+                        return [
+                            TextContent(
+                                type="text", text="ℹ️ **No memory usage found for this decision**"
+                            )
+                        ]
+
+                    total_weight = sum(u["weight"] for u in usage)
+
+                    return [
+                        TextContent(
+                            type="text",
+                            text=(
+                                f"💡 **Decision Explanation**\n\n"
+                                f"- **Total influence:** {total_weight:.2f}\n"
+                                + "\n".join(
+                                    f"- **{u['type']}** ({u['weight']*100:.0f}%): {u['content'][:60]}..."
+                                    for u in usage[:10]
+                                )
+                            ),
+                        )
+                    ]
+                except Exception as e:
+                    logger.exception("Explain decision failed")
+                    return [
+                        TextContent(
+                            type="text", text=f"❌ **Failed:** {type(e).__name__}: {e}"
+                        )
+                    ]
+
+            elif name == "turingmind_get_memory_stats":
+                repo = arguments.get("repo", "")
+                if not repo:
+                    return [TextContent(type="text", text="❌ **Missing required field:** `repo`")]
+
+                try:
+                    db = get_db()
+                    cursor = db.conn.cursor()
+
+                    # Count by type
+                    cursor.execute(
+                        """
+                        SELECT type, status, COUNT(*) as count
+                        FROM memory_entries
+                        WHERE repo = ?
+                        GROUP BY type, status
+                        """,
+                        (repo,),
+                    )
+                    stats = cursor.fetchall()
+
+                    result_text = f"📊 **Memory Statistics for {repo}**\n\n"
+                    for row in stats:
+                        result_text += f"- **{row[0]}** [{row[1]}]: {row[2]}\n"
+
+                    return [TextContent(type="text", text=result_text)]
+                except Exception as e:
+                    logger.exception("Get memory stats failed")
+                    return [
+                        TextContent(
+                            type="text", text=f"❌ **Failed:** {type(e).__name__}: {e}"
+                        )
+                    ]
+
+            elif name == "turingmind_enable_auto_review":
+                repo = arguments.get("repo", "")
+                branch = arguments.get("branch", "main")
+                review_type = arguments.get("review_type", "quick")
+                enabled = arguments.get("enabled", True)
+
+                if not repo:
+                    return [TextContent(type="text", text="❌ **Missing required field:** `repo`")]
+
+                return [
+                    TextContent(
+                        type="text",
+                        text=(
+                            f"🤖 **Auto-Review {'Enabled' if enabled else 'Disabled'}**\n\n"
+                            f"- **Repository:** {repo}\n"
+                            f"- **Branch:** {branch}\n"
+                            f"- **Review type:** {review_type}\n\n"
+                            f"**Note:** Auto-review monitoring requires background service integration."
+                        ),
+                    )
+                ]
 
             # ─────────────────────────────────────────────────────────────
             # UNKNOWN TOOL
