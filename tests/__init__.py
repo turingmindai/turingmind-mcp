@@ -1,1 +1,1 @@
-"""Tests for turingmind-mcp package."""
+"""Tests for TuringMind MCP server."""

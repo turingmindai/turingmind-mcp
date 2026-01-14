@@ -37,6 +37,7 @@ from pydantic import BaseModel, Field
 from .database import MemoryDatabase
 from .memory_manager import MemoryManager
 from .entity_indexer import EntityIndexer, get_repo_path
+from .auto_review_service import get_auto_review_service
 
 # ============================================================================
 # LOGGING
@@ -2168,18 +2169,69 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 if not repo:
                     return [TextContent(type="text", text="❌ **Missing required field:** `repo`")]
 
-                return [
-                    TextContent(
-                        type="text",
-                        text=(
-                            f"🤖 **Auto-Review {'Enabled' if enabled else 'Disabled'}**\n\n"
-                            f"- **Repository:** {repo}\n"
-                            f"- **Branch:** {branch}\n"
-                            f"- **Review type:** {review_type}\n\n"
-                            f"**Note:** Auto-review monitoring requires background service integration."
-                        ),
+                try:
+                    db = get_db()
+                    memory_manager = get_memory_manager()
+                    api_url, api_key = get_config()
+                    
+                    auto_review_service = get_auto_review_service(
+                        db=db,
+                        memory_manager=memory_manager,
+                        api_url=api_url,
+                        api_key=api_key,
                     )
-                ]
+
+                    if enabled:
+                        success = await auto_review_service.start_monitoring(
+                            repo=repo,
+                            branch=branch,
+                            review_type=review_type,
+                            poll_interval=60,  # Poll every 60 seconds
+                        )
+                        if success:
+                            return [
+                                TextContent(
+                                    type="text",
+                                    text=(
+                                        f"✅ **Auto-Review Enabled**\n\n"
+                                        f"- **Repository:** {repo}\n"
+                                        f"- **Branch:** {branch}\n"
+                                        f"- **Review type:** {review_type}\n"
+                                        f"- **Poll interval:** 60 seconds\n\n"
+                                        f"Monitoring for new commits and triggering automatic reviews."
+                                    ),
+                                )
+                            ]
+                        else:
+                            return [
+                                TextContent(
+                                    type="text",
+                                    text=f"⚠️ **Already monitoring** {repo}",
+                                )
+                            ]
+                    else:
+                        success = await auto_review_service.stop_monitoring(repo)
+                        if success:
+                            return [
+                                TextContent(
+                                    type="text",
+                                    text=f"✅ **Auto-Review Disabled** for {repo}",
+                                )
+                            ]
+                        else:
+                            return [
+                                TextContent(
+                                    type="text",
+                                    text=f"⚠️ **Not monitoring** {repo}",
+                                )
+                            ]
+                except Exception as e:
+                    logger.exception("Enable auto-review failed")
+                    return [
+                        TextContent(
+                            type="text", text=f"❌ **Failed:** {type(e).__name__}: {e}"
+                        )
+                    ]
 
             # ─────────────────────────────────────────────────────────────
             # UNKNOWN TOOL

@@ -436,6 +436,33 @@ class MemoryManager:
             and self._similar_topic(entry1["content"], entry2["content"])
         )
 
+    def get_relevant_memory(
+        self, repo: str, file_paths: List[str]
+    ) -> List[Dict[str, Any]]:
+        """Get memory entries relevant to specific files."""
+        relevant = []
+
+        # Get repo-level memory
+        repo_memory = self.db.list_memory_entries(repo, status="active")
+        relevant.extend(repo_memory)
+
+        # Get file-specific memory
+        for file_path in file_paths:
+            file_memory = self.db.list_memory_entries(
+                repo, scope=file_path, status="active"
+            )
+            relevant.extend(file_memory)
+
+        # Remove duplicates
+        seen = set()
+        unique = []
+        for entry in relevant:
+            if entry["memory_id"] not in seen:
+                seen.add(entry["memory_id"])
+                unique.append(entry)
+
+        return unique
+
     # Cleanup
     def cleanup_expired_context(self) -> int:
         """Cleanup expired session context."""
