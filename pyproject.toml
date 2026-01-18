@@ -65,6 +65,8 @@ test = [
 
 [project.scripts]
 turingmind-mcp = "turingmind_mcp.server:main"
+turingmind-store-reasoning = "turingmind_mcp.cli:main"
+turingmind = "turingmind_mcp.unified_cli:main"
 
 [project.urls]
 Homepage = "https://turingmind.ai"

@@ -129,8 +129,32 @@ class AutoReviewService:
 
         return None
 
+    def _fetch_remote(self, repo_path: Path, branch: str) -> bool:
+        """Fetch latest changes from remote for a branch."""
+        try:
+            result = subprocess.run(
+                ["git", "fetch", "origin", branch],
+                cwd=repo_path,
+                capture_output=True,
+                text=True,
+                timeout=30,  # Fetch can take longer
+            )
+            if result.returncode != 0:
+                logger.warning(f"Git fetch failed: {result.stderr}")
+                return False
+            return True
+        except subprocess.TimeoutExpired:
+            logger.warning(f"Git fetch timed out for {repo_path}")
+            return False
+        except Exception as e:
+            logger.debug(f"Could not fetch remote: {e}")
+            return False
+
     def _get_latest_commit(self, repo_path: Path, branch: str) -> Optional[str]:
-        """Get latest commit SHA for a branch."""
+        """Get latest commit SHA for a branch after fetching from remote."""
+        # Fetch first to ensure we have latest remote state
+        self._fetch_remote(repo_path, branch)
+        
         try:
             result = subprocess.run(
                 ["git", "rev-parse", f"origin/{branch}"],

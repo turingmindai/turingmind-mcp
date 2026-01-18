@@ -13,13 +13,18 @@ from typing import Any, Dict, List, Optional
 logger = logging.getLogger("turingmind-mcp")
 
 
-def parse_javascript(ast_root_node: Any, file_content: str) -> Dict[str, Any]:
+def parse_javascript(
+    ast_root_node: Any, 
+    file_content: str,
+    entity_registry: Optional[Dict[tuple, List[Dict[str, Any]]]] = None
+) -> Dict[str, Any]:
     """
     Extract code entities and relationships from a JavaScript AST.
 
     Args:
         ast_root_node: The root node of the tree-sitter AST
         file_content: The full content of the file
+        entity_registry: Optional registry of entities from other files for cross-file lookups
 
     Returns:
         Dictionary containing 'entities' and 'relationships' lists
@@ -122,13 +127,31 @@ def parse_javascript(ast_root_node: Any, file_content: str) -> Dict[str, Any]:
 
     def find_entity_by_name(name: str, entity_type: Optional[str] = None) -> Optional[Dict[str, Any]]:
         """Find an entity by name."""
+        # First search in current file's entities
         for entity in entities:
             if entity["name"] == name and (entity_type is None or entity["entity_type"] == entity_type):
                 return entity
+        
+        # Then search in global registry if available
+        if entity_registry:
+            if entity_type:
+                key = (name, entity_type)
+                if key in entity_registry:
+                    # Return first match (could be improved with scope resolution)
+                    return entity_registry[key][0]
+            else:
+                # Try common entity types
+                for et in ["function", "function_declaration", "class_declaration", "class"]:
+                    key = (name, et)
+                    if key in entity_registry:
+                        return entity_registry[key][0]
+        
         return None
 
     def process_function_declaration(node: Any):
         """Process a function declaration node."""
+        nonlocal current_parent_entity
+        
         name_node = None
         is_async = False
 
@@ -149,7 +172,6 @@ def parse_javascript(ast_root_node: Any, file_content: str) -> Dict[str, Any]:
 
             # Set as parent and process body
             prev_parent = current_parent_entity
-            nonlocal current_parent_entity
             current_parent_entity = entity
 
             # Process function body
@@ -163,6 +185,8 @@ def parse_javascript(ast_root_node: Any, file_content: str) -> Dict[str, Any]:
 
     def process_class_declaration(node: Any):
         """Process a class declaration node."""
+        nonlocal current_parent_entity
+        
         name_node = None
         for child in node.children:
             if child.type == "class_heritage":
@@ -190,7 +214,6 @@ def parse_javascript(ast_root_node: Any, file_content: str) -> Dict[str, Any]:
 
             # Set as parent and process body
             prev_parent = current_parent_entity
-            nonlocal current_parent_entity
             current_parent_entity = entity
 
             # Process class body

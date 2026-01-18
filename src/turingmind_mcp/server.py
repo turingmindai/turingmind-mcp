@@ -1447,80 +1447,121 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                     indexer = EntityIndexer(repo_path)
                     result = indexer.index_codebase(languages=languages, force_reindex=force_reindex)
 
-                    # Store entities in database
+                    # Track indexing errors for reporting
+                    failed_files = result.get("failed_files", [])
+                    
+                    # Store entities in database using transaction
                     db = get_db()
                     entity_id_map = {}  # Map (file_path, name, entity_type) to database entity_id
+                    entities_stored = 0
+                    relationships_stored = 0
                     
-                    for entity in result.get("entities", []):
-                        db_entity_id = db.create_code_entity(
-                            repo=repo,
-                            file_path=entity["file_path"],
-                            entity_type=entity["entity_type"],
-                            name=entity["name"],
-                            start_line=entity.get("start_line"),
-                            end_line=entity.get("end_line"),
-                            language=entity.get("language"),
-                        )
-                        # Map by composite key for relationship lookup
-                        key = (entity["file_path"], entity["name"], entity["entity_type"])
-                        entity_id_map[key] = db_entity_id
-                        # Also map by indexer's entity_id string if present
-                        indexer_entity_id = entity.get("entity_id")
-                        if indexer_entity_id:
-                            entity_id_map[indexer_entity_id] = db_entity_id
-                    
-                    # Store relationships
-                    for rel in result.get("relationships", []):
-                        source_entity_id_str = rel.get("source_entity_id", "")
-                        source_id = None
+                    # Use transaction for atomic indexing
+                    with db.transaction() as cursor:
+                        # Clear existing entities if force_reindex
+                        if force_reindex:
+                            db.clear_entities_for_repo(repo, _cursor=cursor)
                         
-                        # Try to find source entity by indexer ID or by parsing
-                        if source_entity_id_str in entity_id_map:
-                            source_id = entity_id_map[source_entity_id_str]
-                        else:
-                            # Parse indexer ID format: "file_path:name:type"
-                            if ":" in source_entity_id_str:
-                                parts = source_entity_id_str.split(":")
-                                if len(parts) >= 3:
-                                    file_path = parts[0]
-                                    name = parts[1]
-                                    entity_type = ":".join(parts[2:])  # Handle types with colons
-                                    key = (file_path, name, entity_type)
-                                    source_id = entity_id_map.get(key)
-                        
-                        # Try to find target entity if target_entity_id is provided
-                        target_id = None
-                        target_entity_id_str = rel.get("target_entity_id")
-                        if target_entity_id_str and target_entity_id_str in entity_id_map:
-                            target_id = entity_id_map[target_entity_id_str]
-                        
-                        if source_id:  # Only store if source entity was found
-                            db.create_relationship(
+                        # Store entities
+                        for entity in result.get("entities", []):
+                            db_entity_id = db.create_code_entity(
                                 repo=repo,
-                                source_entity_id=source_id,
-                                target_entity_id=target_id,
-                                target_symbol_name=rel.get("target_symbol_name"),
-                                relationship_type=rel.get("relationship_type", "calls"),
+                                file_path=entity["file_path"],
+                                entity_type=entity["entity_type"],
+                                name=entity["name"],
+                                start_line=entity.get("start_line"),
+                                end_line=entity.get("end_line"),
+                                language=entity.get("language"),
+                                _cursor=cursor,
                             )
-
+                            entities_stored += 1
+                            
+                            # Map by composite key for relationship lookup
+                            key = (entity["file_path"], entity["name"], entity["entity_type"])
+                            entity_id_map[key] = db_entity_id
+                            # Also map by indexer's entity_id string if present
+                            indexer_entity_id = entity.get("entity_id")
+                            if indexer_entity_id:
+                                entity_id_map[indexer_entity_id] = db_entity_id
+                        
+                        # Prepare and store relationships
+                        relationship_tuples = []
+                        for rel in result.get("relationships", []):
+                            source_entity_id_str = rel.get("source_entity_id", "")
+                            source_id = None
+                            
+                            # Try to find source entity by indexer ID or by parsing
+                            if source_entity_id_str in entity_id_map:
+                                source_id = entity_id_map[source_entity_id_str]
+                            else:
+                                # Parse indexer ID format: "file_path:name:type"
+                                if ":" in source_entity_id_str:
+                                    parts = source_entity_id_str.split(":")
+                                    if len(parts) >= 3:
+                                        file_path = parts[0]
+                                        name = parts[1]
+                                        entity_type = ":".join(parts[2:])  # Handle types with colons
+                                        key = (file_path, name, entity_type)
+                                        source_id = entity_id_map.get(key)
+                            
+                            # Try to find target entity if target_entity_id is provided
+                            target_id = None
+                            target_entity_id_str = rel.get("target_entity_id")
+                            if target_entity_id_str and target_entity_id_str in entity_id_map:
+                                target_id = entity_id_map[target_entity_id_str]
+                            
+                            if source_id:  # Only store if source entity was found
+                                relationship_tuples.append((
+                                    repo,
+                                    source_id,
+                                    target_id,
+                                    rel.get("target_symbol_name"),
+                                    rel.get("relationship_type", "calls"),
+                                ))
+                        
+                        # Batch store relationships
+                        if relationship_tuples:
+                            relationships_stored = db.create_relationship_batch(
+                                relationship_tuples, _cursor=cursor
+                            )
+                    
+                    # Build response with error reporting
+                    response_parts = [
+                        f"✅ **Codebase Indexed**\n\n",
+                        f"- **Entities indexed:** {entities_stored}\n",
+                        f"- **Languages:** {', '.join(languages)}\n",
+                        f"- **Entity types:** {', '.join(f'{k}: {v}' for k, v in result['entities_by_type'].items())}\n",
+                        f"- **Relationships:** {relationships_stored}\n",
+                    ]
+                    
+                    if force_reindex:
+                        response_parts.append(f"- **Mode:** Full re-index (previous data cleared)\n")
+                    
+                    if failed_files:
+                        response_parts.append(f"\n⚠️ **{len(failed_files)} files failed to index:**\n")
+                        for file_path, error in failed_files[:5]:  # Show first 5
+                            response_parts.append(f"  - `{file_path}`: {error}\n")
+                        if len(failed_files) > 5:
+                            response_parts.append(f"  - ... and {len(failed_files) - 5} more\n")
+                    
+                    response_parts.append("\nCode entities are now available for relationship-aware reviews.")
+                    
                     return [
                         TextContent(
                             type="text",
-                            text=(
-                                f"✅ **Codebase Indexed**\n\n"
-                                f"- **Entities indexed:** {result['indexed']}\n"
-                                f"- **Languages:** {', '.join(languages)}\n"
-                                f"- **Entity types:** {', '.join(f'{k}: {v}' for k, v in result['entities_by_type'].items())}\n"
-                                f"- **Relationships:** {result['relationships']}\n\n"
-                                f"Code entities are now available for relationship-aware reviews."
-                            ),
+                            text="".join(response_parts),
                         )
                     ]
                 except Exception as e:
                     logger.exception("Indexing failed")
                     return [
                         TextContent(
-                            type="text", text=f"❌ **Indexing failed:** {type(e).__name__}: {e}"
+                            type="text", 
+                            text=(
+                                f"❌ **Indexing failed:** {type(e).__name__}: {e}\n\n"
+                                f"This may indicate a parsing error or database issue. "
+                                f"Try running with `force_reindex: true` to clear and rebuild the index."
+                            )
                         )
                     ]
 
@@ -1597,18 +1638,18 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 
                 try:
                     db = get_db()
-                    # Get entity counts
-                    cursor = db.conn.cursor()
-                    cursor.execute(
-                        """
-                        SELECT entity_type, language, COUNT(*) as count
-                        FROM code_entities
-                        WHERE repo = ?
-                        GROUP BY entity_type, language
-                        """,
-                        (repo,),
-                    )
-                    stats = cursor.fetchall()
+                    # Get entity counts using transaction context manager
+                    with db.transaction() as cursor:
+                        cursor.execute(
+                            """
+                            SELECT entity_type, language, COUNT(*) as count
+                            FROM code_entities
+                            WHERE repo = ?
+                            GROUP BY entity_type, language
+                            """,
+                            (repo,),
+                        )
+                        stats = cursor.fetchall()
 
                     structure = {}
                     for row in stats:
@@ -2133,19 +2174,18 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 
                 try:
                     db = get_db()
-                    cursor = db.conn.cursor()
-
-                    # Count by type
-                    cursor.execute(
-                        """
-                        SELECT type, status, COUNT(*) as count
-                        FROM memory_entries
-                        WHERE repo = ?
-                        GROUP BY type, status
-                        """,
-                        (repo,),
-                    )
-                    stats = cursor.fetchall()
+                    # Get memory statistics using transaction context manager
+                    with db.transaction() as cursor:
+                        cursor.execute(
+                            """
+                            SELECT type, status, COUNT(*) as count
+                            FROM memory_entries
+                            WHERE repo = ?
+                            GROUP BY type, status
+                            """,
+                            (repo,),
+                        )
+                        stats = cursor.fetchall()
 
                     result_text = f"📊 **Memory Statistics for {repo}**\n\n"
                     for row in stats:

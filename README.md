@@ -48,7 +48,34 @@ turingmind-mcp --help
 
 ## Quick Start
 
-### 1. Configure Claude Desktop
+### Unified Setup (Recommended)
+
+```bash
+# Install
+pip install turingmind-mcp
+
+# Setup for your platform
+turingmind setup claude_desktop  # Claude Desktop
+turingmind setup cursor          # Cursor IDE/CLI
+turingmind setup claude_cli      # Claude Code CLI
+
+# Diagnose installation
+turingmind diagnose
+```
+
+### Platform-Specific Setup
+
+TuringMind-MCP supports multiple platforms. Choose your platform:
+
+- **[Claude Desktop](docs/platforms/claude-desktop.md)** - Native MCP integration
+- **[Claude Code CLI](docs/platforms/claude-cli.md)** - Command-line with MCP or Skills
+- **[Claude SDK](docs/platforms/claude-sdk.md)** - Programmatic Python access
+- **[Cursor IDE](docs/platforms/cursor-ide.md)** - Native MCP integration
+- **[Cursor CLI](docs/platforms/cursor-cli.md)** - Command-line integration
+
+### Manual Setup (Claude Desktop Example)
+
+1. **Configure Claude Desktop**
 
 Add to your Claude Desktop config file:
 
@@ -68,9 +95,9 @@ Add to your Claude Desktop config file:
 }
 ```
 
-### 2. Restart Claude Desktop
+2. **Restart Claude Desktop**
 
-### 3. Login to TuringMind
+3. **Login to TuringMind**
 
 In Claude, say: "Log me into TuringMind"
 
@@ -367,6 +394,23 @@ API key lacks required permission. Re-run login to create a new key with proper 
 ## License
 
 MIT — see [LICENSE](LICENSE) for details.
+
+## Documentation
+
+### Getting Started
+- **[Quick Start Guide](QUICK_START.md)** - Get started in 5 minutes
+- **[Platform Guides](docs/platforms/)** - Platform-specific setup
+
+### User Documentation
+- **[Features](docs/FEATURES.md)** - Complete feature list and user flows
+- **[Compatibility Matrix](docs/COMPATIBILITY_MATRIX.md)** - Platform compatibility
+
+### Developer Documentation
+- **[Development Guide](docs/DEVELOPMENT.md)** - Architecture and implementation
+- **[Testing Guide](docs/TESTING_GUIDE.md)** - Testing documentation
+- **[Code Review](docs/REVIEW.md)** - Review findings and fixes
+
+See [Documentation Index](docs/README.md) for complete documentation structure.
 
 ## Links
 

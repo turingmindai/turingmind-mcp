@@ -8,20 +8,25 @@ Uses the same logic as JavaScript parser but handles TypeScript-specific constru
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict
+from typing import Any, Dict, List, Optional
 
 from .javascript_parser import parse_javascript
 
 logger = logging.getLogger("turingmind-mcp")
 
 
-def parse_typescript(ast_root_node: Any, file_content: str) -> Dict[str, Any]:
+def parse_typescript(
+    ast_root_node: Any, 
+    file_content: str,
+    entity_registry: Optional[Dict[tuple, List[Dict[str, Any]]]] = None
+) -> Dict[str, Any]:
     """
     Extract code entities and relationships from a TypeScript AST.
 
     Args:
         ast_root_node: The root node of the tree-sitter AST
         file_content: The full content of the file
+        entity_registry: Optional registry of entities from other files for cross-file lookups
 
     Returns:
         Dictionary containing 'entities' and 'relationships' lists
@@ -30,7 +35,7 @@ def parse_typescript(ast_root_node: Any, file_content: str) -> Dict[str, Any]:
     # TypeScript-specific constructs like interfaces, type aliases, enums
 
     # Use JavaScript parser as base
-    result = parse_javascript(ast_root_node, file_content)
+    result = parse_javascript(ast_root_node, file_content, entity_registry)
 
     # Add TypeScript-specific processing
     entities = result["entities"]

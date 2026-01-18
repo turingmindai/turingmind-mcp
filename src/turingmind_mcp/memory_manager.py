@@ -179,16 +179,15 @@ class MemoryManager:
         # Create approval request if needed
         if requires_approval:
             approval_id = str(uuid.uuid4())
-            cursor = self.db.conn.cursor()
-            cursor.execute(
-                """
-                INSERT INTO memory_approvals (
-                    approval_id, repo, memory_id, requested_by, status
-                ) VALUES (?, ?, ?, ?, 'pending')
-                """,
-                (approval_id, repo, memory_id, created_by or "system"),
-            )
-            self.db.conn.commit()
+            with self.db.transaction() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO memory_approvals (
+                        approval_id, repo, memory_id, requested_by, status
+                    ) VALUES (?, ?, ?, ?, 'pending')
+                    """,
+                    (approval_id, repo, memory_id, created_by or "system"),
+                )
 
         # Detect conflicts
         conflicts = self.detect_conflicts(repo, memory_id)

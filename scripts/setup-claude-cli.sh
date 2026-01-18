@@ -1,0 +1,127 @@
+#!/bin/bash
+
+# Setup script for Claude Code CLI integration
+# This script configures TuringMind-MCP for Claude Code CLI
+
+set -e
+
+# Colors
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+RED='\033[0;31m'
+CYAN='\033[0;36m'
+NC='\033[0m' # No Color
+
+echo -e "${CYAN}🧠 Setting up TuringMind-MCP for Claude Code CLI...${NC}"
+echo ""
+
+# Check if we're in a git repository
+if ! git rev-parse --git-dir > /dev/null 2>&1; then
+    echo -e "${YELLOW}⚠️  Not in a git repository${NC}"
+    echo "This script should be run from your project root"
+    read -p "Continue anyway? (y/N): " -n 1 -r
+    echo
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        exit 1
+    fi
+fi
+
+PROJECT_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+CONFIG_FILE="$PROJECT_ROOT/mcp.json"
+
+echo -e "${CYAN}Project root: ${PROJECT_ROOT}${NC}"
+echo -e "${CYAN}Config file: ${CONFIG_FILE}${NC}"
+echo ""
+
+# Check if turingmind-mcp is installed
+if ! command -v turingmind-mcp &> /dev/null; then
+    echo -e "${YELLOW}⚠️  turingmind-mcp not found in PATH${NC}"
+    echo "Installing turingmind-mcp..."
+    pip install turingmind-mcp
+    echo -e "${GREEN}✅ Installed turingmind-mcp${NC}"
+else
+    echo -e "${GREEN}✅ turingmind-mcp found${NC}"
+fi
+
+# Check if Claude CLI is available
+if ! command -v claude &> /dev/null; then
+    echo -e "${YELLOW}⚠️  Claude CLI not found${NC}"
+    echo "Install Claude Code CLI first: https://docs.claude.com/en/docs/claude-code/cli-usage"
+    exit 1
+else
+    echo -e "${GREEN}✅ Claude CLI found${NC}"
+fi
+
+# Read existing config or create new
+if [ -f "$CONFIG_FILE" ]; then
+    echo -e "${CYAN}Found existing config, backing up...${NC}"
+    cp "$CONFIG_FILE" "$CONFIG_FILE.backup"
+    echo -e "${GREEN}✅ Backup created: ${CONFIG_FILE}.backup${NC}"
+    
+    CONFIG=$(cat "$CONFIG_FILE")
+else
+    echo -e "${CYAN}Creating new config...${NC}"
+    CONFIG="{}"
+fi
+
+# Use Python to safely merge JSON
+python3 << PYTHON_SCRIPT
+import json
+import sys
+
+config_path = "$CONFIG_FILE"
+
+# Read existing config
+try:
+    with open(config_path) as f:
+        config = json.load(f)
+except (FileNotFoundError, json.JSONDecodeError):
+    config = {}
+
+# Initialize mcpServers if needed
+if "mcpServers" not in config:
+    config["mcpServers"] = {}
+
+# Check if turingmind already exists
+if "turingmind" in config["mcpServers"]:
+    print("⚠️  TuringMind MCP server already configured")
+    response = input("Update existing configuration? (y/N): ")
+    if response.lower() != 'y':
+        print("Skipping configuration update")
+        sys.exit(0)
+
+# Add/update turingmind server
+config["mcpServers"]["turingmind"] = {
+    "command": "turingmind-mcp",
+    "args": [],
+    "env": {
+        "TURINGMIND_API_URL": "https://api.turingmind.ai"
+    }
+}
+
+# Write config
+with open(config_path, 'w') as f:
+    json.dump(config, f, indent=2)
+
+print("✅ Configuration updated successfully")
+PYTHON_SCRIPT
+
+if [ $? -eq 0 ]; then
+    echo ""
+    echo -e "${GREEN}✅ Claude CLI configuration complete!${NC}"
+    echo ""
+    echo -e "${CYAN}Next steps:${NC}"
+    echo "1. Verify MCP servers: claude mcp"
+    echo "2. Test integration: claude -p 'Review my code' --allowedTools 'turingmind_*'"
+    echo "3. Login: In Claude, say 'Log me into TuringMind'"
+    echo ""
+    echo -e "${YELLOW}Config file: ${CONFIG_FILE}${NC}"
+    echo ""
+    echo -e "${CYAN}Alternative: Use Claude Code Skills${NC}"
+    echo "1. /plugin marketplace add turingmindai/tmind"
+    echo "2. /plugin install tmind@tmind"
+    echo "3. /tmind:setup"
+else
+    echo -e "${RED}❌ Configuration failed${NC}"
+    exit 1
+fi

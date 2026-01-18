@@ -13,13 +13,18 @@ from typing import Any, Dict, List, Optional
 logger = logging.getLogger("turingmind-mcp")
 
 
-def parse_python(ast_root_node: Any, file_content: str) -> Dict[str, Any]:
+def parse_python(
+    ast_root_node: Any, 
+    file_content: str,
+    entity_registry: Optional[Dict[tuple, List[Dict[str, Any]]]] = None
+) -> Dict[str, Any]:
     """
     Extract code entities and relationships from a Python AST.
 
     Args:
         ast_root_node: The root node of the tree-sitter AST
         file_content: The full content of the file
+        entity_registry: Optional registry of entities from other files for cross-file lookups
 
     Returns:
         Dictionary containing 'entities' and 'relationships' lists
@@ -114,13 +119,31 @@ def parse_python(ast_root_node: Any, file_content: str) -> Dict[str, Any]:
 
     def find_entity_by_name(name: str, entity_type: Optional[str] = None) -> Optional[Dict[str, Any]]:
         """Find an entity by name and optionally by type."""
+        # First search in current file's entities
         for entity in entities:
             if entity["name"] == name and (entity_type is None or entity["entity_type"] == entity_type):
                 return entity
+        
+        # Then search in global registry if available
+        if entity_registry:
+            if entity_type:
+                key = (name, entity_type)
+                if key in entity_registry:
+                    # Return first match (could be improved with scope resolution)
+                    return entity_registry[key][0]
+            else:
+                # Try common entity types
+                for et in ["function", "function_definition", "method_definition", "class_definition", "class"]:
+                    key = (name, et)
+                    if key in entity_registry:
+                        return entity_registry[key][0]
+        
         return None
 
     def process_function_definition(node: Any):
         """Process a function definition node."""
+        nonlocal current_parent_entity
+        
         # Find the identifier (function name)
         name_node = None
         is_async = False
@@ -155,7 +178,6 @@ def parse_python(ast_root_node: Any, file_content: str) -> Dict[str, Any]:
 
             # Set as parent and process body
             prev_parent = current_parent_entity
-            nonlocal current_parent_entity
             current_parent_entity = entity
 
             # Process function body
@@ -169,6 +191,8 @@ def parse_python(ast_root_node: Any, file_content: str) -> Dict[str, Any]:
 
     def process_class_definition(node: Any):
         """Process a class definition node."""
+        nonlocal current_parent_entity
+        
         # Find identifier (class name)
         name_node = None
         for child in node.children:
@@ -198,7 +222,6 @@ def parse_python(ast_root_node: Any, file_content: str) -> Dict[str, Any]:
 
             # Set as parent and process body
             prev_parent = current_parent_entity
-            nonlocal current_parent_entity
             current_parent_entity = entity
 
             # Process class body
@@ -214,8 +237,12 @@ def parse_python(ast_root_node: Any, file_content: str) -> Dict[str, Any]:
             if child.type == "argument_list":
                 for base_child in child.children:
                     if base_child.type == "identifier":
-                        base_name = base_child.text.decode("utf-8") if hasattr(base_child.text, "decode") else base_child.text
+                        base_name = get_text(base_child)
+                        # Search in current file first, then registry
                         target_entity = find_entity_by_name(base_name, "class_definition")
+                        if not target_entity:
+                            # Try without type constraint to search registry
+                            target_entity = find_entity_by_name(base_name)
 
                         create_relationship(
                             class_entity["entity_id"],
@@ -272,10 +299,20 @@ def parse_python(ast_root_node: Any, file_content: str) -> Dict[str, Any]:
         from_module = entity.get("custom_metadata", {}).get("from_module")
 
         for imported_name in imported_names:
+            # Try to find imported entity in registry
+            target_entity = None
+            if entity_registry:
+                # Look for function, class, or module
+                for entity_type in ["function", "function_definition", "class_definition", "class"]:
+                    key = (imported_name, entity_type)
+                    if key in entity_registry:
+                        target_entity = entity_registry[key][0]
+                        break
+            
             # Create relationship to imported symbol
             create_relationship(
                 entity["entity_id"],
-                None,  # Target may be in another file
+                target_entity["entity_id"] if target_entity else None,
                 imported_name,
                 "IMPORTS",
                 {"from_module": from_module} if from_module else {},
@@ -308,13 +345,19 @@ def parse_python(ast_root_node: Any, file_content: str) -> Dict[str, Any]:
                             break
 
                 if function_name:
-                    target_entity = find_entity_by_name(function_name)
+                    # Search for function in current file and registry
+                    target_entity = find_entity_by_name(function_name, "function_definition")
+                    if not target_entity:
+                        target_entity = find_entity_by_name(function_name, "method_definition")
+                    if not target_entity:
+                        # Try without type constraint
+                        target_entity = find_entity_by_name(function_name)
 
                     create_relationship(
                         scope_entity["entity_id"],
                         target_entity["entity_id"] if target_entity else None,
                         function_name,
-                        "CALLS_FUNCTION",
+                        "calls",  # Use lowercase for consistency
                         {
                             "call_location": {
                                 "line": node.start_point[0] + 1,

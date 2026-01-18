@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "turingmind": {
+      "command": "turingmind-mcp",
+      "env": {
+        "TURINGMIND_API_URL": "https://api.turingmind.ai"
+      }
+    }
+  }
+}

@@ -11,16 +11,37 @@ This module provides database operations for:
 
 from __future__ import annotations
 
+import atexit
 import json
+import os
 import sqlite3
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Generator, List, Optional, Tuple
 
 import logging
 
 logger = logging.getLogger("turingmind-mcp")
+
+# Track all database instances for cleanup
+_db_instances: List["MemoryDatabase"] = []
+
+
+def _cleanup_all_databases():
+    """Cleanup all database connections on shutdown."""
+    for db in _db_instances:
+        try:
+            db.close()
+            logger.debug(f"Closed database connection: {db.db_path}")
+        except Exception as e:
+            logger.warning(f"Error closing database: {e}")
+    _db_instances.clear()
+
+
+# Register cleanup on interpreter shutdown
+atexit.register(_cleanup_all_databases)
 
 
 class MemoryDatabase:
@@ -37,7 +58,21 @@ class MemoryDatabase:
         self.db_path = db_path
         self.conn = sqlite3.connect(db_path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
+        self._closed = False
+        
+        # Set secure file permissions (read/write for owner only)
+        try:
+            os.chmod(db_path, 0o600)
+        except Exception as e:
+            logger.warning(f"Failed to set database file permissions: {e}")
+        
+        # Enable foreign key constraints
+        self.conn.execute("PRAGMA foreign_keys = ON")
+        
         self._initialize_schema()
+        
+        # Register this instance for cleanup
+        _db_instances.append(self)
 
     def _initialize_schema(self):
         """Create database tables if they don't exist."""
@@ -137,7 +172,8 @@ class MemoryDatabase:
                 end_line INTEGER,
                 language TEXT,
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(repo, file_path, name, entity_type)
             )
         """)
 
@@ -213,7 +249,33 @@ class MemoryDatabase:
 
     def close(self):
         """Close database connection."""
-        self.conn.close()
+        if not self._closed:
+            self.conn.close()
+            self._closed = True
+            # Remove from tracked instances
+            if self in _db_instances:
+                _db_instances.remove(self)
+
+    @contextmanager
+    def transaction(self) -> Generator[sqlite3.Cursor, None, None]:
+        """
+        Context manager for transactional operations.
+        
+        Commits on success, rolls back on exception.
+        
+        Usage:
+            with db.transaction() as cursor:
+                cursor.execute(...)
+                cursor.execute(...)
+            # Auto-commits if no exception
+        """
+        cursor = self.conn.cursor()
+        try:
+            yield cursor
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
 
     # Memory Entry Operations
     def create_memory_entry(
@@ -232,6 +294,9 @@ class MemoryDatabase:
         """Create a new memory entry."""
         memory_id = str(uuid.uuid4())
         security_tags_json = json.dumps(security_tags) if security_tags else None
+        
+        # Clamp confidence to valid range [0.0, 1.0]
+        confidence = max(0.0, min(1.0, confidence))
 
         cursor = self.conn.cursor()
         cursor.execute(
@@ -544,21 +609,126 @@ class MemoryDatabase:
         start_line: Optional[int] = None,
         end_line: Optional[int] = None,
         language: Optional[str] = None,
+        _cursor: Optional[sqlite3.Cursor] = None,
     ) -> str:
-        """Create a code entity."""
-        entity_id = str(uuid.uuid4())
-        cursor = self.conn.cursor()
+        """
+        Create or update a code entity (upsert).
+        
+        If an entity with the same (repo, file_path, name, entity_type) exists,
+        it will be updated. Otherwise, a new entity is created.
+        
+        Args:
+            _cursor: Optional cursor for transaction batching. If provided,
+                     caller is responsible for commit.
+        
+        Returns:
+            The entity_id (either new or existing).
+        """
+        cursor = _cursor or self.conn.cursor()
+        
+        # First, try to find existing entity
         cursor.execute(
             """
-            INSERT INTO code_entities (
-                entity_id, repo, file_path, entity_type, name,
-                start_line, end_line, language
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            SELECT entity_id FROM code_entities 
+            WHERE repo = ? AND file_path = ? AND name = ? AND entity_type = ?
             """,
-            (entity_id, repo, file_path, entity_type, name, start_line, end_line, language),
+            (repo, file_path, name, entity_type),
         )
-        self.conn.commit()
+        existing = cursor.fetchone()
+        
+        if existing:
+            # Update existing entity
+            entity_id = existing[0]
+            cursor.execute(
+                """
+                UPDATE code_entities SET
+                    start_line = ?,
+                    end_line = ?,
+                    language = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE entity_id = ?
+                """,
+                (start_line, end_line, language, entity_id),
+            )
+        else:
+            # Insert new entity
+            entity_id = str(uuid.uuid4())
+            cursor.execute(
+                """
+                INSERT INTO code_entities (
+                    entity_id, repo, file_path, entity_type, name,
+                    start_line, end_line, language
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (entity_id, repo, file_path, entity_type, name, start_line, end_line, language),
+            )
+        
+        if _cursor is None:
+            self.conn.commit()
+        
         return entity_id
+    
+    def clear_entities_for_repo(self, repo: str, _cursor: Optional[sqlite3.Cursor] = None) -> int:
+        """
+        Clear all code entities and relationships for a repository.
+        
+        Useful before re-indexing to avoid stale data.
+        
+        Args:
+            _cursor: Optional cursor for transaction batching.
+            
+        Returns:
+            Number of entities deleted.
+        """
+        cursor = _cursor or self.conn.cursor()
+        
+        # Delete relationships first (due to foreign key constraints)
+        cursor.execute("DELETE FROM code_relationships WHERE repo = ?", (repo,))
+        
+        # Delete entities
+        cursor.execute("DELETE FROM code_entities WHERE repo = ?", (repo,))
+        deleted_count = cursor.rowcount
+        
+        if _cursor is None:
+            self.conn.commit()
+        
+        logger.info(f"Cleared {deleted_count} entities for repo {repo}")
+        return deleted_count
+    
+    def create_relationship_batch(
+        self,
+        relationships: List[Tuple[str, str, Optional[str], Optional[str], str]],
+        _cursor: Optional[sqlite3.Cursor] = None,
+    ) -> int:
+        """
+        Create multiple relationships in a batch.
+        
+        Args:
+            relationships: List of (repo, source_entity_id, target_entity_id, 
+                          target_symbol_name, relationship_type) tuples.
+            _cursor: Optional cursor for transaction batching.
+            
+        Returns:
+            Number of relationships created.
+        """
+        cursor = _cursor or self.conn.cursor()
+        
+        for repo, source_id, target_id, target_symbol, rel_type in relationships:
+            relationship_id = str(uuid.uuid4())
+            cursor.execute(
+                """
+                INSERT INTO code_relationships (
+                    relationship_id, source_entity_id, target_entity_id,
+                    target_symbol_name, relationship_type, repo
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (relationship_id, source_id, target_id, target_symbol, rel_type, repo),
+            )
+        
+        if _cursor is None:
+            self.conn.commit()
+        
+        return len(relationships)
 
     def get_code_entity(self, entity_id: str) -> Optional[Dict[str, Any]]:
         """Get a code entity by ID."""

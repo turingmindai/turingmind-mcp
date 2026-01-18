@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "turingmind": {
+      "command": "/Users/turingmindai/.local/bin/turingmind-mcp",
+      "args": [],
+      "env": {
+        "PYTHONPATH": "/Users/turingmindai/Documents/VSCodeProjects/Turingmind-App/turingmind-mcp/src"
+      }
+    }
+  }
+}
