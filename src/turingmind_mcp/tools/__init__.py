@@ -17,7 +17,7 @@ HANDLERS: dict[str, ToolHandler] = {}
 
 def register_all() -> None:
     """Import all tool modules so they register their handlers."""
-    from . import auth, auto_plan, chat_analysis, code_index, code_review, decisions, edit_tools, issues, login, memory, planning, risks, specs, workflow
+    from . import auth, auto_plan, chat_analysis, code_index, code_review, edit_tools, login, memory
     from ..v2_engine import handlers as v2_handlers
 
     login.register(HANDLERS)
@@ -28,12 +28,6 @@ def register_all() -> None:
     memory.register(HANDLERS)
     auto_plan.register(HANDLERS)
     chat_analysis.register(HANDLERS)
-    decisions.register(HANDLERS)
-    issues.register(HANDLERS)
-    specs.register(HANDLERS)
-    risks.register(HANDLERS)
-    planning.register(HANDLERS)
-    workflow.register(HANDLERS)
     # v2 Constraint Engine — 14 new tools registered last so they take precedence
     v2_handlers.register(HANDLERS)
 

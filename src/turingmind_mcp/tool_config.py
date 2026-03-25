@@ -89,50 +89,6 @@ TOOL_GROUPS = {
         "turingmind_get_chat_analysis_plans",
         "turingmind_enhance_chat_analysis",
     },
-    "decisions": {
-        "turingmind_create_decision",
-        "turingmind_get_pending_decisions",
-        "turingmind_resolve_decision",
-        "turingmind_get_decision_stats",
-    },
-    "issues": {
-        "turingmind_create_issue",
-        "turingmind_get_issue",
-        "turingmind_list_issues",
-        "turingmind_update_issue",
-        "turingmind_create_comment",
-        "turingmind_list_comments",
-        "turingmind_is_issue_blocked",
-        "turingmind_get_next_unblocked_issue",
-    },
-    "goals": {
-        "turingmind_create_goal",
-        "turingmind_get_goal",
-        "turingmind_list_goals",
-        "turingmind_update_goal",
-    },
-    "initiatives": {
-        "turingmind_create_initiative",
-        "turingmind_get_initiative",
-        "turingmind_list_initiatives",
-        "turingmind_update_initiative",
-    },
-    "features": {
-        "turingmind_create_feature",
-        "turingmind_get_feature",
-        "turingmind_list_features",
-        "turingmind_update_feature",
-        "turingmind_break_down_feature",
-        "turingmind_update_feature_progress",
-        "turingmind_get_feature_issues",
-    },
-    "specs": {
-        "turingmind_create_strategic_spec",
-        "turingmind_get_strategic_spec",
-        "turingmind_list_strategic_specs",
-        "turingmind_update_strategic_spec",
-    },
-    "risks": {
         "turingmind_create_strategic_risk",
         "turingmind_get_strategic_risk",
         "turingmind_list_strategic_risks",
@@ -170,10 +126,10 @@ TOOL_GROUPS = {
 
 # Set via environment variable or modify here
 # Format: comma-separated group names, e.g., "login,tdd_workflow,edit_tools"
-DEFAULT_ENABLED_GROUPS = "login,tdd_workflow,edit_tools,chat_analysis,auto_plan,decisions,issues,goals,initiatives,features,specs,risks,v2_engine"
+DEFAULT_ENABLED_GROUPS = "login,auth,code_review,code_index,memory,edit_tools,v2_engine"
 
 # Full set (all tools enabled)
-FULL_ENABLED_GROUPS = "login,auth,code_review,code_index,memory,tdd_workflow,auto_plan,edit_tools,chat_analysis,decisions,issues,goals,initiatives,features,specs,risks,v2_engine"
+FULL_ENABLED_GROUPS = "login,auth,code_review,code_index,memory,edit_tools,v2_engine"
 
 
 def get_enabled_groups() -> Set[str]:
