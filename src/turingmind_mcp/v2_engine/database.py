@@ -3,10 +3,10 @@ SQLite database interface for the v2 Deterministic Constraint Engine.
 Provides a strict graph-based schema mapping to SpecNodes and Execution loop queues.
 """
 
-import json
 import logging
 import os
 import sqlite3
+from collections import deque
 from typing import List, Optional
 
 from .models import SpecNode, ExecutionState, ExecutionStage, FailureClassification
@@ -27,6 +27,8 @@ def _get_connection() -> sqlite3.Connection:
     # Enable Write-Ahead Logging for simultaneous Cursor CLI / AIDD UI access
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA busy_timeout=5000;")
+    # SQLite disables FK enforcement by default — must enable per-connection
+    conn.execute("PRAGMA foreign_keys=ON;")
     return conn
 
 def init_db() -> None:
@@ -141,20 +143,24 @@ def get_impacted_subgraph(upstream_id: str) -> List[str]:
     """
     The core Safe Change engine primitive: Returns all nodes downstream from an origin node.
     If 'upstream_id' (API endpoint) changes, EVERYTHING downstream must be invalidated.
+    Uses iterative BFS to avoid stack overflow on large DAGs.
     """
-    impacted = set()
-    
-    def _traverse(node_id: str):
-        with _get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT downstream_id FROM edge_graph WHERE upstream_id = ?", (node_id,))
+    impacted: set[str] = set()
+    queue: deque[str] = deque([upstream_id])
+
+    with _get_connection() as conn:
+        cursor = conn.cursor()
+        while queue:
+            current = queue.popleft()
+            cursor.execute(
+                "SELECT downstream_id FROM edge_graph WHERE upstream_id = ?", (current,)
+            )
             for row in cursor.fetchall():
                 down_id = row["downstream_id"]
                 if down_id not in impacted:
                     impacted.add(down_id)
-                    _traverse(down_id)
-                    
-    _traverse(upstream_id)
+                    queue.append(down_id)
+
     return list(impacted)
 
 # ==================================================
