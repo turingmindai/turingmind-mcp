@@ -13,12 +13,9 @@ def register(registry: dict) -> None:
     registry["turingmind_list_memory"] = handle_list_memory
     registry["turingmind_get_memory"] = handle_get_memory
     registry["turingmind_save_memory"] = handle_save_memory
-    registry["turingmind_delete_memory"] = handle_delete_memory
-    registry["turingmind_detect_conflicts"] = handle_detect_conflicts
-    registry["turingmind_resolve_conflict"] = handle_resolve_conflict
-    registry["turingmind_simulate_impact"] = handle_simulate_impact
-    registry["turingmind_explain_decision"] = handle_explain_decision
-    registry["turingmind_get_memory_stats"] = handle_get_memory_stats
+    # NOTE: delete_memory, detect_conflicts, resolve_conflict, simulate_impact,
+    # explain_decision, get_memory_stats are intentionally NOT registered.
+    # They have no v2 tool definitions and are not exposed to agents.
 
 
 async def handle_list_memory(arguments: dict, ctx: ToolContext) -> list[TextContent]:

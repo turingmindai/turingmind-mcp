@@ -49,7 +49,7 @@ from .memory_manager import MemoryManager
 from .entity_indexer import EntityIndexer, get_repo_path
 from .auto_review_service import get_auto_review_service
 from .tool_config import is_tool_enabled, get_enabled_tools
-from .tool_registry import get_all_tools
+from .v2_engine.tool_registry import ALL_V2_TOOLS
 from .tools import ToolContext, get_handler, register_all
 
 # Import agents and LLM providers
@@ -90,34 +90,14 @@ AUTH_FREE_TOOLS = {
     "turingmind_get_related_code",
     "turingmind_get_project_structure",
     "turingmind_get_edit_reasoning",
-    "turingmind_list_memory",
-    "turingmind_get_memory",
-    "turingmind_get_memory_stats",
-    "turingmind_explain_decision",
-    # TDD/SDD tools (local database, no cloud required)
-    "turingmind_create_edit_plan",
-    "turingmind_generate_spec",
-    "turingmind_define_required_tests",
-    "turingmind_mark_test_written",
-    "turingmind_validate_tests_written",
-    "turingmind_request_code_edit",
-    "turingmind_validate_tests_passing",
-    "turingmind_complete_tdd_cycle",
-    "turingmind_get_tdd_status",
-    "turingmind_get_audit_trail",
-    "turingmind_get_kanban_data",
-    # Auto-plan tools (continuous SDD)
     "turingmind_analyze_diff",
-    "turingmind_store_auto_plan",
-    "turingmind_get_auto_plans",
-    "turingmind_bundle_plans_for_commit",
-    # Reasoning-captured edit tools
     "turingmind_apply_edit",
     "turingmind_log_reasoning",
-    # Chat analysis tools
-    "turingmind_store_chat_analysis_plan",
-    "turingmind_get_chat_analysis_plans",
-    "turingmind_enhance_chat_analysis",  # Agent-based chat analysis (uses Azure OpenAI, not TuringMind API)
+    "turingmind_get_memory",
+    "turingmind_save_memory",
+    "turingmind_list_memory",
+    "turingmind_get_audit_trail",
+    "turingmind_validate_auth",
     # v2 Engine (Local constraint graph operations)
     "turingmind_create_spec_node",
     "turingmind_update_spec_node",
@@ -133,7 +113,10 @@ AUTH_FREE_TOOLS = {
     "turingmind_get_impacted_nodes",
     "turingmind_request_approval",
     "turingmind_get_execution_state",
+    "turingmind_ingest_runtime_signal",
+    "turingmind_bootstrap_codebase",
 }
+
 
 # Package version
 __version__ = "0.2.0"
@@ -238,7 +221,7 @@ def get_memory_manager() -> MemoryManager:
 _chat_analysis_agent = None
 
 
-def get_chat_analysis_agent() -> Optional[ChatAnalysisAgent]:
+def get_chat_analysis_agent() -> Optional[object]:  # ChatAnalysisAgent when available, else None
     """Get or create ChatAnalysisAgent instance with LangSmith integration."""
     global _chat_analysis_agent
     
@@ -265,37 +248,41 @@ def get_chat_analysis_agent() -> Optional[ChatAnalysisAgent]:
             else:
                 logger.debug("LangSmith not configured. Agent will run without tracing.")
         
+        # Guard: only instantiate if ChatAnalysisAgent is actually a callable class
+        if not callable(ChatAnalysisAgent):
+            return None
         _chat_analysis_agent = ChatAnalysisAgent(
             llm_provider=llm_provider,
             langsmith_client=langsmith_client,
             use_heavy_task_model=False
         )
-    
+
     return _chat_analysis_agent
+
+
+# Register all tool handlers once at import time (not per-request)
+register_all()
 
 
 @server.list_tools()
 async def list_tools() -> list[Tool]:
     """List available TuringMind tools.
-    
-    Tools are filtered based on TURINGMIND_ENABLED_TOOL_GROUPS environment variable.
-    Set to 'all' for all tools, 'minimal' for core workflow, or comma-separated group names.
-    Default: minimal (login,tdd_workflow,edit_tools,chat_analysis,auto_plan)
+
+    Filtered by TURINGMIND_ENABLED_TOOL_GROUPS env var.
+    Set to 'all', 'v2_engine', 'code_intelligence', 'login', or a comma-separated list.
+    Default: v2_engine,login,code_intelligence
     """
     enabled_tools = get_enabled_tools()
     logger.info(f"Enabled tools: {len(enabled_tools)} tools from groups")
-    all_tools = get_all_tools()
-    
-    # Filter to only enabled tools
-    filtered_tools = [tool for tool in all_tools if tool.name in enabled_tools]
-    logger.info(f"Returning {len(filtered_tools)} of {len(all_tools)} tools (filtered by tool_config)")
+    filtered_tools = [tool for tool in ALL_V2_TOOLS if tool.name in enabled_tools]
+    logger.info(f"Returning {len(filtered_tools)} of {len(ALL_V2_TOOLS)} tools (filtered by tool_config)")
     return filtered_tools
 
 
 @server.call_tool()
 async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     """Execute a TuringMind tool."""
-    
+
     # Check if tool is enabled
     if not is_tool_enabled(name):
         return [
@@ -312,7 +299,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 ),
             )
         ]
-    
+
     api_url, api_key = get_config()
 
     # Check if tool requires authentication
@@ -333,6 +320,32 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 
     logger.info(f"Executing tool: {name}")
 
+    # ── Fast path: local handler (v2 engine, code intelligence, memory) ──
+    # These never touch the network — no need to open an httpx client.
+    handler = get_handler(name)
+    if handler is not None:
+        try:
+            # Build a minimal ToolContext; cloud credentials are optional here.
+            context = ToolContext(
+                client=None,  # not used by local handlers
+                api_url=api_url,
+                headers={},
+                logger=logger,
+                save_api_key=save_api_key,
+                version=__version__,
+                get_db=get_db,
+                get_memory_manager=get_memory_manager,
+                get_repo_path=get_repo_path,
+                get_config=get_config,
+                entity_indexer_cls=EntityIndexer,
+                get_chat_analysis_agent=get_chat_analysis_agent,
+            )
+            return await handler(arguments, context)
+        except Exception as e:
+            logger.exception(f"Local tool {name} failed")
+            return [TextContent(type="text", text=f"❌ **Error:** {type(e).__name__}: {e}")]
+
+    # ── Cloud path: tools that call the TuringMind API over HTTP ──
     async with httpx.AsyncClient(timeout=30.0) as client:
         headers = {
             "Content-Type": "application/json",
@@ -342,7 +355,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             headers["Authorization"] = f"Bearer {api_key}"
 
         try:
-            register_all()
+            # Build full context for cloud tools
             context = ToolContext(
                 client=client,
                 api_url=api_url,
@@ -357,28 +370,23 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 entity_indexer_cls=EntityIndexer,
                 get_chat_analysis_agent=get_chat_analysis_agent,
             )
-            handler = get_handler(name)
-            if handler is not None:
-                return await handler(arguments, context)
-            # ─────────────────────────────────────────────────────────────
-            # UNKNOWN TOOL
-            # ─────────────────────────────────────────────────────────────
-            else:
-                return [
-                    TextContent(
-                        type="text",
-                        text=(
-                            f"❌ **Unknown tool:** `{name}`\n\n"
-                            f"Available tools:\n"
-                            f"- `turingmind_initiate_login` - Start login flow\n"
-                            f"- `turingmind_poll_login` - Complete login\n"
-                            f"- `turingmind_validate_auth` - Check auth status\n"
-                            f"- `turingmind_upload_review` - Upload review results\n"
-                            f"- `turingmind_get_context` - Get memory context\n"
-                            f"- `turingmind_submit_feedback` - Submit issue feedback"
-                        ),
-                    )
-                ]
+            # If we reach here with no handler, the tool is unknown
+            return [
+                TextContent(
+                    type="text",
+                    text=(
+                        f"❌ **Unknown tool:** `{name}`\n\n"
+                        f"Available v2 tools include:\n"
+                        f"- `turingmind_create_spec_node` - Create a new constraint node\n"
+                        f"- `turingmind_list_spec_nodes` - List nodes for a repo\n"
+                        f"- `turingmind_get_execution_state` - Get DAG control plane state\n"
+                        f"- `turingmind_apply_spec_delta` - Propagate a spec change\n"
+                        f"- `turingmind_classify_failure` - Classify a node failure\n"
+                        f"- `turingmind_request_approval` - Human-gate a node\n"
+                        f"Run `list_tools` to see the full enabled tool surface."
+                    ),
+                )
+            ]
 
         except httpx.ConnectError:
             return [
@@ -399,8 +407,11 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 )
             ]
         except Exception as e:
-            logger.exception(f"Tool {name} failed")
+            logger.exception(f"Cloud tool {name} failed")
             return [TextContent(type="text", text=f"❌ **Error:** {type(e).__name__}: {e}")]
+
+    # Unreachable: all branches above return, but satisfies type checker
+    return [TextContent(type="text", text=f"❌ **Error:** unexpected code path for tool `{name}`.")]
 
 
 # ============================================================================

@@ -197,6 +197,10 @@ V2_TOOLS: list[Tool] = [
             "type": "object",
             "properties": {
                 "node_id": {"type": "string", "description": "SpecNode to generate tests for"},
+                "test_dir": {
+                    "type": "string",
+                    "description": "Directory to write stub .py test files into. If omitted, stubs are recorded in DB but not written to disk."
+                },
                 "verification_types": {
                     "type": "array",
                     "items": {
@@ -220,6 +224,14 @@ V2_TOOLS: list[Tool] = [
             "type": "object",
             "properties": {
                 "node_id": {"type": "string"},
+                "test_dir": {
+                    "type": "string",
+                    "description": "Directory containing tests to run with pytest. Auto-discovered from node.implementation.files if omitted."
+                },
+                "python_bin": {
+                    "type": "string",
+                    "description": "Path to the Python binary to use (e.g. '/path/to/.venv/bin/python'). Defaults to 'python'."
+                },
                 "verification_types": {
                     "type": "array",
                     "items": {"type": "string"},
@@ -394,6 +406,68 @@ V2_TOOLS: list[Tool] = [
             "type": "object",
             "properties": {"repo": {"type": "string"}},
             "required": ["repo"],
+        },
+    ),
+    Tool(
+        name="turingmind_ingest_runtime_signal",
+        description=(
+            "Ingest a live runtime signal into the constraint graph. "
+            "Automatically checks the value against contractual Metric thresholds, "
+            "decays node confidence proportionally if breached, marks the node failed "
+            "if confidence falls below 0.6, and fully invalidates the node on a regression. "
+            "Every change is recorded as Evidence so confidence always has a receipt. "
+            "Call from CI, Sentry, Datadog, or any monitoring source."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "repo": {"type": "string", "description": "Repository (owner/repo)"},
+                "node_id": {"type": "string", "description": "SpecNode to attach the signal to"},
+                "signal_type": {
+                    "type": "string",
+                    "enum": ["error_rate", "p95_latency", "regression", "user_feedback", "coverage_drop", "security_finding"],
+                    "description": "Category of runtime signal. 'regression' always fully invalidates the node."
+                },
+                "value": {"type": "number", "description": "Observed value (e.g. 0.04 for 4% error rate)"},
+                "threshold": {
+                    "type": "number",
+                    "description": "Limit the value must stay under. If omitted, the system checks the node's contract Metrics automatically."
+                },
+                "source": {"type": "string", "description": "Origin of the signal (e.g. 'sentry', 'ci', 'datadog', 'cursor')"},
+                "detail": {"type": "string", "description": "Human-readable detail for the Evidence record"},
+            },
+            "required": ["repo", "node_id", "signal_type", "value"],
+        },
+    ),
+    Tool(
+        name="turingmind_bootstrap_codebase",
+        description=(
+            "Scan an existing project directory and auto-create L2 SpecNodes for each module group. "
+            "Nodes are created with blank contracts — fill in invariants and metrics progressively. "
+            "Use dry_run=true first to preview what would be created without writing to the DB. "
+            "Skips excluded directories (node_modules, .venv, __pycache__, etc.) automatically."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "repo": {"type": "string", "description": "Repository (owner/repo)"},
+                "project_path": {"type": "string", "description": "Absolute path to the project root to scan"},
+                "include_patterns": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Glob patterns to include (default: ['*.py','*.ts','*.js','*.jsx','*.tsx'])",
+                },
+                "exclude_dirs": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Directory names to skip (default: node_modules, .venv, __pycache__, .git, dist, build)",
+                },
+                "dry_run": {
+                    "type": "boolean",
+                    "description": "If true, preview nodes without writing to the DB (default: false)",
+                },
+            },
+            "required": ["repo", "project_path"],
         },
     ),
 ]

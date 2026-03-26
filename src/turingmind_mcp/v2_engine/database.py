@@ -85,6 +85,12 @@ def init_db() -> None:
 
 def save_spec_node(node: SpecNode) -> None:
     """Save a SpecNode and strictly sync its dependency edges in the mathematical graph."""
+    # Evidence FIFO rotation — cap at 100 most recent entries to prevent
+    # unbounded JSON blob growth after hundreds of CI runs.
+    MAX_EVIDENCE = 100
+    if len(node.state.evidence) > MAX_EVIDENCE:
+        node.state.evidence = node.state.evidence[-MAX_EVIDENCE:]
+
     with _get_connection() as conn:
         cursor = conn.cursor()
         
@@ -139,6 +145,24 @@ def get_nodes_by_stage(repo: str, stage: ExecutionStage) -> List[SpecNode]:
         
         return [SpecNode.model_validate_json(row["data"]) for row in cursor.fetchall()]
 
+def get_all_spec_nodes(repo: str) -> List[SpecNode]:
+    """Fetch all spec nodes for a repo (used for bootstrap deduplication)."""
+    with _get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT data FROM spec_nodes
+            WHERE repo = ?
+            ORDER BY created_at ASC
+        """, (repo,))
+        nodes = []
+        for row in cursor.fetchall():
+            try:
+                nodes.append(SpecNode.model_validate_json(row["data"]))
+            except Exception:
+                pass
+        return nodes
+
+
 def get_impacted_subgraph(upstream_id: str) -> List[str]:
     """
     The core Safe Change engine primitive: Returns all nodes downstream from an origin node.
@@ -180,7 +204,7 @@ def get_execution_state(repo: str) -> ExecutionState:
 def save_execution_state(repo: str, state: ExecutionState) -> None:
     """Updates the global metrics, ready_queue, and failed_queues."""
     import datetime
-    now_iso = datetime.datetime.utcnow().isoformat()
+    now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
     
     with _get_connection() as conn:
         cursor = conn.cursor()

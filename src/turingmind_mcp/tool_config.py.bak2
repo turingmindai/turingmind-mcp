@@ -1,0 +1,253 @@
+"""
+Tool Configuration for TuringMind MCP Server
+
+This module defines which tool groups are enabled/disabled.
+Modify ENABLED_TOOL_GROUPS to control which tools are exposed.
+
+Tool Groups:
+- login: Authentication flow (initiate_login, poll_login)
+- auth: Auth validation (validate_auth)
+- code_review: Code review tools (upload_review, get_context, submit_feedback, enable_auto_review)
+- code_index: Code indexing (index_codebase, get_related_code, get_project_structure)
+- memory: Memory graph (list_memory, get_memory, save_memory, delete_memory, detect_conflicts, resolve_conflict, simulate_impact, explain_decision, get_memory_stats)
+- tdd_workflow: TDD/SDD workflow (create_edit_plan, generate_spec, define_required_tests, validate_tests_written, request_code_edit, mark_test_written, validate_tests_passing, complete_tdd_cycle, get_tdd_status, get_audit_trail, get_kanban_data)
+- auto_plan: Continuous SDD (analyze_diff, store_auto_plan, get_auto_plans, bundle_plans_for_commit)
+- edit_tools: Edit with reasoning (apply_edit, log_reasoning, get_edit_reasoning)
+- chat_analysis: Chat analysis (store_chat_analysis_plan, get_chat_analysis_plans, enhance_chat_analysis)
+- decisions: Human-in-the-loop decision queue (create_decision, get_pending_decisions, resolve_decision, get_decision_stats)
+- issues: Work management (create_issue, get_issue, list_issues, update_issue, create_comment, list_comments) - Linear-compatible naming
+- goals: Strategic goals/OKRs (create_goal, get_goal, list_goals, update_goal)
+- initiatives: Strategic initiatives (create_initiative, get_initiative, list_initiatives, update_initiative)
+- features: Feature management (create_feature, get_feature, list_features, update_feature)
+- specs: Strategic specs/requirements (create_strategic_spec, get_strategic_spec, list_strategic_specs, update_strategic_spec)
+- risks: Strategic risks (create_strategic_risk, get_strategic_risk, list_strategic_risks, update_strategic_risk)
+"""
+
+import os
+from typing import Set
+
+# ============================================================================
+# TOOL GROUP DEFINITIONS
+# ============================================================================
+
+TOOL_GROUPS = {
+    "login": {
+        "turingmind_initiate_login",
+        "turingmind_poll_login",
+    },
+    "auth": {
+        "turingmind_validate_auth",
+    },
+    "code_review": {
+        "turingmind_upload_review",
+        "turingmind_get_context",
+        "turingmind_submit_feedback",
+        "turingmind_enable_auto_review",
+    },
+    "code_index": {
+        "turingmind_index_codebase",
+        "turingmind_get_related_code",
+        "turingmind_get_project_structure",
+    },
+    "memory": {
+        "turingmind_list_memory",
+        "turingmind_get_memory",
+        "turingmind_save_memory",
+        "turingmind_delete_memory",
+        "turingmind_detect_conflicts",
+        "turingmind_resolve_conflict",
+        "turingmind_simulate_impact",
+        "turingmind_explain_decision",
+        "turingmind_get_memory_stats",
+    },
+    "tdd_workflow": {
+        "turingmind_create_edit_plan",
+        "turingmind_generate_spec",
+        "turingmind_define_required_tests",
+        "turingmind_validate_tests_written",
+        "turingmind_request_code_edit",
+        "turingmind_mark_test_written",
+        "turingmind_validate_tests_passing",
+        "turingmind_complete_tdd_cycle",
+        "turingmind_get_tdd_status",
+        "turingmind_get_audit_trail",
+        "turingmind_get_kanban_data",
+    },
+    "auto_plan": {
+        "turingmind_analyze_diff",
+        "turingmind_store_auto_plan",
+        "turingmind_get_auto_plans",
+        "turingmind_bundle_plans_for_commit",
+    },
+    "edit_tools": {
+        "turingmind_apply_edit",
+        "turingmind_log_reasoning",
+        "turingmind_get_edit_reasoning",
+    },
+    "chat_analysis": {
+        "turingmind_store_chat_analysis_plan",
+        "turingmind_get_chat_analysis_plans",
+        "turingmind_enhance_chat_analysis",
+    },
+        "turingmind_create_strategic_risk",
+        "turingmind_get_strategic_risk",
+        "turingmind_list_strategic_risks",
+        "turingmind_update_strategic_risk",
+    },
+    "v2_engine": {
+        "turingmind_create_spec_node",
+        "turingmind_update_spec_node",
+        "turingmind_get_spec_status",
+        "turingmind_list_spec_nodes",
+        "turingmind_get_ready_nodes",
+        "turingmind_generate_verification",
+        "turingmind_run_verification",
+        "turingmind_record_execution_stage",
+        "turingmind_classify_failure",
+        "turingmind_apply_fix",
+        "turingmind_apply_spec_delta",
+        "turingmind_get_impacted_nodes",
+        "turingmind_request_approval",
+        "turingmind_get_execution_state",
+    },
+}
+
+# ============================================================================
+# ENABLED TOOL GROUPS
+# ============================================================================
+
+# Default: MINIMAL set (core workflow + VSCode extension + human-in-the-loop)
+# - login: Required for authentication
+# - tdd_workflow: Core TDD/SDD workflow (minus some redundant tools)
+# - edit_tools: apply_edit, log_reasoning
+# - chat_analysis: Required by VSCode extension
+# - auto_plan: analyze_diff used by VSCode extension
+# - decisions: Human-in-the-loop decision queue
+
+# Set via environment variable or modify here
+# Format: comma-separated group names, e.g., "login,tdd_workflow,edit_tools"
+DEFAULT_ENABLED_GROUPS = "login,tdd_workflow,edit_tools,chat_analysis,auto_plan,decisions,issues,goals,initiatives,features,specs,risks,v2_engine"
+
+# Full set (all tools enabled)
+FULL_ENABLED_GROUPS = "login,auth,code_review,code_index,memory,tdd_workflow,auto_plan,edit_tools,chat_analysis,decisions,issues,goals,initiatives,features,specs,risks,v2_engine"
+
+
+def get_enabled_groups() -> Set[str]:
+    """Get the set of enabled tool groups from environment or default."""
+    env_groups = os.environ.get("TURINGMIND_ENABLED_TOOL_GROUPS", "")
+    
+    if env_groups.lower() == "all":
+        return set(TOOL_GROUPS.keys())
+    
+    if env_groups.lower() == "minimal":
+        env_groups = DEFAULT_ENABLED_GROUPS
+    
+    if not env_groups:
+        env_groups = DEFAULT_ENABLED_GROUPS
+    
+    return {g.strip() for g in env_groups.split(",") if g.strip()}
+
+
+def get_enabled_tools() -> Set[str]:
+    """Get the set of enabled tool names based on enabled groups."""
+    enabled_groups = get_enabled_groups()
+    enabled_tools: Set[str] = set()
+    
+    for group_name in enabled_groups:
+        if group_name in TOOL_GROUPS:
+            enabled_tools.update(TOOL_GROUPS[group_name])
+    
+    return enabled_tools
+
+
+def is_tool_enabled(tool_name: str) -> bool:
+    """Check if a specific tool is enabled."""
+    return tool_name in get_enabled_tools()
+
+
+# ============================================================================
+# MINIMAL TOOL SET (for reference)
+# ============================================================================
+
+# These are the 12 essential tools identified for the core workflow:
+#
+# Core Workflow (6 TDD tools):
+#   - turingmind_create_edit_plan
+#   - turingmind_define_required_tests
+#   - turingmind_mark_test_written
+#   - turingmind_validate_tests_passing
+#   - turingmind_complete_tdd_cycle
+#   - turingmind_apply_edit
+#
+# VSCode Extension (3 tools):
+#   - turingmind_store_chat_analysis_plan
+#   - turingmind_get_chat_analysis_plans
+#   - turingmind_analyze_diff
+#
+# Supporting (3 tools):
+#   - turingmind_initiate_login
+#   - turingmind_poll_login
+#   - turingmind_log_reasoning
+
+MINIMAL_TOOLS = {
+    # Login
+    "turingmind_initiate_login",
+    "turingmind_poll_login",
+    # TDD Core
+    "turingmind_create_edit_plan",
+    "turingmind_define_required_tests",
+    "turingmind_mark_test_written",
+    "turingmind_validate_tests_passing",
+    "turingmind_complete_tdd_cycle",
+    # Edit
+    "turingmind_apply_edit",
+    "turingmind_log_reasoning",
+    # VSCode Extension
+    "turingmind_store_chat_analysis_plan",
+    "turingmind_get_chat_analysis_plans",
+    "turingmind_analyze_diff",
+}
+
+
+# ============================================================================
+# TOOLS TO REMOVE (for reference - these are NOT in minimal set)
+# ============================================================================
+
+DEPRECATED_TOOLS = {
+    # Auth (handle at session level)
+    "turingmind_validate_auth",
+    # Code Review (defer)
+    "turingmind_upload_review",
+    "turingmind_get_context",
+    "turingmind_submit_feedback",
+    "turingmind_enable_auto_review",
+    # Code Index (defer)
+    "turingmind_index_codebase",
+    "turingmind_get_related_code",
+    "turingmind_get_project_structure",
+    # Memory (defer)
+    "turingmind_list_memory",
+    "turingmind_get_memory",
+    "turingmind_save_memory",
+    "turingmind_delete_memory",
+    "turingmind_detect_conflicts",
+    "turingmind_resolve_conflict",
+    "turingmind_simulate_impact",
+    "turingmind_explain_decision",
+    "turingmind_get_memory_stats",
+    # TDD Redundant
+    "turingmind_generate_spec",  # Fold into create_edit_plan
+    "turingmind_validate_tests_written",  # Implicit in validate_tests_passing
+    "turingmind_request_code_edit",  # Fold into apply_edit
+    "turingmind_get_tdd_status",  # UI query
+    "turingmind_get_audit_trail",  # UI query
+    "turingmind_get_kanban_data",  # UI query
+    # Auto-plan extras
+    "turingmind_store_auto_plan",
+    "turingmind_get_auto_plans",
+    "turingmind_bundle_plans_for_commit",
+    # Edit extras
+    "turingmind_get_edit_reasoning",  # Overlaps with apply_edit
+    # Chat analysis extras
+    "turingmind_enhance_chat_analysis",  # Optional LLM enhancement
+}

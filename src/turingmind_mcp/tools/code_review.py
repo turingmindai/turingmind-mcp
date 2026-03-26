@@ -12,9 +12,9 @@ from .context import ToolContext
 
 
 def register(registry: dict) -> None:
-    registry["turingmind_upload_review"] = handle_upload_review
-    registry["turingmind_get_context"] = handle_get_context
-    registry["turingmind_submit_feedback"] = handle_submit_feedback
+    # NOTE: upload_review, get_context, submit_feedback are intentionally NOT registered.
+    # They have no v2 tool definitions and are not exposed to agents.
+    pass
 
 
 async def handle_upload_review(arguments: dict, ctx: ToolContext) -> list[TextContent]:
