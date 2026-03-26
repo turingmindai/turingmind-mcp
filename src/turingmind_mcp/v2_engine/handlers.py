@@ -1292,7 +1292,8 @@ def cascade_blast_radius(origin_id: str, repo: str) -> dict:
     # that warrants human review, not automated propagation.
     # The cap is a safety valve — not a correctness limit.
     _MAX_CASCADE_NODES = 50
-    truncated = len(impacted_with_depth) > _MAX_CASCADE_NODES
+    total_impacted = len(impacted_with_depth)  # capture BEFORE slicing
+    truncated = total_impacted > _MAX_CASCADE_NODES
     if truncated:
         impacted_with_depth = impacted_with_depth[:_MAX_CASCADE_NODES]
 
@@ -1361,7 +1362,7 @@ def cascade_blast_radius(origin_id: str, repo: str) -> dict:
     if truncated:
         result["truncation_warning"] = (
             f"Cascade truncated at {_MAX_CASCADE_NODES} nodes. "
-            f"Total downstream impact was {len(impacted_with_depth)} nodes. "
+            f"Total downstream impact was {total_impacted} nodes. "
             "This suggests an L0_INFRA failure — escalate for human review."
         )
     return result
