@@ -1213,11 +1213,12 @@ def detect_graph_gaps(repo: str) -> list[dict]:
     # Collect existing levels
     levels_present = {n.level for n in all_nodes}
 
-    # ── Gap 1: L1 nodes with ZERO upstream L2 dependencies ──────────────
+    # ── Gap 1: L1 nodes (in SPEC_DEFINED stage) with ZERO upstream L2 dependencies ──────────────
     # An L1 (file-level) node that has no dependencies pointing to an L2_EXTERNAL
     # or L3_API node means we haven't mapped its external boundary yet.
+    # Exclude nodes that have advanced past SPEC_DEFINED to prevent nagging on pure files.
     for node in all_nodes:
-        if node.level == NodeLevel.L1:
+        if node.level == NodeLevel.L1 and node.state.stage == ExecutionStage.SPEC_DEFINED:
             has_boundary_dep = any(
                 node_map[dep_id].level in (NodeLevel.L2, NodeLevel.L3)
                 for dep_id in node.dependencies
@@ -1232,8 +1233,9 @@ def detect_graph_gaps(repo: str) -> list[dict]:
                     "action": (
                         f"L1 node '{node.title}' has no L2_EXTERNAL or L3_API dependency edges. "
                         f"Analyze its source files and call turingmind_create_spec_node for each "
-                        f"external dependency (e.g., npm packages, API endpoints) with level=L2 or L3, "
-                        f"then call turingmind_update_spec_node to add the dependency edge."
+                        f"external dependency with level=L2 or L3, then call turingmind_update_spec_node "
+                        f"to add the dependency edge. If the file legitimately has no external dependencies, "
+                        f"use turingmind_record_execution_stage to advance its stage to 'implementing' to clear this warning."
                     ),
                 })
 
