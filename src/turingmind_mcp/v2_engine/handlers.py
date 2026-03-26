@@ -142,7 +142,7 @@ async def handle_create_spec_node(args: dict, ctx: ToolContext) -> list[TextCont
     )
 
     save_spec_node(node)
-    return _ok({
+    response = {
         "status": "created",
         "node_id": node_id,
         "repo": repo,
@@ -150,7 +150,8 @@ async def handle_create_spec_node(args: dict, ctx: ToolContext) -> list[TextCont
         "surface_type": surface.value,
         "stage": node.state.stage.value,
         "message": f"SpecNode '{title}' created. Next: turingmind_generate_verification",
-    })
+    }
+    return _ok(_append_gap_hints(response, repo))
 
 
 async def handle_update_spec_node(args: dict, ctx: ToolContext) -> list[TextContent]:
@@ -179,7 +180,8 @@ async def handle_update_spec_node(args: dict, ctx: ToolContext) -> list[TextCont
 
     node.updated_at = _now()
     save_spec_node(node)
-    return _ok({"status": "updated", "node_id": node_id})
+    response = {"status": "updated", "node_id": node_id}
+    return _ok(_append_gap_hints(response, node.repo))
 
 
 async def handle_get_spec_status(args: dict, ctx: ToolContext) -> list[TextContent]:
@@ -613,13 +615,13 @@ async def handle_record_execution_stage(args: dict, ctx: ToolContext) -> list[Te
             state.failed_nodes.remove(node_id)
         save_execution_state(node.repo, state)
 
-    return _ok({
+    return _ok(_append_gap_hints({
         "status": "recorded",
         "node_id": node_id,
         "stage": node.state.stage.value,
         "confidence": node.state.confidence,
         "evidence_count": len(node.state.evidence),
-    })
+    }, node.repo))
 
 
 # =============================================================================
@@ -1185,6 +1187,103 @@ def _all_nodes_for_repo(repo: str) -> list[SpecNode]:
         return get_all_spec_nodes(repo)
     except Exception:
         return []
+
+
+# =============================================================================
+# GRAPH-GAP DETECTOR (Stage 2 Automation)
+# =============================================================================
+# Instead of watching files on disk, we analyze the DAG itself after every
+# mutation.  If structural gaps exist (e.g. L1 nodes with no L2 dependency
+# edges, or L3 API nodes with no contract invariants), we return a structured
+# prompt inside the tool response so the IDE Agent can act on it immediately.
+# This is a pull-based, graph-driven trigger — no file watchers, no scripts.
+
+def detect_graph_gaps(repo: str) -> list[dict]:
+    """Scan the constraint graph for structural gaps that the IDE Agent
+    should resolve.  Returns a list of gap descriptors."""
+    all_nodes = _all_nodes_for_repo(repo)
+    if not all_nodes:
+        return []
+
+    gaps: list[dict] = []
+
+    # Index by ID for fast lookup
+    node_map = {n.id: n for n in all_nodes}
+
+    # Collect existing levels
+    levels_present = {n.level for n in all_nodes}
+
+    # ── Gap 1: L1 nodes with ZERO upstream L2 dependencies ──────────────
+    # An L1 (file-level) node that has no dependencies pointing to an L2_EXTERNAL
+    # or L3_API node means we haven't mapped its external boundary yet.
+    for node in all_nodes:
+        if node.level == NodeLevel.L1:
+            has_boundary_dep = any(
+                node_map[dep_id].level in (NodeLevel.L2, NodeLevel.L3)
+                for dep_id in node.dependencies
+                if dep_id in node_map
+            )
+            if not has_boundary_dep:
+                gaps.append({
+                    "gap_type": "missing_boundary_edge",
+                    "severity": "medium",
+                    "node_id": node.id,
+                    "node_title": node.title,
+                    "action": (
+                        f"L1 node '{node.title}' has no L2_EXTERNAL or L3_API dependency edges. "
+                        f"Analyze its source files and call turingmind_create_spec_node for each "
+                        f"external dependency (e.g., npm packages, API endpoints) with level=L2 or L3, "
+                        f"then call turingmind_update_spec_node to add the dependency edge."
+                    ),
+                })
+
+    # ── Gap 2: API endpoint nodes with empty contracts ──────────────────
+    for node in all_nodes:
+        if node.surface_type == SurfaceType.API_ENDPOINT:
+            if not node.contract.invariants and not node.contract.inputs:
+                gaps.append({
+                    "gap_type": "empty_api_contract",
+                    "severity": "high",
+                    "node_id": node.id,
+                    "node_title": node.title,
+                    "action": (
+                        f"API endpoint node '{node.title}' has an empty contract. "
+                        f"Analyze the OpenAPI spec or source code and call "
+                        f"turingmind_update_spec_node to populate contract.inputs, "
+                        f"contract.outputs, and contract.invariants."
+                    ),
+                })
+
+    # ── Gap 3: Orphan nodes (no dependencies AND no dependents) ─────────
+    for node in all_nodes:
+        if node.level not in (NodeLevel.L0,):  # L0 infra nodes are allowed to be roots
+            if not node.dependencies and not node.dependents:
+                gaps.append({
+                    "gap_type": "orphan_node",
+                    "severity": "low",
+                    "node_id": node.id,
+                    "node_title": node.title,
+                    "action": (
+                        f"Node '{node.title}' is disconnected from the graph (no edges). "
+                        f"Either link it to its upstream dependencies or remove it."
+                    ),
+                })
+
+    return gaps
+
+
+def _append_gap_hints(response: dict, repo: str) -> dict:
+    """Enrich any handler response with graph-gap hints so the IDE Agent
+    can proactively resolve structural issues on the next turn."""
+    gaps = detect_graph_gaps(repo)
+    if gaps:
+        response["graph_gaps"] = gaps
+        response["graph_gap_count"] = len(gaps)
+        response["graph_gap_summary"] = (
+            f"⚠️ {len(gaps)} structural gap(s) detected in the constraint graph. "
+            f"Review the 'graph_gaps' array and resolve each action to complete Stage 2 boundary mapping."
+        )
+    return response
 
 
 # =============================================================================
