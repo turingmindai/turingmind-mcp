@@ -16,10 +16,12 @@ from pydantic import BaseModel, Field
 
 
 class NodeLevel(str, Enum):
-    L0 = "L0"  # System/Architecture level
-    L1 = "L1"  # Service/Component level
-    L2 = "L2"  # Module/API level
-    L3 = "L3"  # Function/Implementation level
+    L0_INFRA = "L0_INFRA"                 # System/Architecture level
+    L1_FILE = "L1_FILE"                   # Service/Component code
+    L2_EXTERNAL = "L2_EXTERNAL"           # SBOM/Dependencies/Module API
+    L3_API = "L3_API"                     # Network Ingress/Egress 
+    L4_FEATURE = "L4_FEATURE"             # Feature/Ticket tracker
+    L5_BUSINESS_GOAL = "L5_BUSINESS_GOAL" # Epic/Business Intent
 
 
 class SurfaceType(str, Enum):
