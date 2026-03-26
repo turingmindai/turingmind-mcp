@@ -133,6 +133,39 @@ def get_spec_node(node_id: str) -> Optional[SpecNode]:
             return SpecNode.model_validate_json(row["data"])
         return None
 
+
+def save_spec_nodes(nodes: List[SpecNode]) -> None:
+    """Atomically persist multiple SpecNodes in a single SQLite transaction.
+    If any write fails the entire batch is rolled back, preserving graph consistency.
+    Used by cascade_blast_radius to ensure the entire impact radius is updated atomically.
+    """
+    if not nodes:
+        return
+    conn = _get_connection()
+    try:
+        conn.execute("BEGIN")
+        cursor = conn.cursor()
+        for node in nodes:
+            cursor.execute("""
+                UPDATE spec_nodes
+                SET status = ?, stage = ?, confidence = ?, data = ?, updated_at = ?
+                WHERE id = ?
+            """, (
+                node.state.status.value,
+                node.state.stage.value,
+                node.state.confidence,
+                node.model_dump_json(),
+                node.updated_at,
+                node.id,
+            ))
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.close()
+
+
 def get_nodes_by_stage(repo: str, stage: ExecutionStage) -> List[SpecNode]:
     """Fetch the exact nodes occupying a specific column in the manufacturing pipeline."""
     with _get_connection() as conn:

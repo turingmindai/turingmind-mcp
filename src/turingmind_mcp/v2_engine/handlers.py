@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import datetime
 import json
+import re
 import uuid
 from typing import Any
 
@@ -25,6 +26,7 @@ from .database import (
     get_spec_node,
     save_execution_state,
     save_spec_node,
+    save_spec_nodes,
 )
 from .models import (
     Contract,
@@ -646,11 +648,17 @@ async def handle_classify_failure(args: dict, ctx: ToolContext) -> list[TextCont
     except ValueError:
         return _err(f"Invalid classification: {classification_raw}")
 
+    # ── Stage 3.1: Guard — only cascade if node wasn't already FAILED.
+    # If it was already FAILED (e.g. auto-set by ingest_runtime_signal which
+    # already ran cascade_blast_radius), a second cascade would double-penalize
+    # all downstream nodes.
+    was_already_failed = node.state.status == SpecStatus.FAILED
+
     node.state.status = SpecStatus.FAILED
     node.state.failure_classification = classification
     node.state.failure_trace = failure_trace
     node.updated_at = _now()
-    save_spec_node(node)
+    save_spec_node(node)  # Persist origin FIRST before cascading
 
     # Register in execution state failed_nodes
     state = get_execution_state(node.repo)
@@ -665,17 +673,19 @@ async def handle_classify_failure(args: dict, ctx: ToolContext) -> list[TextCont
         FailureClassification.DEPENDENCY_FAILURE: "Block this node: upstream dependency failed",
     }
 
-    # ── Stage 3: Auto-cascade blast radius on failure classification ───
-    cascade_report = cascade_blast_radius(node_id, node.repo)
-
     response = {
         "status": "failure_classified",
         "node_id": node_id,
         "classification": classification.value,
         "escalation_action": escalation_map[classification],
     }
-    if cascade_report["impacted_count"] > 0:
-        response["blast_radius_cascade"] = cascade_report
+
+    # Only cascade if this is a fresh failure (not already in FAILED state)
+    if not was_already_failed:
+        cascade_report = cascade_blast_radius(node_id, node.repo)
+        if cascade_report["impacted_count"] > 0:
+            response["blast_radius_cascade"] = cascade_report
+
     return _ok(response)
 
 
@@ -964,8 +974,6 @@ async def handle_ingest_runtime_signal(args: dict, ctx: ToolContext) -> list[Tex
         node.verification.property_tests = []
         node.verification.fuzz_tests = []
         action_taken = "node_invalidated_regression"
-        # Stage 3: auto-cascade blast radius on regression
-        cascade_blast_radius(node_id, repo)
     elif breached and new_confidence < 0.6:
         node.state.status = SpecStatus.FAILED
         node.state.failure_classification = FailureClassification.IMPLEMENTATION_BUG
@@ -976,7 +984,11 @@ async def handle_ingest_runtime_signal(args: dict, ctx: ToolContext) -> list[Tex
         action_taken = "confidence_degraded"
 
     node.updated_at = _now()
-    save_spec_node(node)
+    save_spec_node(node)  # Persist origin node BEFORE cascading to downstream
+
+    # Stage 3.1: cascade blast radius AFTER origin is saved, only on regression
+    if is_regression:
+        cascade_blast_radius(node_id, repo)
 
     # ── Update execution control plane ────────────────────────────────────────
     if breached or is_regression:
@@ -1236,10 +1248,14 @@ def auto_classify_failure(node: SpecNode, node_map: dict[str, SpecNode]) -> Fail
         if dep and dep.state.status == SpecStatus.FAILED:
             return FailureClassification.DEPENDENCY_FAILURE
 
-    # Rule 2: Trace mentions dependency/import keywords
-    dep_keywords = ["import", "module not found", "dependency", "cannot find module",
-                    "no such file", "package", "require", "resolution failed"]
-    if any(kw in trace for kw in dep_keywords):
+    # Rule 2: Trace mentions dependency/import keywords (use word-boundary regex to avoid
+    # false matches like "important" matching "import" or "required" matching "require")
+    dep_patterns = [
+        r"\bimport\b", r"module not found", r"\bdependency\b",
+        r"cannot find module", r"no such file", r"\bpackage\b",
+        r"\brequire\b", r"resolution failed",
+    ]
+    if any(re.search(pat, trace) for pat in dep_patterns):
         return FailureClassification.DEPENDENCY_FAILURE
 
     # Rule 3: Node has empty verification (no tests generated)
@@ -1259,45 +1275,64 @@ def cascade_blast_radius(origin_id: str, repo: str) -> dict:
     """Walk dependents[] recursively and apply distance-attenuated confidence
     penalties.  Returns a report of all affected nodes.
 
-    Penalty schedule:
-      - Depth 1 (direct dependents): -0.3
-      - Depth 2: -0.2
-      - Depth 3+: -0.1
+    Stage 3.1 improvements:
+    - Proportional (not absolute) penalty: depth-1 = 0.7x, depth-2 = 0.8x, depth-3+ = 0.9x
+    - Idempotent: skips nodes that already have blast-radius evidence from this origin
+    - Uses recalculate_confidence() as single source of truth after appending evidence
+    - Atomically saves all affected nodes via save_spec_nodes() transaction
     """
     impacted_with_depth = get_impacted_subgraph_with_depth(origin_id)
     if not impacted_with_depth:
         return {"origin": origin_id, "impacted_count": 0, "affected": []}
 
-    penalty_schedule = {1: 0.3, 2: 0.2}  # depth -> penalty; 3+ defaults to 0.1
+    # Proportional multipliers: depth-1 keeps 70% of confidence, depth-2 80%, depth-3+ 90%
+    multiplier_schedule = {1: 0.7, 2: 0.8}  # depth -> keep_ratio; 3+ defaults to 0.9
     affected = []
+    nodes_to_save = []
+    cascade_marker = f"blast_radius::{origin_id}"
 
     for node_id, depth in impacted_with_depth:
         node = get_spec_node(node_id)
         if not node:
             continue
 
-        penalty = penalty_schedule.get(depth, 0.1)
-        old_conf = node.state.confidence
-        new_conf = max(0.0, old_conf - penalty)
+        # ── Idempotency: skip if this origin already cascaded to this node ──
+        already_cascaded = any(
+            ev.kind == "blast_radius_cascade" and cascade_marker in ev.detail
+            for ev in node.state.evidence
+        )
+        if already_cascaded:
+            continue
 
-        # Append evidence receipt
+        old_conf = node.state.confidence
+        multiplier = multiplier_schedule.get(depth, 0.9)
+        # Penalty is proportional to current confidence, not a fixed absolute offset
+        penalty = round(old_conf * (1.0 - multiplier), 4)
+
+        # Append typed evidence receipt
         node.state.evidence.append(Evidence(
-            kind="security_scan",
-            score=new_conf,
-            detail=f"Blast radius cascade from '{origin_id}' (depth={depth}, penalty=-{penalty})",
+            kind="blast_radius_cascade",
+            score=round(old_conf * multiplier, 4),
+            detail=f"Blast radius cascade from '{cascade_marker}' (depth={depth}, multiplier={multiplier})",
             source="blast_radius_engine",
         ))
-        node.state.confidence = new_conf
+
+        # Use recalculate_confidence as the single source of truth
+        node.state.confidence = recalculate_confidence(node)
         node.updated_at = _now()
-        save_spec_node(node)
+        nodes_to_save.append(node)
 
         affected.append({
             "node_id": node_id,
             "depth": depth,
             "old_confidence": old_conf,
-            "new_confidence": new_conf,
+            "new_confidence": node.state.confidence,
             "penalty": penalty,
         })
+
+    # Atomic batch save — if any write fails, the entire cascade is rolled back
+    if nodes_to_save:
+        save_spec_nodes(nodes_to_save)
 
     return {
         "origin": origin_id,
@@ -1389,7 +1424,7 @@ def detect_graph_gaps(repo: str) -> list[dict]:
                 })
 
     # ── Gap 4: Failed nodes with no failure_classification (Stage 3) ─────
-    node_map = {n.id: n for n in all_nodes}
+    # Note: node_map was already built above for Gap 1 — reuse it here (Stage 3.1 fix)
     for node in all_nodes:
         if node.state.status == SpecStatus.FAILED and not node.state.failure_classification:
             suggested = auto_classify_failure(node, node_map)

@@ -133,11 +133,12 @@ class Evidence(BaseModel):
     Confidence must be evidenced, not asserted.
     """
     kind: Literal[
-        "test_run",         # pytest/jest results
-        "approval",         # human sign-off
-        "runtime_sample",   # live metric reading
-        "regression_clear", # a regression was fixed and verified
-        "security_scan",    # SAST/DAST result
+        "test_run",             # pytest/jest results
+        "approval",             # human sign-off
+        "runtime_sample",       # live metric reading
+        "regression_clear",     # a regression was fixed and verified
+        "security_scan",        # SAST/DAST result
+        "blast_radius_cascade", # confidence penalty propagated from a failed upstream node
     ] = Field(..., description="What kind of evidence this is")
     recorded_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     score: float = Field(
