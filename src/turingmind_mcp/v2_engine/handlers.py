@@ -20,6 +20,7 @@ from ..tools.context import ToolContext
 from .database import (
     get_execution_state,
     get_impacted_subgraph,
+    get_impacted_subgraph_with_depth,
     get_nodes_by_stage,
     get_spec_node,
     save_execution_state,
@@ -664,12 +665,18 @@ async def handle_classify_failure(args: dict, ctx: ToolContext) -> list[TextCont
         FailureClassification.DEPENDENCY_FAILURE: "Block this node: upstream dependency failed",
     }
 
-    return _ok({
+    # ── Stage 3: Auto-cascade blast radius on failure classification ───
+    cascade_report = cascade_blast_radius(node_id, node.repo)
+
+    response = {
         "status": "failure_classified",
         "node_id": node_id,
         "classification": classification.value,
         "escalation_action": escalation_map[classification],
-    })
+    }
+    if cascade_report["impacted_count"] > 0:
+        response["blast_radius_cascade"] = cascade_report
+    return _ok(response)
 
 
 async def handle_apply_fix(args: dict, ctx: ToolContext) -> list[TextContent]:
@@ -957,6 +964,8 @@ async def handle_ingest_runtime_signal(args: dict, ctx: ToolContext) -> list[Tex
         node.verification.property_tests = []
         node.verification.fuzz_tests = []
         action_taken = "node_invalidated_regression"
+        # Stage 3: auto-cascade blast radius on regression
+        cascade_blast_radius(node_id, repo)
     elif breached and new_confidence < 0.6:
         node.state.status = SpecStatus.FAILED
         node.state.failure_classification = FailureClassification.IMPLEMENTATION_BUG
@@ -1190,6 +1199,114 @@ def _all_nodes_for_repo(repo: str) -> list[SpecNode]:
 
 
 # =============================================================================
+# STAGE 3: COGNITIVE OFFLOADING ENGINE
+# =============================================================================
+# Three pure deterministic functions that shift reasoning work from the
+# IDE Agent to the MCP backend.  No LLM calls — pure graph logic.
+
+
+def recalculate_confidence(node: SpecNode, decay: float = 0.85) -> float:
+    """Compute confidence from the Evidence[] trail using a weighted-recency formula.
+    Most recent evidence is weighted highest.  If no evidence, returns 0.0.
+    """
+    evidence = node.state.evidence
+    if not evidence:
+        return 0.0
+
+    n = len(evidence)
+    total_weight = 0.0
+    weighted_sum = 0.0
+    for i, ev in enumerate(evidence):
+        weight = decay ** (n - 1 - i)  # most recent (last) gets weight=1.0
+        weighted_sum += ev.score * weight
+        total_weight += weight
+
+    return round(weighted_sum / total_weight, 4) if total_weight > 0 else 0.0
+
+
+def auto_classify_failure(node: SpecNode, node_map: dict[str, SpecNode]) -> FailureClassification:
+    """Deterministic heuristic classification of a node failure.
+    Uses graph state (not LLM) to pick the most likely FailureClassification.
+    """
+    trace = (node.state.failure_trace or "").lower()
+
+    # Rule 1: Upstream dependency is itself in FAILED status
+    for dep_id in node.dependencies:
+        dep = node_map.get(dep_id)
+        if dep and dep.state.status == SpecStatus.FAILED:
+            return FailureClassification.DEPENDENCY_FAILURE
+
+    # Rule 2: Trace mentions dependency/import keywords
+    dep_keywords = ["import", "module not found", "dependency", "cannot find module",
+                    "no such file", "package", "require", "resolution failed"]
+    if any(kw in trace for kw in dep_keywords):
+        return FailureClassification.DEPENDENCY_FAILURE
+
+    # Rule 3: Node has empty verification (no tests generated)
+    if not node.verification.unit_tests and not node.verification.property_tests:
+        return FailureClassification.TEST_GAP
+
+    # Rule 4: Contract is empty and failure involves assertion
+    if (not node.contract.invariants and not node.contract.inputs
+            and ("assert" in trace or "invariant" in trace or "contract" in trace)):
+        return FailureClassification.SPEC_GAP
+
+    # Default
+    return FailureClassification.IMPLEMENTATION_BUG
+
+
+def cascade_blast_radius(origin_id: str, repo: str) -> dict:
+    """Walk dependents[] recursively and apply distance-attenuated confidence
+    penalties.  Returns a report of all affected nodes.
+
+    Penalty schedule:
+      - Depth 1 (direct dependents): -0.3
+      - Depth 2: -0.2
+      - Depth 3+: -0.1
+    """
+    impacted_with_depth = get_impacted_subgraph_with_depth(origin_id)
+    if not impacted_with_depth:
+        return {"origin": origin_id, "impacted_count": 0, "affected": []}
+
+    penalty_schedule = {1: 0.3, 2: 0.2}  # depth -> penalty; 3+ defaults to 0.1
+    affected = []
+
+    for node_id, depth in impacted_with_depth:
+        node = get_spec_node(node_id)
+        if not node:
+            continue
+
+        penalty = penalty_schedule.get(depth, 0.1)
+        old_conf = node.state.confidence
+        new_conf = max(0.0, old_conf - penalty)
+
+        # Append evidence receipt
+        node.state.evidence.append(Evidence(
+            kind="security_scan",
+            score=new_conf,
+            detail=f"Blast radius cascade from '{origin_id}' (depth={depth}, penalty=-{penalty})",
+            source="blast_radius_engine",
+        ))
+        node.state.confidence = new_conf
+        node.updated_at = _now()
+        save_spec_node(node)
+
+        affected.append({
+            "node_id": node_id,
+            "depth": depth,
+            "old_confidence": old_conf,
+            "new_confidence": new_conf,
+            "penalty": penalty,
+        })
+
+    return {
+        "origin": origin_id,
+        "impacted_count": len(affected),
+        "affected": affected,
+    }
+
+
+# =============================================================================
 # GRAPH-GAP DETECTOR (Stage 2 Automation)
 # =============================================================================
 # Instead of watching files on disk, we analyze the DAG itself after every
@@ -1270,6 +1387,24 @@ def detect_graph_gaps(repo: str) -> list[dict]:
                         f"Either link it to its upstream dependencies or remove it."
                     ),
                 })
+
+    # ── Gap 4: Failed nodes with no failure_classification (Stage 3) ─────
+    node_map = {n.id: n for n in all_nodes}
+    for node in all_nodes:
+        if node.state.status == SpecStatus.FAILED and not node.state.failure_classification:
+            suggested = auto_classify_failure(node, node_map)
+            gaps.append({
+                "gap_type": "unclassified_failure",
+                "severity": "high",
+                "node_id": node.id,
+                "node_title": node.title,
+                "suggested_classification": suggested.value,
+                "action": (
+                    f"Node '{node.title}' is in FAILED status but has no failure classification. "
+                    f"Auto-classifier suggests: '{suggested.value}'. Call turingmind_classify_failure "
+                    f"with classification='{suggested.value}' to accept, or override with your own."
+                ),
+            })
 
     return gaps
 

@@ -187,6 +187,34 @@ def get_impacted_subgraph(upstream_id: str) -> List[str]:
 
     return list(impacted)
 
+
+def get_impacted_subgraph_with_depth(upstream_id: str) -> List[tuple]:
+    """
+    Like get_impacted_subgraph but returns (node_id, depth) tuples.
+    Depth 1 = direct dependents, depth 2 = dependents of dependents, etc.
+    Used by cascade_blast_radius for distance-attenuated confidence penalties.
+    """
+    result: list[tuple] = []
+    visited: set[str] = set()
+    queue: deque[tuple] = deque([(upstream_id, 0)])  # (node_id, depth)
+
+    with _get_connection() as conn:
+        cursor = conn.cursor()
+        while queue:
+            current, depth = queue.popleft()
+            cursor.execute(
+                "SELECT downstream_id FROM edge_graph WHERE upstream_id = ?", (current,)
+            )
+            for row in cursor.fetchall():
+                down_id = row["downstream_id"]
+                if down_id not in visited:
+                    visited.add(down_id)
+                    child_depth = depth + 1
+                    result.append((down_id, child_depth))
+                    queue.append((down_id, child_depth))
+
+    return result
+
 # ==================================================
 # Execution Loop Queue state
 # ==================================================
