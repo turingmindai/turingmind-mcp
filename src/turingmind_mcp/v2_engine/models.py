@@ -151,6 +151,10 @@ class Evidence(BaseModel):
         default=None,
         description="UUID from turingmind_run_verification. Required for confidence > 0.7 unless source is 'pytest'."
     )
+    origin_id: Optional[str] = Field(
+        default=None,
+        description="For blast_radius_cascade evidence: the node_id of the origin failure that triggered this cascade. Used for idempotency checks."
+    )
 
 
 class NodeState(BaseModel):

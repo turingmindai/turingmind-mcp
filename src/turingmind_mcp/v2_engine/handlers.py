@@ -1275,21 +1275,31 @@ def cascade_blast_radius(origin_id: str, repo: str) -> dict:
     """Walk dependents[] recursively and apply distance-attenuated confidence
     penalties.  Returns a report of all affected nodes.
 
-    Stage 3.1 improvements:
-    - Proportional (not absolute) penalty: depth-1 = 0.7x, depth-2 = 0.8x, depth-3+ = 0.9x
-    - Idempotent: skips nodes that already have blast-radius evidence from this origin
-    - Uses recalculate_confidence() as single source of truth after appending evidence
-    - Atomically saves all affected nodes via save_spec_nodes() transaction
+    Stage 3.2 hardening:
+    - max_nodes circuit breaker: caps total traversal to prevent DB lock storms
+      on high-fan-out graphs. Truncation is surfaced in the return value so the
+      IDE Agent knows to escalate for human review.
+    - Structured idempotency via Evidence.origin_id (not string-parsing on detail)
+    - Evidence eviction: trims to last 30 entries before saving to prevent
+      unbounded JSON blob growth and keep recalculate_confidence efficient
     """
     impacted_with_depth = get_impacted_subgraph_with_depth(origin_id)
     if not impacted_with_depth:
-        return {"origin": origin_id, "impacted_count": 0, "affected": []}
+        return {"origin": origin_id, "impacted_count": 0, "affected": [], "truncated": False}
+
+    # Circuit breaker: cap total nodes touched.
+    # >50 impacted nodes on a change is almost certainly an L0_INFRA failure
+    # that warrants human review, not automated propagation.
+    # The cap is a safety valve — not a correctness limit.
+    _MAX_CASCADE_NODES = 50
+    truncated = len(impacted_with_depth) > _MAX_CASCADE_NODES
+    if truncated:
+        impacted_with_depth = impacted_with_depth[:_MAX_CASCADE_NODES]
 
     # Proportional multipliers: depth-1 keeps 70% of confidence, depth-2 80%, depth-3+ 90%
     multiplier_schedule = {1: 0.7, 2: 0.8}  # depth -> keep_ratio; 3+ defaults to 0.9
     affected = []
     nodes_to_save = []
-    cascade_marker = f"blast_radius::{origin_id}"
 
     for node_id, depth in impacted_with_depth:
         node = get_spec_node(node_id)
@@ -1297,8 +1307,9 @@ def cascade_blast_radius(origin_id: str, repo: str) -> dict:
             continue
 
         # ── Idempotency: skip if this origin already cascaded to this node ──
+        # Uses structured Evidence.origin_id field (not fragile string-parsing)
         already_cascaded = any(
-            ev.kind == "blast_radius_cascade" and cascade_marker in ev.detail
+            ev.kind == "blast_radius_cascade" and ev.origin_id == origin_id
             for ev in node.state.evidence
         )
         if already_cascaded:
@@ -1309,13 +1320,20 @@ def cascade_blast_radius(origin_id: str, repo: str) -> dict:
         # Penalty is proportional to current confidence, not a fixed absolute offset
         penalty = round(old_conf * (1.0 - multiplier), 4)
 
-        # Append typed evidence receipt
+        # Append typed evidence receipt with structured origin_id for idempotency
         node.state.evidence.append(Evidence(
             kind="blast_radius_cascade",
             score=round(old_conf * multiplier, 4),
-            detail=f"Blast radius cascade from '{cascade_marker}' (depth={depth}, multiplier={multiplier})",
+            detail=f"Cascade from '{origin_id}' (depth={depth}, multiplier={multiplier})",
             source="blast_radius_engine",
+            origin_id=origin_id,
         ))
+
+        # Evidence eviction: keep only the 30 most recent entries.
+        # Early entries have exponential weight decay (~0.85^30 < 0.01) —
+        # they're mathematically irrelevant and unnecessarily bloat the JSON blob.
+        if len(node.state.evidence) > 30:
+            node.state.evidence = node.state.evidence[-30:]
 
         # Use recalculate_confidence as the single source of truth
         node.state.confidence = recalculate_confidence(node)
@@ -1334,11 +1352,20 @@ def cascade_blast_radius(origin_id: str, repo: str) -> dict:
     if nodes_to_save:
         save_spec_nodes(nodes_to_save)
 
-    return {
+    result = {
         "origin": origin_id,
         "impacted_count": len(affected),
         "affected": affected,
+        "truncated": truncated,
     }
+    if truncated:
+        result["truncation_warning"] = (
+            f"Cascade truncated at {_MAX_CASCADE_NODES} nodes. "
+            f"Total downstream impact was {len(impacted_with_depth)} nodes. "
+            "This suggests an L0_INFRA failure — escalate for human review."
+        )
+    return result
+
 
 
 # =============================================================================
