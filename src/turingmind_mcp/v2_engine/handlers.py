@@ -1158,7 +1158,7 @@ async def handle_bootstrap_codebase(args: dict, ctx: ToolContext) -> list[TextCo
             id=node_id,
             repo=repo,
             title=title,
-            level=NodeLevel.L2,
+            level=NodeLevel.L2_EXTERNAL,
             surface_type=SurfaceType.INTERNAL,
             implementation=Implementation(files=files),
         )
@@ -1218,9 +1218,9 @@ def detect_graph_gaps(repo: str) -> list[dict]:
     # or L3_API node means we haven't mapped its external boundary yet.
     # Exclude nodes that have advanced past SPEC_DEFINED to prevent nagging on pure files.
     for node in all_nodes:
-        if node.level == NodeLevel.L1 and node.state.stage == ExecutionStage.SPEC_DEFINED:
+        if node.level == NodeLevel.L1_FILE and node.state.stage == ExecutionStage.SPEC_DEFINED:
             has_boundary_dep = any(
-                node_map[dep_id].level in (NodeLevel.L2, NodeLevel.L3)
+                node_map[dep_id].level in (NodeLevel.L2_EXTERNAL, NodeLevel.L3_API)
                 for dep_id in node.dependencies
                 if dep_id in node_map
             )
@@ -1258,7 +1258,7 @@ def detect_graph_gaps(repo: str) -> list[dict]:
 
     # ── Gap 3: Orphan nodes (no dependencies AND no dependents) ─────────
     for node in all_nodes:
-        if node.level not in (NodeLevel.L0,):  # L0 infra nodes are allowed to be roots
+        if node.level not in (NodeLevel.L0_INFRA,):  # L0 infra nodes are allowed to be roots
             if not node.dependencies and not node.dependents:
                 gaps.append({
                     "gap_type": "orphan_node",
