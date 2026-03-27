@@ -56,8 +56,8 @@ _SPEC_NODE_PROPS = {
     "title": {"type": "string", "description": "Short human-readable title"},
     "level": {
         "type": "string",
-        "enum": ["L0", "L1", "L2", "L3"],
-        "description": "L0=system, L1=service, L2=module/api, L3=function",
+        "enum": ["L0_INFRA", "L1_FILE", "L2_EXTERNAL", "L3_API", "L4_FEATURE", "L5_BUSINESS_GOAL"],
+        "description": "L0=system, L1=file, L2=external, L3=api, L4=feature, L5=business",
     },
     "surface_type": {
         "type": "string",
@@ -125,6 +125,7 @@ V2_TOOLS: list[Tool] = [
                 "contract": _SPEC_NODE_PROPS["contract"],
                 "priority": _SPEC_NODE_PROPS["priority"],
                 "surface_type": _SPEC_NODE_PROPS["surface_type"],
+                "dependencies": _SPEC_NODE_PROPS["dependencies"],
             },
             "required": ["node_id"],
         },
@@ -468,6 +469,45 @@ V2_TOOLS: list[Tool] = [
                 },
             },
             "required": ["repo", "project_path"],
+        },
+    ),
+    # ──────────────────────────────────────────────────────────────────────────
+    # AUTONOMOUS ENGINE
+    # ──────────────────────────────────────────────────────────────────────────
+    Tool(
+        name="turingmind_get_decision_queue",
+        description=(
+            "Provides a prioritized Action Item queue for the IDE Agent. "
+            "Call this tool to figure out what you should work on next. "
+            "It returns a list of high-priority gaps in the graph (e.g. missing contracts, broken tests) "
+            "sorted by blast radius severity."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "repo": {"type": "string", "description": "Repository (owner/repo)"},
+                "limit": {"type": "number", "description": "Max items to return (default 10)"},
+            },
+            "required": ["repo"],
+        },
+    ),
+    Tool(
+        name="turingmind_sync_codebase",
+        description=(
+            "Syncs the codebase state with the constraint graph. Intended to be called by git webhooks/hooks. "
+            "Applies a confidence penalty to nodes whose files were modified and propagates the blast radius."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "repo": {"type": "string", "description": "Repository (owner/repo)"},
+                "files": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "List of absolute or relative file paths that were changed"
+                },
+            },
+            "required": ["repo", "files"],
         },
     ),
 ]

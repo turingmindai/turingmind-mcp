@@ -181,6 +181,10 @@ async def handle_update_spec_node(args: dict, ctx: ToolContext) -> list[TextCont
         except ValueError:
             pass
 
+    if "dependencies" in args:
+        merged = list(set(node.dependencies + args["dependencies"]))
+        node.dependencies = merged
+
     node.updated_at = _now()
     save_spec_node(node)
     response = {"status": "updated", "node_id": node_id}
@@ -439,17 +443,15 @@ async def handle_run_verification(args: dict, ctx: ToolContext) -> list[TextCont
             output = result.stdout + result.stderr
 
             # Parse pytest summary line only — avoids double-counting verbose PASSED lines
-            # Pytest summary format: "3 passed, 1 failed in 0.42s" or "3 passed in 0.42s"
-            summary_match = re.search(
-                r'(\d+) passed(?:,\s*(\d+) failed)?',
-                output, re.MULTILINE
-            )
-            if summary_match:
-                passed = int(summary_match.group(1))
-                failed = int(summary_match.group(2) or 0)
-            else:
+            # Pytest summary format: "3 passed, 1 failed in 0.42s" or "2 failed in 0.42s"
+            passed_match = re.search(r'(\d+) passed', output)
+            failed_match = re.search(r'(\d+) failed', output)
+            
+            passed = int(passed_match.group(1)) if passed_match else 0
+            failed = int(failed_match.group(1)) if failed_match else 0
+            
+            if passed == 0 and failed == 0:
                 # Fallback: no summary line means collection error or empty suite
-                passed = 0
                 failed = 1 if result.returncode != 0 else 0
             total = passed + failed
 
@@ -1437,9 +1439,19 @@ def detect_graph_gaps(repo: str) -> list[dict]:
                 })
 
     # ── Gap 3: Orphan nodes (no dependencies AND no dependents) ─────────
+    # We must precompute dependents from the `edge_graph` table since `node.dependents`
+    # inside the JSON blob is not updated when downstream nodes declare a dependency.
+    import sqlite3
+    from .database import _get_connection
+    with _get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT upstream_id FROM edge_graph")
+        all_upstream_ids = {row["upstream_id"] for row in cursor.fetchall()}
+
     for node in all_nodes:
         if node.level not in (NodeLevel.L0_INFRA,):  # L0 infra nodes are allowed to be roots
-            if not node.dependencies and not node.dependents:
+            has_dependents = node.id in all_upstream_ids
+            if not node.dependencies and not has_dependents:
                 gaps.append({
                     "gap_type": "orphan_node",
                     "severity": "low",
@@ -1487,6 +1499,93 @@ def _append_gap_hints(response: dict, repo: str) -> dict:
 
 
 # =============================================================================
+# STAGE 4: AUTONOMOUS WORKFLOW & DECISION QUEUE
+# =============================================================================
+
+async def handle_sync_codebase(args: dict, ctx: ToolContext) -> list[TextContent]:
+    """Git hook receiver. Invalidate nodes that contain changed files and cascade."""
+    repo = args.get("repo")
+    files = args.get("files", [])
+    if not repo:
+        return _err("repo is required")
+    if not files:
+        return _err("files list is required and must not be empty")
+
+    all_nodes = _all_nodes_for_repo(repo)
+    changed_set = set(files)
+    impacted_nodes = []
+
+    for node in all_nodes:
+        node_files = set(node.implementation.files)
+        overlap = changed_set.intersection(node_files)
+        if overlap:
+            # File changed. Apply a 10% penalty to confidence and cascade.
+            old_conf = node.state.confidence
+            new_score = float(round(old_conf * 0.9, 4)) if old_conf > 0 else 0.0
+
+            node.state.evidence.append(Evidence(
+                kind="code_change",
+                score=new_score,
+                detail=f"Files modified: {', '.join(sorted(overlap))}",
+                source="git_hook",
+                origin_id=f"sync_{node.id}",
+            ))
+            node.state.confidence = recalculate_confidence(node)
+            node.state.status = SpecStatus.IN_PROGRESS if node.state.status == SpecStatus.VERIFIED else node.state.status
+            node.updated_at = _now()
+
+            save_spec_node(node)
+            impacted_nodes.append(node.id)
+
+    cascades = []
+    for nid in impacted_nodes:
+        # Cascade the change down the graph
+        res = cascade_blast_radius(nid, repo)
+        if res.get("impacted_count", 0) > 0:
+            cascades.append(res)
+
+    return _ok({
+        "status": "synced",
+        "repo": repo,
+        "direct_impact_count": len(impacted_nodes),
+        "direct_impact_nodes": impacted_nodes,
+        "cascades_triggered": len(cascades),
+        "cascades": cascades,
+    })
+
+
+async def handle_get_decision_queue(args: dict, ctx: ToolContext) -> list[TextContent]:
+    """Provides a prioritized list of action items (Decision Queue) to the IDE Agent."""
+    repo = args.get("repo")
+    if not repo:
+        return _err("repo is required")
+    limit = int(args.get("limit", 10))
+
+    gaps = detect_graph_gaps(repo)
+
+    # Severity to sort weight
+    severity_weight = {
+        "critical": 4,
+        "high": 3,
+        "medium": 2,
+        "low": 1,
+    }
+
+    # Sort gaps by descending severity
+    sorted_gaps = sorted(gaps, key=lambda g: severity_weight.get(g.get("severity", "low"), 0), reverse=True)
+    top_items = sorted_gaps[:limit]
+
+    return _ok({
+        "status": "success",
+        "repo": repo,
+        "total_items_in_queue": len(gaps),
+        "returned_items": len(top_items),
+        "decision_queue": top_items,
+        "instruction": "Agent: Pick the TOP item from this queue, execute its 'action', then poll this queue again.",
+    })
+
+
+# =============================================================================
 # REGISTRATION
 # =============================================================================
 
@@ -1515,6 +1614,9 @@ V2_HANDLERS: dict[str, Any] = {
     "turingmind_get_execution_state": handle_get_execution_state,
     # Bootstrap
     "turingmind_bootstrap_codebase": handle_bootstrap_codebase,
+    # Autonomous Engine
+    "turingmind_sync_codebase": handle_sync_codebase,
+    "turingmind_get_decision_queue": handle_get_decision_queue,
     # Cloud
     "turingmind_sync_cloud": handle_sync_cloud,
 }

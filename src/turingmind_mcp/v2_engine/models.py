@@ -22,6 +22,7 @@ class NodeLevel(str, Enum):
     L3_API = "L3_API"                     # Network Ingress/Egress 
     L4_FEATURE = "L4_FEATURE"             # Feature/Ticket tracker
     L5_BUSINESS_GOAL = "L5_BUSINESS_GOAL" # Epic/Business Intent
+    L6_ACTION_ITEM = "L6_ACTION_ITEM"     # Decision Queue Task
 
 
 class SurfaceType(str, Enum):
@@ -139,6 +140,7 @@ class Evidence(BaseModel):
         "regression_clear",     # a regression was fixed and verified
         "security_scan",        # SAST/DAST result
         "blast_radius_cascade", # confidence penalty propagated from a failed upstream node
+        "code_change",          # Git hook detected a file modification
     ] = Field(..., description="What kind of evidence this is")
     recorded_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     score: float = Field(

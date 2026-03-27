@@ -115,6 +115,8 @@ AUTH_FREE_TOOLS = {
     "turingmind_get_execution_state",
     "turingmind_ingest_runtime_signal",
     "turingmind_bootstrap_codebase",
+    "turingmind_get_decision_queue",
+    "turingmind_sync_codebase",
 }
 
 

@@ -1,13 +1,17 @@
 import logging
 import datetime
+import uuid
+import hashlib
+import pathlib
 from typing import List, Optional, Any, Dict
 from fastapi import FastAPI, HTTPException, Body
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 
-from .v2_engine.models import SpecNode, ExecutionState, SpecStatus, ExecutionStage, FailureClassification, Evidence
+from .v2_engine.models import SpecNode, ExecutionState, SpecStatus, ExecutionStage, FailureClassification, Evidence, NodeLevel, SurfaceType, Contract, Metric
 from .v2_engine.database import get_all_spec_nodes, get_execution_state, get_spec_node, save_spec_node, save_execution_state, get_impacted_subgraph
+from .v2_engine.handlers import detect_graph_gaps, _all_nodes_for_repo, cascade_blast_radius, recalculate_confidence, _now
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("turingmind_api")
@@ -21,6 +25,294 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ── Stage 4: Decision Queue ─────────────────────────────────────────────────
+SEVERITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+
+@app.get("/api/v2/decision-queue")
+def get_decision_queue(repo: str, limit: int = 20):
+    """Return prioritized action items derived from graph gap analysis."""
+    if not repo:
+        raise HTTPException(status_code=400, detail="repo is required")
+    try:
+        gaps = detect_graph_gaps(repo)
+        # Sort by severity (critical first)
+        gaps.sort(key=lambda g: SEVERITY_ORDER.get(g.get("severity", "low"), 99))
+        return {
+            "queue": gaps[:limit],
+            "total": len(gaps),
+            "repo": repo,
+        }
+    except Exception as e:
+        logger.error(f"Error building decision queue: {e}")
+        return {"queue": [], "total": 0, "repo": repo}
+
+
+class ClusterMeta(BaseModel):
+    type: str = "unknown"            # refactor_burst, cross_module, targeted_fix, non_code, development
+    severity: str = "low"            # low, medium, high
+    description: str = ""
+    duration_ms: int = 0
+    edit_counts: dict[str, int] = {} # file → edit count within the cluster
+
+class SyncPayload(BaseModel):
+    repo: str
+    files: list[str]
+    cluster: ClusterMeta | None = None
+
+class CreateNodePayload(BaseModel):
+    repo: str
+    title: str
+    level: str                          # L0_SYSTEM, L1_FILE, L2_EXTERNAL, L3_API
+    surface_type: str = "internal"      # api_endpoint, internal, job, hardware_bridge
+    contract: dict = {}                 # {invariants: [], metrics: [], inputs: {}, outputs: {}}
+    dependencies: list[str] = []
+    priority: str = "medium"
+
+class UpdateNodePayload(BaseModel):
+    contract: dict = {}
+    dependencies: list[str] = []
+    surface_type: Optional[str] = None
+    priority: Optional[str] = None
+
+class IntentRecord(BaseModel):
+    text: str               # Raw text of the intent item (e.g. checklist line)
+    kind: str = "task"      # "task" | "plan_section" | "goal"
+    node_id: Optional[str] = None  # Link to an existing SpecNode if known
+
+class IntentPayload(BaseModel):
+    repo: str
+    source_file: str        # Which plan file this came from (e.g. "task.md")
+    records: list[IntentRecord]
+    agent: str = "antigravity"
+
+@app.post("/api/v2/intent")
+def capture_intent(payload: IntentPayload):
+    """Store planning intent records before code is written.
+    Called automatically by `turingmind plan` when task.md or implementation_plan.md changes."""
+    if not payload.repo or not payload.records:
+        raise HTTPException(status_code=400, detail="repo and records are required")
+
+    import os as _os, json as _json
+
+    # Use TURINGMIND_DATA_DIR if set, otherwise fall back to CWD
+    data_root = pathlib.Path(_os.environ.get("TURINGMIND_DATA_DIR", "."))
+    log_dir = data_root / ".turingmind"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / "intent_log.json"
+
+    existing: list = []
+    if log_path.exists():
+        try:
+            existing = _json.loads(log_path.read_text())
+        except Exception:
+            existing = []
+
+    # Deduplication: hash the record texts to skip identical re-submissions
+    record_dicts = [r.model_dump() for r in payload.records]
+    content_hash = hashlib.sha256(
+        _json.dumps(record_dicts, sort_keys=True).encode()
+    ).hexdigest()[:12]
+
+    if existing and existing[-1].get("content_hash") == content_hash:
+        logger.info(f"Intent duplicate skipped for {payload.source_file} (hash={content_hash})")
+        return {
+            "status": "duplicate_skipped",
+            "records": len(payload.records),
+            "repo": payload.repo,
+            "source_file": payload.source_file,
+            "content_hash": content_hash,
+        }
+
+    timestamp = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    entry = {
+        "timestamp": timestamp,
+        "repo": payload.repo,
+        "source_file": payload.source_file,
+        "agent": payload.agent,
+        "content_hash": content_hash,
+        "records": record_dicts,
+    }
+    existing.append(entry)
+
+    # Cap at 200 entries to prevent unbounded growth
+    MAX_INTENT_LOG = 200
+    if len(existing) > MAX_INTENT_LOG:
+        existing = existing[-MAX_INTENT_LOG:]
+
+    log_path.write_text(_json.dumps(existing, indent=2))
+
+    logger.info(f"Captured {len(payload.records)} intent records from {payload.source_file} for {payload.repo}")
+    return {
+        "status": "captured",
+        "records": len(payload.records),
+        "repo": payload.repo,
+        "source_file": payload.source_file,
+        "timestamp": timestamp,
+        "content_hash": content_hash,
+    }
+
+
+@app.post("/api/v2/graph/nodes")
+def create_node(payload: CreateNodePayload):
+    """REST endpoint to create a new SpecNode — mirrors MCP handle_create_spec_node."""
+    if not payload.repo or not payload.title:
+        raise HTTPException(status_code=400, detail="repo and title are required")
+
+    try:
+        level = NodeLevel(payload.level)
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"Invalid level: {payload.level}. Must be one of: {[e.value for e in NodeLevel]}")
+
+    try:
+        surface = SurfaceType(payload.surface_type)
+    except ValueError:
+        surface = SurfaceType.INTERNAL
+
+    contract = Contract(
+        inputs=payload.contract.get("inputs", {}),
+        outputs=payload.contract.get("outputs", {}),
+        invariants=payload.contract.get("invariants", []),
+        metrics=payload.contract.get("metrics", []),
+    )
+
+    node_id = str(uuid.uuid4())
+    node = SpecNode(
+        id=node_id,
+        repo=payload.repo,
+        title=payload.title,
+        level=level,
+        surface_type=surface,
+        contract=contract,
+        dependencies=payload.dependencies,
+    )
+
+    save_spec_node(node)
+    logger.info(f"Created node {node_id}: {payload.title} [{level.value}]")
+
+    return {
+        "status": "created",
+        "node_id": node_id,
+        "repo": payload.repo,
+        "title": payload.title,
+        "level": level.value,
+        "surface_type": surface.value,
+    }
+
+@app.put("/api/v2/graph/nodes/{node_id}")
+def update_node(node_id: str, payload: UpdateNodePayload):
+    """REST endpoint to incrementally update a SpecNode (edges, contracts, surface)."""
+    node = get_spec_node(node_id)
+    if not node:
+        raise HTTPException(status_code=404, detail=f"Node {node_id} not found")
+
+    changed = False
+
+    if payload.dependencies:
+        # Merge dependencies
+        merged = list(set(node.dependencies + payload.dependencies))
+        if set(node.dependencies) != set(merged):
+            node.dependencies = merged
+            changed = True
+
+    if payload.surface_type:
+        try:
+            node.surface_type = SurfaceType(payload.surface_type)
+            changed = True
+        except ValueError:
+            pass
+
+    if payload.contract:
+        c = payload.contract
+        new_invariants = list(set(node.contract.invariants + c.get("invariants", [])))
+        new_metrics_data = c.get("metrics", [])
+        
+        # Merge metrics by name
+        existing_metrics = {m.name: m for m in node.contract.metrics}
+        for md in new_metrics_data:
+            if isinstance(md, dict) and "name" in md and "threshold" in md:
+                existing_metrics[md["name"]] = Metric(**md)
+        
+        new_metrics = list(existing_metrics.values())
+
+        if new_invariants != node.contract.invariants or len(new_metrics) != len(node.contract.metrics):
+            node.contract = Contract(
+                inputs=c.get("inputs", node.contract.inputs),
+                outputs=c.get("outputs", node.contract.outputs),
+                invariants=new_invariants,
+                metrics=new_metrics,
+            )
+            changed = True
+
+    if changed:
+        node.updated_at = _now()
+        save_spec_node(node)
+        logger.info(f"Updated node {node_id} via REST")
+
+    return {"status": "updated" if changed else "unchanged", "node_id": node_id}
+
+@app.post("/api/v2/sync")
+def sync_codebase(payload: SyncPayload):
+    """REST endpoint for sync_codebase — invalidate nodes containing changed files and cascade."""
+    if not payload.repo:
+        raise HTTPException(status_code=400, detail="repo is required")
+    if not payload.files:
+        raise HTTPException(status_code=400, detail="files list is required")
+
+    cluster_label = ""
+    if payload.cluster:
+        cluster_label = f" [{payload.cluster.type}/{payload.cluster.severity}]"
+        logger.info(f"Sync cluster{cluster_label}: {payload.cluster.description}")
+
+    try:
+        all_nodes = _all_nodes_for_repo(payload.repo)
+        changed_set = set(payload.files)
+        impacted_nodes = []
+
+        for node in all_nodes:
+            node_files = set(node.implementation.files)
+            overlap = changed_set.intersection(node_files)
+            if overlap:
+                old_conf = node.state.confidence
+                new_score = float(round(old_conf * 0.9, 4)) if old_conf > 0 else 0.0
+
+                detail = f"Files modified: {', '.join(sorted(overlap))}"
+                if cluster_label:
+                    detail += cluster_label
+
+                node.state.evidence.append(Evidence(
+                    kind="code_change",
+                    score=new_score,
+                    detail=detail,
+                    source="git_hook",
+                    origin_id=f"sync_{node.id}",
+                ))
+                node.state.confidence = recalculate_confidence(node)
+                node.state.status = SpecStatus.IN_PROGRESS if node.state.status == SpecStatus.VERIFIED else node.state.status
+                node.updated_at = _now()
+
+                save_spec_node(node)
+                impacted_nodes.append(node.id)
+
+        cascades = []
+        for nid in impacted_nodes:
+            res = cascade_blast_radius(nid, payload.repo)
+            if res.get("impacted_count", 0) > 0:
+                cascades.append(res)
+
+        result = {
+            "status": "synced",
+            "repo": payload.repo,
+            "direct_impact_count": len(impacted_nodes),
+            "direct_impact_nodes": impacted_nodes,
+            "cascades_triggered": len(cascades),
+        }
+        if payload.cluster:
+            result["cluster"] = payload.cluster.model_dump()
+        return result
+    except Exception as e:
+        logger.error(f"Error syncing codebase: {e}")
+        return {"status": "error", "detail": str(e)}
 
 @app.get("/api/v2/graph/nodes")
 def get_graph_nodes(repo: str):
@@ -157,6 +449,44 @@ def ingest_signal(payload: SignalPayload):
     # ── Standard signal processing ────────────────────────────────────────────
     num_threshold = payload.threshold
     metric_direction = 'below'
+
+class VerifyPayload(BaseModel):
+    test_dir: Optional[str] = None
+    python_bin: str = "python"
+    
+@app.post("/api/v2/graph/nodes/{node_id}/verify")
+def verify_node(node_id: str, payload: VerifyPayload):
+    from turingmind_mcp.v2_engine.handlers import handle_run_verification
+    import asyncio
+    
+    # We create a dummy ToolContext (not used by the handler directly)
+    class DummyContext: pass
+    ctx = DummyContext()
+    
+    args = {
+        "node_id": node_id,
+        "test_dir": payload.test_dir,
+        "python_bin": payload.python_bin
+    }
+    
+    # Run the async handler synchronously for the REST Request
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+    result = loop.run_until_complete(handle_run_verification(args, ctx))
+    
+    if result[0].type == "text" and result[0].text.startswith("Error"):
+        raise HTTPException(status_code=400, detail=result[0].text)
+        
+    import json
+    try:
+        data = json.loads(result[0].text)
+        return data
+    except json.JSONDecodeError:
+        return {"status": "success", "raw": result[0].text}
 
     if num_threshold is None and node.contract and node.contract.metrics:
         # Match metric by name
