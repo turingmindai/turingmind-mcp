@@ -26,6 +26,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ── Health Check ────────────────────────────────────────────────────────────
+@app.get("/api/v2/health")
+def health_check():
+    """Simple liveness probe for the daemon supervisor."""
+    return {"status": "ok"}
+
 # ── Stage 4: Decision Queue ─────────────────────────────────────────────────
 SEVERITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3}
 
