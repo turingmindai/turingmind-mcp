@@ -68,6 +68,7 @@ class CreateNodePayload(BaseModel):
     contract: dict = {}                 # {invariants: [], metrics: [], inputs: {}, outputs: {}}
     dependencies: list[str] = []
     priority: str = "medium"
+    governance_tier: Optional[str] = None
 
 class UpdateNodePayload(BaseModel):
     contract: dict = {}
@@ -177,12 +178,21 @@ def create_node(payload: CreateNodePayload):
     )
 
     node_id = str(uuid.uuid4())
+    
+    # Parse governance tier if provided
+    try:
+        from .v2_engine.models import GovernanceTier
+        tier = GovernanceTier(payload.governance_tier) if payload.governance_tier else GovernanceTier.GOVERNED
+    except ValueError:
+        tier = GovernanceTier.GOVERNED
+
     node = SpecNode(
         id=node_id,
         repo=payload.repo,
         title=payload.title,
         level=level,
         surface_type=surface,
+        governance_tier=tier,
         contract=contract,
         dependencies=payload.dependencies,
     )

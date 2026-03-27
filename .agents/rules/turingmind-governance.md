@@ -21,7 +21,8 @@ Before modifying any source file, you MUST do one of the following:
 
 ### Option A: Create a SpecNode directly via MCP (Preferred)
 Use the `turingmind_create_spec_node` MCP tool to create a node for the exact feature/fix you are about to implement. 
-- You must define the `contract.invariants` and `contract.metrics`. 
+- You must define at least a skeleton contract (e.g., `contract.metrics` like test coverage).
+- **Note on Governance Tiers**: A node being `governed` guarantees structural enforcement and empirical testing (unit/integration). Formal `contract.invariants` (Z3 Prover capabilities) are an optional "Ultra" tier feature and are NOT strictly required to reach the governed state.
 - The constraint graph dictates the code, not the other way around.
 
 ### Option B: Declare intent in `task.md` or `implementation_plan.md`
