@@ -1757,7 +1757,12 @@ def _append_gap_hints(response: dict, repo: str) -> dict:
 # =============================================================================
 
 async def handle_sync_codebase(args: dict, ctx: ToolContext) -> list[TextContent]:
-    """Git hook receiver. Invalidate nodes that contain changed files and cascade."""
+    """Git hook receiver. Invalidate nodes that contain changed files and cascade.
+
+    R2-A enhancement: Files not tracked by any existing SpecNode are auto-created
+    as L1_FILE OBSERVED nodes so they never enter a 'dark zone' invisible to the
+    constraint graph.
+    """
     repo = args.get("repo")
     files = args.get("files", [])
     if not repo:
@@ -1768,6 +1773,11 @@ async def handle_sync_codebase(args: dict, ctx: ToolContext) -> list[TextContent
     all_nodes = _all_nodes_for_repo(repo)
     changed_set = set(files)
     impacted_nodes = []
+
+    # Collect all files already tracked across all nodes
+    tracked_files: set[str] = set()
+    for node in all_nodes:
+        tracked_files.update(node.implementation.files)
 
     for node in all_nodes:
         node_files = set(node.implementation.files)
@@ -1791,6 +1801,60 @@ async def handle_sync_codebase(args: dict, ctx: ToolContext) -> list[TextContent
             save_spec_node(node)
             impacted_nodes.append(node.id)
 
+    # ── R2-A: Auto-discover untracked source files as OBSERVED L1 nodes ───
+    SOURCE_EXTENSIONS = {
+        ".py", ".js", ".ts", ".tsx", ".jsx",
+        ".go", ".rs", ".java", ".rb", ".c", ".cpp", ".h", ".cs",
+        ".swift", ".kt", ".scala", ".ex", ".exs",
+        ".sh", ".bash",
+        ".yaml", ".yml",  # config-as-code (k8s, CI, OpenGrep rules)
+        ".tf", ".hcl",    # infrastructure-as-code
+    }
+    auto_created: list[str] = []
+    untracked = changed_set - tracked_files
+    for filepath in sorted(untracked):
+        # Only auto-create for source code files
+        ext = "." + filepath.rsplit(".", 1)[-1].lower() if "." in filepath else ""
+        if ext not in SOURCE_EXTENSIONS:
+            continue
+
+        # Derive a deterministic node_id from the filepath
+        node_id = f"L1::{filepath.replace('/', '::').replace('.', '_')}"
+
+        # Check dedup — the node may already exist under a different implementation.files set
+        existing = get_spec_node(node_id)
+        if existing:
+            # Node exists but didn't have this file — add the file to its implementation
+            if filepath not in existing.implementation.files:
+                existing.implementation.files.append(filepath)
+                existing.updated_at = _now()
+                save_spec_node(existing)
+            continue
+
+        # Create a new OBSERVED L1 node
+        new_node = SpecNode(
+            id=node_id,
+            repo=repo,
+            title=filepath.rsplit("/", 1)[-1],  # basename as title
+            level=NodeLevel.L1_FILE,
+            surface_type=SurfaceType.INTERNAL,
+            governance_tier=GovernanceTier.OBSERVED,
+            implementation=Implementation(files=[filepath]),
+            state=NodeState(
+                status=SpecStatus.PENDING,
+                stage=ExecutionStage.SPEC_DEFINED,
+                confidence=0.0,
+                evidence=[Evidence(
+                    kind="code_change",
+                    score=0.0,
+                    detail=f"Auto-discovered during sync: {filepath}",
+                    source="git_hook",
+                )],
+            ),
+        )
+        save_spec_node(new_node)
+        auto_created.append(node_id)
+
     cascades = []
     for nid in impacted_nodes:
         # Cascade the change down the graph
@@ -1803,6 +1867,8 @@ async def handle_sync_codebase(args: dict, ctx: ToolContext) -> list[TextContent
         "repo": repo,
         "direct_impact_count": len(impacted_nodes),
         "direct_impact_nodes": impacted_nodes,
+        "auto_discovered_count": len(auto_created),
+        "auto_discovered_nodes": auto_created,
         "cascades_triggered": len(cascades),
         "cascades": cascades,
     })
