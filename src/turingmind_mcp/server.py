@@ -104,6 +104,7 @@ AUTH_FREE_TOOLS = {
     "turingmind_get_spec_status",
     "turingmind_list_spec_nodes",
     "turingmind_get_ready_nodes",
+    "turingmind_promote_node",
     "turingmind_generate_verification",
     "turingmind_run_verification",
     "turingmind_record_execution_stage",

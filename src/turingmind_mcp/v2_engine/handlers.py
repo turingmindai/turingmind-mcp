@@ -35,6 +35,7 @@ from .models import (
     ExecutionState,
     FailureClassification,
     GlobalMetrics,
+    GovernanceTier,
     Implementation,
     Metric,
     NodeLevel,
@@ -1075,23 +1076,25 @@ async def handle_get_execution_state(args: dict, ctx: ToolContext) -> list[TextC
         all_nodes = get_all_spec_nodes(repo)
         _METRICS_CACHE[repo] = (now, all_nodes)
 
-    if all_nodes:
-        total = len(all_nodes)
-        verified_count = sum(1 for n in all_nodes if n.state.stage == ExecutionStage.VERIFIED)
-        failed_count = sum(1 for n in all_nodes if n.state.status == SpecStatus.FAILED)
-        passed_count = verified_count  # nodes that reached verified = passed
+    # Filter out observed/proposed nodes for formal metrics
+    governed_nodes = [n for n in (all_nodes or []) if getattr(n, 'governance_tier', 'governed') == 'governed' or getattr(n, 'governance_tier', None) == GovernanceTier.GOVERNED]
+
+    if governed_nodes:
+        total = len(governed_nodes)
+        verified_count = sum(1 for n in governed_nodes if n.state.stage == ExecutionStage.VERIFIED)
+        failed_count = sum(1 for n in governed_nodes if n.state.status == SpecStatus.FAILED)
+        passed_count = verified_count
         tested_count = passed_count + failed_count
 
-        avg_confidence = sum(n.state.confidence for n in all_nodes) / total
+        avg_confidence = sum(n.state.confidence for n in governed_nodes) / total
         pass_rate = (passed_count / tested_count) if tested_count > 0 else 0.0
-        coverage = verified_count / total  # fraction of nodes fully verified
+        coverage = verified_count / total
 
         state.metrics.system_confidence = round(avg_confidence, 3)
         state.metrics.pass_rate = round(pass_rate, 3)
         state.metrics.coverage = round(coverage, 3)
 
-        # Sync failed_nodes list from actual node data
-        actual_failed = [n.id for n in all_nodes if n.state.status == SpecStatus.FAILED]
+        actual_failed = [n.id for n in governed_nodes if n.state.status == SpecStatus.FAILED]
         state.failed_nodes = actual_failed
 
     return _ok({
@@ -1099,8 +1102,8 @@ async def handle_get_execution_state(args: dict, ctx: ToolContext) -> list[TextC
         "ready_queue": state.ready_queue,
         "blocked_queue": state.blocked_queue,
         "failed_nodes": state.failed_nodes,
-        "total_nodes": len(all_nodes) if all_nodes else 0,
-        "verified_nodes": sum(1 for n in all_nodes if n.state.stage == ExecutionStage.VERIFIED) if all_nodes else 0,
+        "total_nodes": len(governed_nodes) if governed_nodes else 0,
+        "verified_nodes": sum(1 for n in governed_nodes if n.state.stage == ExecutionStage.VERIFIED) if governed_nodes else 0,
         "metrics": {
             "coverage": state.metrics.coverage,
             "pass_rate": state.metrics.pass_rate,
@@ -1188,19 +1191,264 @@ async def handle_bootstrap_codebase(args: dict, ctx: ToolContext) -> list[TextCo
         save_spec_node(node)
         created.append({"node_id": node_id, "title": title, "files": files})
 
+    # ── Deep Scan: auto-inventory L3 APIs and L4 Features as OBSERVED ────────
+    scan_depth = args.get("scan_depth", "shallow")
+    observed_created = []
+
+    if scan_depth == "deep" and not dry_run:
+        import re as _re
+
+        # Regex patterns for common API route declarations
+        route_patterns = [
+            _re.compile(r'''app\.(get|post|put|delete|patch)\(['"]([^'"]+)['"]''', _re.IGNORECASE),
+            _re.compile(r'''router\.(get|post|put|delete|patch)\(['"]([^'"]+)['"]''', _re.IGNORECASE),
+            _re.compile(r'''@app\.(route|get|post|put|delete|patch)\(['"]([^'"]+)['"]''', _re.IGNORECASE),
+        ]
+
+        # Scan all source files for API routes
+        discovered_routes: list[dict] = []
+        for _files in module_groups.values():
+            for rel_file in _files:
+                full_path = root / rel_file
+                if not full_path.exists():
+                    continue
+                try:
+                    content = full_path.read_text(errors="ignore")
+                except Exception:
+                    continue
+                for pat in route_patterns:
+                    for match in pat.finditer(content):
+                        method = match.group(1).upper()
+                        path = match.group(2)
+                        discovered_routes.append({
+                            "method": method,
+                            "path": path,
+                            "source_file": rel_file,
+                        })
+
+        # Create L3 API nodes (observed tier)
+        for route in discovered_routes:
+            api_title = f"{route['method']} {route['path']}"
+            if api_title in existing_titles:
+                continue
+            api_id = f"api-{repo.replace('/', '-')}-{str(uuid.uuid4())[:8]}"
+            api_node = SpecNode(
+                id=api_id,
+                repo=repo,
+                title=api_title,
+                level=NodeLevel.L3_API,
+                surface_type=SurfaceType.API_ENDPOINT,
+                governance_tier=GovernanceTier.OBSERVED,
+                implementation=Implementation(files=[route["source_file"]]),
+            )
+            save_spec_node(api_node)
+            existing_titles.add(api_title)
+            observed_created.append({"node_id": api_id, "title": api_title, "level": "L3_API", "tier": "observed"})
+
+        # Cluster L3 APIs into L4 Features by URL prefix
+        prefix_groups: dict[str, list[str]] = {}
+        for route in discovered_routes:
+            parts = route["path"].strip("/").split("/")
+            # Use first 2 path segments as feature key (e.g., '/api/v2/graph' -> 'api/v2/graph')
+            prefix = "/".join(parts[:3]) if len(parts) >= 3 else "/".join(parts[:2]) if len(parts) >= 2 else parts[0] if parts else "misc"
+            if prefix not in prefix_groups:
+                prefix_groups[prefix] = []
+            prefix_groups[prefix].append(f"{route['method']} {route['path']}")
+
+        for prefix, api_titles in prefix_groups.items():
+            # Convert prefix to human-readable feature name
+            feature_name = prefix.replace("/", " ").replace("api ", "").replace("v2 ", "").strip().title() or "Core"
+            if feature_name in existing_titles:
+                continue
+            feat_id = f"feature-{repo.replace('/', '-')}-{str(uuid.uuid4())[:8]}"
+            feat_node = SpecNode(
+                id=feat_id,
+                repo=repo,
+                title=feature_name,
+                level=NodeLevel.L4_FEATURE,
+                surface_type=SurfaceType.INTERNAL,
+                governance_tier=GovernanceTier.OBSERVED,
+            )
+            save_spec_node(feat_node)
+            existing_titles.add(feature_name)
+            observed_created.append({"node_id": feat_id, "title": feature_name, "level": "L4_FEATURE", "tier": "observed", "apis": api_titles})
+
+    # ── Manifest Scan: 3rd party libs and external services as OBSERVED ──────
+    if scan_depth == "deep" and not dry_run:
+        import json as _json
+        import re as _re2
+
+        # ── Known external service SDK fingerprints ──────────────────────────
+        EXTERNAL_SERVICE_PATTERNS = {
+            "redis":       SurfaceType.EXTERNAL_SERVICE,
+            "rq":          SurfaceType.EXTERNAL_SERVICE,
+            "celery":      SurfaceType.EXTERNAL_SERVICE,
+            "kafka":       SurfaceType.EXTERNAL_SERVICE,
+            "pika":        SurfaceType.EXTERNAL_SERVICE,   # RabbitMQ
+            "pg":          SurfaceType.EXTERNAL_SERVICE,   # node-postgres
+            "psycopg2":    SurfaceType.EXTERNAL_SERVICE,
+            "asyncpg":     SurfaceType.EXTERNAL_SERVICE,
+            "pymongo":     SurfaceType.EXTERNAL_SERVICE,
+            "motor":       SurfaceType.EXTERNAL_SERVICE,   # async mongo
+            "elasticsearch": SurfaceType.EXTERNAL_SERVICE,
+            "boto3":       SurfaceType.EXTERNAL_SERVICE,   # AWS
+            "aiobotocore": SurfaceType.EXTERNAL_SERVICE,
+            "stripe":      SurfaceType.EXTERNAL_SERVICE,
+            "twilio":      SurfaceType.EXTERNAL_SERVICE,
+            "sendgrid":    SurfaceType.EXTERNAL_SERVICE,
+            "httpx":       SurfaceType.EXTERNAL_SERVICE,
+            "aiohttp":     SurfaceType.EXTERNAL_SERVICE,
+            "firebase_admin": SurfaceType.EXTERNAL_SERVICE,
+            "openai":      SurfaceType.EXTERNAL_SERVICE,
+            "anthropic":   SurfaceType.EXTERNAL_SERVICE,
+        }
+
+        # ── Manifest file parsers ─────────────────────────────────────────────
+        manifest_files = [
+            root / "package.json",
+            root / "requirements.txt",
+            root / "Pipfile",
+            root / "pyproject.toml",
+        ]
+
+        for manifest_path in manifest_files:
+            if not manifest_path.exists():
+                continue
+            try:
+                text = manifest_path.read_text(errors="ignore")
+                manifest_name = manifest_path.name
+                packages: dict[str, str] = {}  # name -> version
+
+                if manifest_name == "package.json":
+                    try:
+                        data = _json.loads(text)
+                        for key in ("dependencies", "devDependencies"):
+                            for pkg, ver in (data.get(key) or {}).items():
+                                packages[pkg] = str(ver)
+                    except Exception:
+                        pass
+
+                elif manifest_name == "requirements.txt":
+                    for line in text.splitlines():
+                        line = line.strip()
+                        if not line or line.startswith("#"):
+                            continue
+                        m = _re2.match(r"^([A-Za-z0-9_\-\.]+)([>=<!\s].*)?$", line)
+                        if m:
+                            pkg = m.group(1).lower()
+                            ver = (m.group(2) or "").strip() or "unpinned"
+                            packages[pkg] = ver
+
+                elif manifest_name in ("Pipfile", "pyproject.toml"):
+                    # Best-effort: look for `package = "*"` or `package = "^1.2.3"`
+                    for m in _re2.finditer(r'^([a-zA-Z0-9_\-]+)\s*=\s*["\']([^"\']+)["\']', text, _re2.MULTILINE):
+                        packages[m.group(1).lower()] = m.group(2)
+
+                for pkg_name, pkg_ver in packages.items():
+                    if pkg_name in existing_titles:
+                        continue
+                    stype = EXTERNAL_SERVICE_PATTERNS.get(pkg_name, SurfaceType.THIRD_PARTY_LIB)
+                    pkg_id = f"dep-{repo.replace('/', '-')}-{str(uuid.uuid4())[:8]}"
+                    pkg_node = SpecNode(
+                        id=pkg_id,
+                        repo=repo,
+                        title=pkg_name,
+                        level=NodeLevel.L2_EXTERNAL,
+                        surface_type=stype,
+                        governance_tier=GovernanceTier.OBSERVED,
+                        implementation=Implementation(
+                            files=[str(manifest_path.relative_to(root))],
+                            functions=[f"version:{pkg_ver}", f"source:{manifest_name}"],
+                        ),
+                    )
+                    save_spec_node(pkg_node)
+                    existing_titles.add(pkg_name)
+                    observed_created.append({
+                        "node_id": pkg_id,
+                        "title": pkg_name,
+                        "level": "L2_EXTERNAL",
+                        "tier": "observed",
+                        "surface_type": stype.value,
+                        "version": pkg_ver,
+                        "source": manifest_name,
+                    })
+            except Exception:
+                continue
+
+        # ── Infrastructure inventory: Docker / k8s / CI config files ──────────
+        # Note: pathlib.glob() skips hidden dirs (.github etc) on Python <3.11
+        # so we cannot use patterns like '.github/workflows/*.yml'. Instead we
+        # check explicit well-known paths and then glob simple top-level patterns.
+        infra_entries: list[tuple[pathlib.Path, str]] = []
+
+        # Explicit well-known files in hidden dirs
+        for _explicit in [
+            root / ".github" / "workflows",
+            root / ".circleci",
+        ]:
+            if _explicit.is_dir():
+                for _f in _explicit.iterdir():
+                    if _f.suffix in (".yml", ".yaml", ".json") and _f.is_file():
+                        infra_entries.append((_f, _f.name))
+
+        # Simple top-level globs (no hidden dirs involved)
+        INFRA_TOP_GLOBS = [
+            "Dockerfile", "Dockerfile.*", "docker-compose.yml", "docker-compose.yaml",
+            "docker-compose.*.yml", "*.tf", "*.tfvars", "*.k8s.yaml", "*.k8s.yml",
+            "*-deployment.yaml", "*-deployment.yml", "Jenkinsfile",
+        ]
+        for _pat in INFRA_TOP_GLOBS:
+            for _f in root.glob(_pat):
+                if _f.is_file():
+                    infra_entries.append((_f, _f.name))
+
+        for infra_file, infra_name in infra_entries:
+            try:
+                rel = str(infra_file.relative_to(root))
+            except ValueError:
+                rel = infra_name
+            title = f"infra:{rel}"
+            if title in existing_titles:
+                continue
+            infra_id = f"infra-{repo.replace('/', '-')}-{str(uuid.uuid4())[:8]}"
+            infra_node = SpecNode(
+                id=infra_id,
+                repo=repo,
+                title=title,
+                level=NodeLevel.L0_INFRA,
+                surface_type=SurfaceType.INFRASTRUCTURE,
+                governance_tier=GovernanceTier.OBSERVED,
+                implementation=Implementation(files=[rel]),
+            )
+            save_spec_node(infra_node)
+            existing_titles.add(title)
+            observed_created.append({
+                "node_id": infra_id,
+                "title": title,
+                "level": "L0_INFRA",
+                "tier": "observed",
+                "surface_type": "infrastructure",
+                "source": rel,
+            })
+
+
+    total_files = sum(len(v) for v in module_groups.values())
     return _ok({
         "status": "bootstrapped" if not dry_run else "dry_run",
         "repo": repo,
         "nodes_created": len(created) if not dry_run else 0,
         "nodes_dry_run": len(created) if dry_run else 0,
         "nodes_skipped": len(skipped),
+        "observed_created": observed_created,
         "created": created,
         "skipped": skipped,
         "message": (
-            f"{'Would create' if dry_run else 'Created'} {len(created)} L2 SpecNodes from {sum(len(v) for v in module_groups.values())} files. "
-            "Contracts are blank — fill in invariants and metrics progressively."
+            f"{'Would create' if dry_run else 'Created'} {len(created)} L2 SpecNodes from {total_files} files. "
+            + (f"Deep scan: {len(observed_created)} observed L3/L4 nodes auto-inventoried. " if observed_created else "")
+            + "Contracts are blank — fill in invariants and metrics progressively."
         ),
     })
+
 
 
 def _all_nodes_for_repo(repo: str) -> list[SpecNode]:
@@ -1382,24 +1630,29 @@ def cascade_blast_radius(origin_id: str, repo: str) -> dict:
 
 def detect_graph_gaps(repo: str) -> list[dict]:
     """Scan the constraint graph for structural gaps that the IDE Agent
-    should resolve.  Returns a list of gap descriptors."""
-    all_nodes = _all_nodes_for_repo(repo)
-    if not all_nodes:
+    should resolve.  Returns a list of gap descriptors.
+    Only GOVERNED nodes trigger gap alerts — OBSERVED and PROPOSED nodes are
+    informational and do not require structural enforcement."""
+    all_nodes_raw = _all_nodes_for_repo(repo)
+    if not all_nodes_raw:
         return []
+
+    # Index by ID across ALL nodes so dependencies on observed nodes resolve properly
+    node_map = {n.id: n for n in all_nodes_raw}
+
+    # Filter to governed-only for subjects of gap detection
+    governed_nodes = [n for n in all_nodes_raw if getattr(n, 'governance_tier', 'governed') == 'governed' or getattr(n, 'governance_tier', None) == GovernanceTier.GOVERNED]
 
     gaps: list[dict] = []
 
-    # Index by ID for fast lookup
-    node_map = {n.id: n for n in all_nodes}
-
-    # Collect existing levels
-    levels_present = {n.level for n in all_nodes}
+    # Collect existing levels across all nodes
+    levels_present = {n.level for n in all_nodes_raw}
 
     # ── Gap 1: L1 nodes (in SPEC_DEFINED stage) with ZERO upstream L2 dependencies ──────────────
     # An L1 (file-level) node that has no dependencies pointing to an L2_EXTERNAL
     # or L3_API node means we haven't mapped its external boundary yet.
     # Exclude nodes that have advanced past SPEC_DEFINED to prevent nagging on pure files.
-    for node in all_nodes:
+    for node in governed_nodes:
         if node.level == NodeLevel.L1_FILE and node.state.stage == ExecutionStage.SPEC_DEFINED:
             has_boundary_dep = any(
                 node_map[dep_id].level in (NodeLevel.L2_EXTERNAL, NodeLevel.L3_API)
@@ -1422,7 +1675,7 @@ def detect_graph_gaps(repo: str) -> list[dict]:
                 })
 
     # ── Gap 2: API endpoint nodes with empty contracts ──────────────────
-    for node in all_nodes:
+    for node in governed_nodes:
         if node.surface_type == SurfaceType.API_ENDPOINT:
             if not node.contract.invariants and not node.contract.inputs:
                 gaps.append({
@@ -1448,7 +1701,7 @@ def detect_graph_gaps(repo: str) -> list[dict]:
         cursor.execute("SELECT upstream_id FROM edge_graph")
         all_upstream_ids = {row["upstream_id"] for row in cursor.fetchall()}
 
-    for node in all_nodes:
+    for node in governed_nodes:
         if node.level not in (NodeLevel.L0_INFRA,):  # L0 infra nodes are allowed to be roots
             has_dependents = node.id in all_upstream_ids
             if not node.dependencies and not has_dependents:
@@ -1465,7 +1718,7 @@ def detect_graph_gaps(repo: str) -> list[dict]:
 
     # ── Gap 4: Failed nodes with no failure_classification (Stage 3) ─────
     # Note: node_map was already built above for Gap 1 — reuse it here (Stage 3.1 fix)
-    for node in all_nodes:
+    for node in governed_nodes:
         if node.state.status == SpecStatus.FAILED and not node.state.failure_classification:
             suggested = auto_classify_failure(node, node_map)
             gaps.append({
@@ -1582,6 +1835,42 @@ async def handle_get_decision_queue(args: dict, ctx: ToolContext) -> list[TextCo
         "returned_items": len(top_items),
         "decision_queue": top_items,
         "instruction": "Agent: Pick the TOP item from this queue, execute its 'action', then poll this queue again.",
+    })
+
+
+async def handle_promote_node(args: dict, ctx: ToolContext) -> list[TextContent]:
+    from .models import GovernanceTier
+    from .database import _get_connection, get_spec_node, save_spec_node
+    from .models import Contract, NodeLevel, SpecStatus, SurfaceType, ExecutionStage, Evidence, _now, _ok, _err
+    
+    node_id = args.get("node_id")
+    if not node_id:
+        return _err("Missing node_id parameter")
+        
+    node = get_spec_node(node_id)
+    if not node:
+        return _err(f"Node {node_id} not found")
+        
+    current_tier = getattr(node, 'governance_tier', 'governed')
+    if current_tier == 'observed':
+        node.governance_tier = GovernanceTier.PROPOSED
+    elif current_tier == 'proposed':
+        node.governance_tier = GovernanceTier.GOVERNED
+        # Apply skeleton contract on final promotion
+        if not getattr(node, 'contract', None):
+            node.contract = Contract()
+        if not node.contract.invariants:
+            if getattr(node, 'surface_type', 'internal') == SurfaceType.API_ENDPOINT:
+                node.contract.invariants = ['returns valid HTTP status']
+            else:
+                node.contract.invariants = ['implements declared interface']
+        
+    save_spec_node(node)
+    return _ok({
+        "status": "success",
+        "node_id": node_id,
+        "new_tier": getattr(node.governance_tier, "value", str(node.governance_tier)) if hasattr(node, "governance_tier") else "governed",
+        "message": f"Successfully promoted {node_id}"
     })
 
 

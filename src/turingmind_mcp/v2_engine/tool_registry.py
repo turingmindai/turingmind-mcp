@@ -172,6 +172,20 @@ V2_TOOLS: list[Tool] = [
         },
     ),
     Tool(
+        name="turingmind_promote_node",
+        description=(
+            "Promote an auto-inventoried node from 'observed' → 'proposed' → 'governed'. "
+            "Proposed nodes require contracts; Governed nodes are actively checked."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "node_id": {"type": "string"},
+            },
+            "required": ["node_id"],
+        },
+    ),
+    Tool(
         name="turingmind_get_ready_nodes",
         description=(
             "Get all SpecNodes whose upstream dependencies are fully verified (ready_queue). "

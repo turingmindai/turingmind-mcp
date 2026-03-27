@@ -315,11 +315,14 @@ def sync_codebase(payload: SyncPayload):
         return {"status": "error", "detail": str(e)}
 
 @app.get("/api/v2/graph/nodes")
-def get_graph_nodes(repo: str):
+def get_graph_nodes(repo: str, governance_tier: Optional[str] = None):
     if not repo:
         raise HTTPException(status_code=400, detail="repo is required")
     try:
         nodes = get_all_spec_nodes(repo)
+        if governance_tier:
+            nodes = [n for n in nodes if getattr(n, 'governance_tier', 'governed') == governance_tier]
+            
         ui_nodes = []
         for n in nodes:
             ui_nodes.append({
@@ -337,12 +340,90 @@ def get_graph_nodes(repo: str):
                 "dependencies": n.dependencies,
                 "evidence": n.state.evidence,
                 "contract": n.contract.model_dump() if n.contract else {},
+                "governance_tier": getattr(n, 'governance_tier', 'governed'),
                 "updated_at": n.updated_at
             })
         return {"nodes": ui_nodes, "count": len(ui_nodes)}
     except Exception as e:
         logger.error(f"Error fetching nodes: {e}")
         return {"nodes": [], "count": 0, "note": "Internal server error"}
+
+@app.post("/api/v2/graph/nodes/{node_id}/promote")
+def promote_node(node_id: str):
+    """Promote a node from observed → proposed → governed with a skeleton contract."""
+    from .v2_engine.models import GovernanceTier, Contract, Metric
+    node = get_spec_node(node_id)
+    if not node:
+        raise HTTPException(status_code=404, detail=f"Node {node_id} not found")
+
+    current_tier = getattr(node, 'governance_tier', 'governed')
+    if current_tier == 'observed':
+        node.governance_tier = GovernanceTier.PROPOSED
+    elif current_tier == 'proposed':
+        node.governance_tier = GovernanceTier.GOVERNED
+        # Apply skeleton contract on final promotion
+        if not node.contract.invariants:
+            if node.surface_type.value == 'api_endpoint':
+                node.contract.invariants = ['returns valid HTTP status']
+            else:
+                node.contract.invariants = ['implements declared interface']
+        if not node.contract.metrics:
+            node.contract.metrics = [Metric(name='test_coverage', threshold=0, unit='percent', direction='above')]
+    elif current_tier == 'governed':
+        return {"status": "already_governed", "node_id": node_id}
+    else:
+        return {"status": "unknown_tier", "node_id": node_id, "current": current_tier}
+
+    node.updated_at = _now()
+    save_spec_node(node)
+    logger.info(f"Promoted node {node_id}: {current_tier} → {node.governance_tier.value}")
+    return {"status": "promoted", "node_id": node_id, "from": current_tier, "to": node.governance_tier.value}
+
+
+@app.get("/api/v2/inventory")
+def get_inventory(repo: str):
+    """Return all nodes grouped by surface_type for the Asset Inventory tab."""
+    if not repo:
+        raise HTTPException(status_code=400, detail="repo is required")
+    try:
+        all_nodes = get_all_spec_nodes(repo)
+        # Show all nodes in the inventory so it doesn't appear empty after Day 1 Hydration
+        inventory_nodes = all_nodes
+
+        def _serialize(n):
+            functions = getattr(n.implementation, 'functions', []) or []
+            version = next((f.replace('version:', '') for f in functions if f.startswith('version:')), None)
+            source = next((f.replace('source:', '') for f in functions if f.startswith('source:')), None)
+            # governance_tier may be a GovernanceTier enum or a plain string — always coerce to str
+            tier = getattr(n, 'governance_tier', 'observed')
+            tier_str = tier.value if hasattr(tier, 'value') else str(tier)
+            return {
+                "node_id": n.id,
+                "title": n.title,
+                "level": n.level.value,
+                "surface_type": n.surface_type.value,
+                "governance_tier": tier_str,
+                "version": version,
+                "source": source,
+                "files": getattr(n.implementation, 'files', []),
+                "confidence": n.state.confidence,
+            }
+
+
+        result = {
+            "repo": repo,
+            "libs": [_serialize(n) for n in inventory_nodes if n.surface_type.value == "third_party_lib"],
+            "services": [_serialize(n) for n in inventory_nodes if n.surface_type.value == "external_service"],
+            "infra": [_serialize(n) for n in inventory_nodes if n.surface_type.value == "infrastructure"],
+            "api_endpoints": [_serialize(n) for n in inventory_nodes if n.surface_type.value == "api_endpoint"],
+            "features": [_serialize(n) for n in inventory_nodes if n.level.value in ("L4_FEATURE", "L5_BUSINESS_GOAL")],
+        }
+        result["total"] = sum(len(v) for v in result.values() if isinstance(v, list))
+        return result
+    except Exception as e:
+        logger.error(f"Error fetching inventory: {e}")
+        return {"libs": [], "services": [], "infra": [], "api_endpoints": [], "features": [], "total": 0}
+
 
 @app.get("/api/v2/graph/state")
 def get_graph_state(repo: str):
@@ -450,44 +531,6 @@ def ingest_signal(payload: SignalPayload):
     num_threshold = payload.threshold
     metric_direction = 'below'
 
-class VerifyPayload(BaseModel):
-    test_dir: Optional[str] = None
-    python_bin: str = "python"
-    
-@app.post("/api/v2/graph/nodes/{node_id}/verify")
-def verify_node(node_id: str, payload: VerifyPayload):
-    from turingmind_mcp.v2_engine.handlers import handle_run_verification
-    import asyncio
-    
-    # We create a dummy ToolContext (not used by the handler directly)
-    class DummyContext: pass
-    ctx = DummyContext()
-    
-    args = {
-        "node_id": node_id,
-        "test_dir": payload.test_dir,
-        "python_bin": payload.python_bin
-    }
-    
-    # Run the async handler synchronously for the REST Request
-    try:
-        loop = asyncio.get_event_loop()
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        
-    result = loop.run_until_complete(handle_run_verification(args, ctx))
-    
-    if result[0].type == "text" and result[0].text.startswith("Error"):
-        raise HTTPException(status_code=400, detail=result[0].text)
-        
-    import json
-    try:
-        data = json.loads(result[0].text)
-        return data
-    except json.JSONDecodeError:
-        return {"status": "success", "raw": result[0].text}
-
     if num_threshold is None and node.contract and node.contract.metrics:
         # Match metric by name
         for m in node.contract.metrics:
@@ -557,6 +600,48 @@ def verify_node(node_id: str, payload: VerifyPayload):
         "old_confidence": old_confidence,
         "new_confidence": new_confidence
     }
+
+
+# ── Verification endpoint (moved outside ingest_signal) ─────────────────────
+
+class VerifyPayload(BaseModel):
+    test_dir: Optional[str] = None
+    python_bin: str = "python"
+    
+@app.post("/api/v2/graph/nodes/{node_id}/verify")
+def verify_node(node_id: str, payload: VerifyPayload):
+    from turingmind_mcp.v2_engine.handlers import handle_run_verification
+    import asyncio
+    
+    # We create a dummy ToolContext (not used by the handler directly)
+    class DummyContext: pass
+    ctx = DummyContext()
+    
+    args = {
+        "node_id": node_id,
+        "test_dir": payload.test_dir,
+        "python_bin": payload.python_bin
+    }
+    
+    # Run the async handler synchronously for the REST Request
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+    result = loop.run_until_complete(handle_run_verification(args, ctx))
+    
+    if result[0].type == "text" and result[0].text.startswith("Error"):
+        raise HTTPException(status_code=400, detail=result[0].text)
+        
+    import json
+    try:
+        data = json.loads(result[0].text)
+        return data
+    except json.JSONDecodeError:
+        return {"status": "success", "raw": result[0].text}
+
 
 if __name__ == "__main__":
     uvicorn.run("turingmind_mcp.api_server:app", host="127.0.0.1", port=8000, reload=True)

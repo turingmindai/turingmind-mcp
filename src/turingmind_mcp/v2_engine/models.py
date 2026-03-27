@@ -30,6 +30,9 @@ class SurfaceType(str, Enum):
     API_ENDPOINT = "api_endpoint"
     JOB = "job"
     HARDWARE_BRIDGE = "hardware_bridge"
+    THIRD_PARTY_LIB = "third_party_lib"      # npm / pip package dependency
+    EXTERNAL_SERVICE = "external_service"    # DB, queue, cloud API SDK usage
+    INFRASTRUCTURE = "infrastructure"        # Docker, k8s, CI/CD config
 
 
 class Priority(str, Enum):
@@ -59,6 +62,12 @@ class FailureClassification(str, Enum):
     TEST_GAP = "test_gap"
     IMPLEMENTATION_BUG = "implementation_bug"
     DEPENDENCY_FAILURE = "dependency_failure"
+
+
+class GovernanceTier(str, Enum):
+    OBSERVED = "observed"       # Auto-scraped from code, no contract enforced
+    PROPOSED = "proposed"       # Flagged for promotion to governed
+    GOVERNED = "governed"       # Subject to full constraint enforcement
 
 
 class SignalType(str, Enum):
@@ -193,6 +202,7 @@ class SpecNode(BaseModel):
     title: str = Field(..., description="Human readable summary")
     level: NodeLevel = Field(...)
     surface_type: SurfaceType = Field(default=SurfaceType.INTERNAL)
+    governance_tier: GovernanceTier = Field(default=GovernanceTier.GOVERNED)
 
     contract: Contract = Field(default_factory=Contract)
     verification: Verification = Field(default_factory=Verification)
