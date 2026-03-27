@@ -32,16 +32,98 @@ def health_check():
     """Simple liveness probe for the daemon supervisor."""
     return {"status": "ok"}
 
+# ── Phase 2.5a: Security Scanning ───────────────────────────────────────────
+from .v2_engine.security_scanner import SecurityScanner
+
+# Cache scanner instances per workspace to persist dedup hashes across cycles
+_scanner_cache: dict[str, SecurityScanner] = {}
+
+class SecurityCycleRequest(BaseModel):
+    repo: str
+    workspace_dir: str = ""
+
+@app.post("/api/v2/security/cycle")
+def run_security_cycle(request: SecurityCycleRequest):
+    """Daemon calls this every poll cycle. Runs incremental OpenGrep scan
+    on changed files and returns new security findings.
+    
+    The scanner deduplicates findings across calls via in-memory hash set,
+    so calling this repeatedly will not produce duplicate gaps.
+    """
+    if not request.repo:
+        raise HTTPException(status_code=400, detail="repo is required")
+    
+    workspace = request.workspace_dir
+    if not workspace:
+        # Derive workspace from common repo layout
+        workspace = str(pathlib.Path.cwd())
+    
+    try:
+        # Get or create scanner for this workspace
+        if workspace not in _scanner_cache:
+            _scanner_cache[workspace] = SecurityScanner(workspace)
+        scanner = _scanner_cache[workspace]
+        
+        result = scanner.run_security_cycle(request.repo)
+        
+        return {
+            "scan_ok": result.scan_ok,
+            "findings_total": result.findings_total,
+            "findings_new": result.findings_new,
+            "findings_duplicate": result.findings_duplicate,
+            "blindspots": result.blindspots,
+            "gaps_injected": result.gaps_injected,
+            "error_message": result.error_message,
+        }
+    except Exception as e:
+        logger.error(f"Security cycle failed: {e}")
+        return {
+            "scan_ok": False,
+            "findings_total": 0,
+            "findings_new": 0,
+            "error_message": str(e),
+        }
+
+@app.get("/api/v2/security/rules")
+def list_security_rules(workspace_dir: str = ""):
+    """List all active OpenGrep rules in the workspace rules directory."""
+    workspace = workspace_dir or str(pathlib.Path.cwd())
+    rules_dir = pathlib.Path(workspace) / ".opengrep" / "rules"
+    
+    if not rules_dir.exists():
+        return {"rules": [], "total": 0}
+    
+    rules = []
+    for rule_file in sorted(rules_dir.glob("*.yml")):
+        rules.append({
+            "filename": rule_file.name,
+            "path": str(rule_file),
+            "size_bytes": rule_file.stat().st_size,
+        })
+    
+    return {"rules": rules, "total": len(rules)}
+
+
 # ── Stage 4: Decision Queue ─────────────────────────────────────────────────
 SEVERITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3}
 
+# Cache the latest security gaps so they merge into the decision queue
+_security_gaps_cache: list[dict] = []
+
 @app.get("/api/v2/decision-queue")
 def get_decision_queue(repo: str, limit: int = 20):
-    """Return prioritized action items derived from graph gap analysis."""
+    """Return prioritized action items derived from graph gap analysis + security findings."""
     if not repo:
         raise HTTPException(status_code=400, detail="repo is required")
     try:
         gaps = detect_graph_gaps(repo)
+        
+        # Merge in any security gaps from the latest scan cycle
+        for scanner in _scanner_cache.values():
+            last_result = scanner.run_security_cycle(repo)
+            if last_result.gaps_injected:
+                gaps.extend(last_result.gaps_injected)
+        
         # Sort by severity (critical first)
         gaps.sort(key=lambda g: SEVERITY_ORDER.get(g.get("severity", "low"), 99))
         return {
