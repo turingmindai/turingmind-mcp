@@ -86,22 +86,92 @@ def run_security_cycle(request: SecurityCycleRequest):
 
 @app.get("/api/v2/security/rules")
 def list_security_rules(workspace_dir: str = ""):
-    """List all active OpenGrep rules in the workspace rules directory."""
+    """List all OpenGrep rules (active + quarantined) with status metadata."""
     workspace = workspace_dir or str(pathlib.Path.cwd())
-    rules_dir = pathlib.Path(workspace) / ".opengrep" / "rules"
     
-    if not rules_dir.exists():
-        return {"rules": [], "total": 0}
+    if workspace not in _scanner_cache:
+        _scanner_cache[workspace] = SecurityScanner(workspace)
+    scanner = _scanner_cache[workspace]
     
-    rules = []
-    for rule_file in sorted(rules_dir.glob("*.yml")):
-        rules.append({
-            "filename": rule_file.name,
-            "path": str(rule_file),
-            "size_bytes": rule_file.stat().st_size,
-        })
+    rules = scanner.list_rules()
+    active = sum(1 for r in rules if r["status"] == "active")
+    quarantined = sum(1 for r in rules if r["status"] == "quarantined")
     
-    return {"rules": rules, "total": len(rules)}
+    return {
+        "rules": rules,
+        "total": len(rules),
+        "active": active,
+        "quarantined": quarantined,
+    }
+
+
+class CIReportRequest(BaseModel):
+    repo: str
+    workspace_dir: str = ""
+    report: dict  # Raw OpenGrep JSON output
+
+@app.post("/api/v2/security/report")
+def ingest_ci_report(request: CIReportRequest):
+    """Ingest a CI/CD OpenGrep scan report. Shipped violations get -40% confidence + cascade."""
+    workspace = request.workspace_dir or str(pathlib.Path.cwd())
+    
+    if workspace not in _scanner_cache:
+        _scanner_cache[workspace] = SecurityScanner(workspace)
+    scanner = _scanner_cache[workspace]
+    
+    try:
+        result = scanner.ingest_ci_report(request.report, request.repo)
+        return {
+            "scan_ok": result.scan_ok,
+            "findings_total": result.findings_total,
+            "findings_new": result.findings_new,
+            "findings_duplicate": result.findings_duplicate,
+            "gaps_injected": result.gaps_injected,
+            "confidence_impact": "violation" if result.findings_new > 0 else "none",
+        }
+    except Exception as e:
+        logger.error(f"CI report ingestion failed: {e}")
+        return {"scan_ok": False, "error_message": str(e)}
+
+
+@app.post("/api/v2/security/validate")
+def validate_rules(workspace_dir: str = ""):
+    """Run self-tests on all rules to detect broken ones."""
+    workspace = workspace_dir or str(pathlib.Path.cwd())
+    
+    if workspace not in _scanner_cache:
+        _scanner_cache[workspace] = SecurityScanner(workspace)
+    scanner = _scanner_cache[workspace]
+    
+    results = scanner.self_test_rules()
+    passed = sum(1 for r in results if r["status"] == "passed")
+    broken = sum(1 for r in results if r["status"] == "broken")
+    no_fixtures = sum(1 for r in results if r["status"] == "no_fixtures")
+    
+    return {
+        "results": results,
+        "total": len(results),
+        "passed": passed,
+        "broken": broken,
+        "no_fixtures": no_fixtures,
+    }
+
+
+@app.post("/api/v2/security/prune")
+def prune_rules(workspace_dir: str = ""):
+    """Run rule pruning: detect broken/dormant/dead rules and inject gaps."""
+    workspace = workspace_dir or str(pathlib.Path.cwd())
+    
+    if workspace not in _scanner_cache:
+        _scanner_cache[workspace] = SecurityScanner(workspace)
+    scanner = _scanner_cache[workspace]
+    
+    gaps = scanner.prune_rules()
+    return {
+        "gaps_injected": gaps,
+        "pruning_actions": len(gaps),
+    }
+
 
 
 # ── Stage 4: Decision Queue ─────────────────────────────────────────────────

@@ -261,6 +261,195 @@ class SecurityScanner:
         )
         return cycle
 
+    def list_rules(self) -> list[dict]:
+        """List all rules in .opengrep/rules/ with status metadata."""
+        rules = []
+        rules_dir = self.rules_dir
+        archive_dir = rules_dir.parent / "archive"
+
+        # Active rules
+        if rules_dir.exists():
+            for f in sorted(rules_dir.glob("*.yml")):
+                rules.append({
+                    "file": f.name,
+                    "path": str(f),
+                    "status": "active",
+                    "size_bytes": f.stat().st_size,
+                })
+
+        # Archived (quarantined) rules
+        if archive_dir.exists():
+            for f in sorted(archive_dir.glob("*.yml")):
+                rules.append({
+                    "file": f.name,
+                    "path": str(f),
+                    "status": "quarantined",
+                    "size_bytes": f.stat().st_size,
+                })
+
+        return rules
+
+    def self_test_rules(self) -> list[dict]:
+        """Re-run each rule against its test fixtures to detect broken rules.
+        
+        For each rule in .opengrep/rules/<rule_id>.yml, checks for matching
+        fixtures in .opengrep/tests/<rule_id>_vulnerable.* and <rule_id>_safe.*.
+        
+        Returns a list of test results with status: passed, broken, no_fixtures.
+        """
+        results = []
+        rules_dir = self.rules_dir
+        tests_dir = rules_dir.parent / "tests"
+
+        if not rules_dir.exists():
+            return results
+
+        for rule_file in sorted(rules_dir.glob("*.yml")):
+            rule_id = rule_file.stem
+            result = {"rule_id": rule_id, "file": rule_file.name}
+
+            # Find matching fixtures
+            vuln_fixtures = list(tests_dir.glob(f"{rule_id}_vulnerable.*")) if tests_dir.exists() else []
+            safe_fixtures = list(tests_dir.glob(f"{rule_id}_safe.*")) if tests_dir.exists() else []
+
+            if not vuln_fixtures or not safe_fixtures:
+                result["status"] = "no_fixtures"
+                result["detail"] = "No test fixtures found — rule cannot be self-tested"
+                results.append(result)
+                continue
+
+            try:
+                # Test: rule SHOULD fire on vulnerable code
+                vuln_cmd = subprocess.run(
+                    ["opengrep", "scan", "--json", "--config", str(rule_file), str(vuln_fixtures[0])],
+                    capture_output=True, text=True, timeout=30,
+                    cwd=str(self.workspace_dir),
+                )
+                vuln_count = self._count_findings_from_output(vuln_cmd.stdout)
+
+                # Test: rule should NOT fire on safe code
+                safe_cmd = subprocess.run(
+                    ["opengrep", "scan", "--json", "--config", str(rule_file), str(safe_fixtures[0])],
+                    capture_output=True, text=True, timeout=30,
+                    cwd=str(self.workspace_dir),
+                )
+                safe_count = self._count_findings_from_output(safe_cmd.stdout)
+
+                if vuln_count > 0 and safe_count == 0:
+                    result["status"] = "passed"
+                    result["detail"] = "Rule fires on vulnerable fixture and stays clean on safe fixture"
+                else:
+                    result["status"] = "broken"
+                    result["detail"] = (
+                        f"Self-test failed: vulnerable_fires={vuln_count > 0}, safe_clean={safe_count == 0}. "
+                        f"Rule pattern may have drifted or fixtures are outdated."
+                    )
+            except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+                result["status"] = "error"
+                result["detail"] = str(e)
+
+            results.append(result)
+
+        return results
+
+    def prune_rules(self) -> list[dict]:
+        """Check rule health and prune dormant/dead/broken rules.
+        
+        Returns a list of pruning actions taken (gaps to inject).
+        Lifecycle states:
+        - dormant: 0 fires in history + linked node still exists → [LOW] review gap
+        - dead: 0 fires in history + no linked node → move to archive
+        - broken: self-test fails → [HIGH] gap
+        """
+        gaps: list[dict] = []
+
+        # 1. Run self-tests to find broken rules
+        test_results = self.self_test_rules()
+        for tr in test_results:
+            if tr["status"] == "broken":
+                gaps.append({
+                    "gap_type": "security_rule_broken",
+                    "severity": "high",
+                    "node_id": f"RULE_BROKEN::{tr['rule_id']}",
+                    "node_title": f"Broken OpenGrep rule: {tr['rule_id']}",
+                    "action": (
+                        f"Rule '{tr['rule_id']}' failed self-test: {tr.get('detail', '')}. "
+                        f"The rule pattern may have drifted or the test fixtures are outdated. "
+                        f"Fix the rule or quarantine it with turingmind_quarantine_rule."
+                    ),
+                })
+
+        # 2. Check for rules with no test fixtures (can't be validated)
+        for tr in test_results:
+            if tr["status"] == "no_fixtures":
+                gaps.append({
+                    "gap_type": "security_rule_untestable",
+                    "severity": "low",
+                    "node_id": f"RULE_NO_FIXTURES::{tr['rule_id']}",
+                    "node_title": f"Rule has no test fixtures: {tr['rule_id']}",
+                    "action": (
+                        f"Rule '{tr['rule_id']}' has no test fixtures in .opengrep/tests/. "
+                        f"Create vulnerable and safe code snippets so this rule can be self-tested."
+                    ),
+                })
+
+        return gaps
+
+    def ingest_ci_report(self, report_json: dict, repo: str) -> CycleResult:
+        """Ingest a CI/CD OpenGrep JSON report and apply confidence impacts.
+        
+        Called by POST /api/v2/security/report.
+        Violations found in CI are SHIPPED violations → -40% confidence + cascade.
+        """
+        cycle = CycleResult()
+
+        results = report_json.get("results", [])
+        cycle.findings_total = len(results)
+
+        for item in results:
+            finding = Finding(
+                rule_id=item.get("check_id", "unknown"),
+                file_path=item.get("path", ""),
+                line_start=item.get("start", {}).get("line", 0),
+                line_end=item.get("end", {}).get("line", 0),
+                message=item.get("extra", {}).get("message", ""),
+                severity=item.get("extra", {}).get("severity", "WARNING"),
+                matched_code=item.get("extra", {}).get("lines", ""),
+            )
+
+            h = finding.dedup_hash
+            if h in self._injected_hashes:
+                cycle.findings_duplicate += 1
+                continue
+
+            self._injected_hashes.add(h)
+            cycle.findings_new += 1
+
+            # CI violations are CRITICAL — shipped to production
+            gap = {
+                "gap_type": "security_ci_violation",
+                "severity": "critical",
+                "node_id": f"CI_VIOLATION::{finding.file_path}::{finding.rule_id}",
+                "node_title": f"CI VIOLATION: {finding.rule_id} shipped to main",
+                "file_path": finding.file_path,
+                "line_start": finding.line_start,
+                "line_end": finding.line_end,
+                "matched_code": finding.matched_code,
+                "confidence_impact": "violation",  # triggers -40% + cascade
+                "action": (
+                    f"CRITICAL: OpenGrep rule '{finding.rule_id}' violation was SHIPPED in CI build. "
+                    f"File: '{finding.file_path}' line {finding.line_start}. "
+                    f"This bypassed pre-commit scanning. Fix immediately and investigate how it passed."
+                ),
+            }
+            cycle.gaps_injected.append(gap)
+
+        logger.info(
+            "CI report ingested: %d findings (%d new, %d duplicate)",
+            cycle.findings_total, cycle.findings_new, cycle.findings_duplicate,
+        )
+        return cycle
+
     # ── Private ──────────────────────────────────────────────────────────
 
     def _opengrep_available(self) -> bool:
@@ -340,6 +529,20 @@ class SecurityScanner:
             result.parse_errors.append(pe)
 
         return result
+
+    def _count_findings_from_output(self, stdout: str) -> int:
+        """Extract the number of findings from OpenGrep JSON output."""
+        try:
+            start = stdout.find('{"version"')
+            if start == -1:
+                return 0
+            remaining = stdout[start:]
+            end = remaining.find('\n\n')
+            json_str = remaining[:end].strip() if end != -1 else remaining.strip()
+            data = json.loads(json_str)
+            return len(data.get("results", []))
+        except (json.JSONDecodeError, ValueError):
+            return 0
 
     @staticmethod
     def _is_scannable(filepath: str) -> bool:
