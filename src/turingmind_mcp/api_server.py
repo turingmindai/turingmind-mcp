@@ -105,33 +105,37 @@ def list_security_rules(workspace_dir: str = ""):
     }
 
 
-class CIReportRequest(BaseModel):
-    repo: str
+class QuarantineRequest(BaseModel):
+    rule_id: str
+    reason: str = ""
     workspace_dir: str = ""
-    report: dict  # Raw OpenGrep JSON output
 
-@app.post("/api/v2/security/report")
-def ingest_ci_report(request: CIReportRequest):
-    """Ingest a CI/CD OpenGrep scan report. Shipped violations get -40% confidence + cascade."""
+@app.post("/api/v2/security/quarantine")
+def quarantine_rule(request: QuarantineRequest):
+    """Move a rule from .opengrep/rules/ to .opengrep/archive/."""
     workspace = request.workspace_dir or str(pathlib.Path.cwd())
-    
-    if workspace not in _scanner_cache:
-        _scanner_cache[workspace] = SecurityScanner(workspace)
-    scanner = _scanner_cache[workspace]
-    
-    try:
-        result = scanner.ingest_ci_report(request.report, request.repo)
-        return {
-            "scan_ok": result.scan_ok,
-            "findings_total": result.findings_total,
-            "findings_new": result.findings_new,
-            "findings_duplicate": result.findings_duplicate,
-            "gaps_injected": result.gaps_injected,
-            "confidence_impact": "violation" if result.findings_new > 0 else "none",
-        }
-    except Exception as e:
-        logger.error(f"CI report ingestion failed: {e}")
-        return {"scan_ok": False, "error_message": str(e)}
+    rules_dir = pathlib.Path(workspace) / ".opengrep" / "rules"
+    archive_dir = pathlib.Path(workspace) / ".opengrep" / "archive"
+    archive_dir.mkdir(parents=True, exist_ok=True)
+
+    import shutil
+
+    rule_file = rules_dir / request.rule_id
+    if not rule_file.exists():
+        rule_file = rules_dir / f"{request.rule_id}.yml"
+
+    if not rule_file.exists():
+        raise HTTPException(status_code=404, detail=f"Rule not found: {request.rule_id}")
+
+    dest = archive_dir / rule_file.name
+    shutil.move(str(rule_file), str(dest))
+
+    return {
+        "quarantined": rule_file.name,
+        "moved_to": str(dest),
+        "reason": request.reason,
+        "active": False,
+    }
 
 
 @app.post("/api/v2/security/validate")

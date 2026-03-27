@@ -2024,7 +2024,7 @@ async def handle_register_rule(args: dict, ctx: ToolContext) -> list[TextContent
     # Attach Evidence to SpecNode if node_id provided
     if node_id:
         try:
-            node = load_spec_node(node_id)
+            node = get_spec_node(node_id)
             if node:
                 node.state.evidence.append(Evidence(
                     kind="opengrep_rule",

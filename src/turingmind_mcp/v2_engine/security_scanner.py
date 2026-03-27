@@ -395,60 +395,6 @@ class SecurityScanner:
 
         return gaps
 
-    def ingest_ci_report(self, report_json: dict, repo: str) -> CycleResult:
-        """Ingest a CI/CD OpenGrep JSON report and apply confidence impacts.
-        
-        Called by POST /api/v2/security/report.
-        Violations found in CI are SHIPPED violations → -40% confidence + cascade.
-        """
-        cycle = CycleResult()
-
-        results = report_json.get("results", [])
-        cycle.findings_total = len(results)
-
-        for item in results:
-            finding = Finding(
-                rule_id=item.get("check_id", "unknown"),
-                file_path=item.get("path", ""),
-                line_start=item.get("start", {}).get("line", 0),
-                line_end=item.get("end", {}).get("line", 0),
-                message=item.get("extra", {}).get("message", ""),
-                severity=item.get("extra", {}).get("severity", "WARNING"),
-                matched_code=item.get("extra", {}).get("lines", ""),
-            )
-
-            h = finding.dedup_hash
-            if h in self._injected_hashes:
-                cycle.findings_duplicate += 1
-                continue
-
-            self._injected_hashes.add(h)
-            cycle.findings_new += 1
-
-            # CI violations are CRITICAL — shipped to production
-            gap = {
-                "gap_type": "security_ci_violation",
-                "severity": "critical",
-                "node_id": f"CI_VIOLATION::{finding.file_path}::{finding.rule_id}",
-                "node_title": f"CI VIOLATION: {finding.rule_id} shipped to main",
-                "file_path": finding.file_path,
-                "line_start": finding.line_start,
-                "line_end": finding.line_end,
-                "matched_code": finding.matched_code,
-                "confidence_impact": "violation",  # triggers -40% + cascade
-                "action": (
-                    f"CRITICAL: OpenGrep rule '{finding.rule_id}' violation was SHIPPED in CI build. "
-                    f"File: '{finding.file_path}' line {finding.line_start}. "
-                    f"This bypassed pre-commit scanning. Fix immediately and investigate how it passed."
-                ),
-            }
-            cycle.gaps_injected.append(gap)
-
-        logger.info(
-            "CI report ingested: %d findings (%d new, %d duplicate)",
-            cycle.findings_total, cycle.findings_new, cycle.findings_duplicate,
-        )
-        return cycle
 
     # ── Private ──────────────────────────────────────────────────────────
 
