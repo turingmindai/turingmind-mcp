@@ -62,6 +62,8 @@ class FailureClassification(str, Enum):
     TEST_GAP = "test_gap"
     IMPLEMENTATION_BUG = "implementation_bug"
     DEPENDENCY_FAILURE = "dependency_failure"
+    SECURITY_REGRESSION = "security_regression"   # OpenGrep rule violation shipped to main
+    SECURITY_BLINDSPOT = "security_blindspot"     # OpenGrep can't parse a file → scanning gap
 
 
 class GovernanceTier(str, Enum):
@@ -150,6 +152,8 @@ class Evidence(BaseModel):
         "security_scan",        # SAST/DAST result
         "blast_radius_cascade", # confidence penalty propagated from a failed upstream node
         "code_change",          # Git hook detected a file modification
+        "opengrep_rule",        # Phase 2.5b: AI-generated OpenGrep YAML rule linked to this node
+        "security_violation",   # Phase 2.5b: OpenGrep finding on this node's implementation files
     ] = Field(..., description="What kind of evidence this is")
     recorded_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     score: float = Field(

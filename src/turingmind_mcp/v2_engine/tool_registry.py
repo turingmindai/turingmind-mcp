@@ -524,6 +524,111 @@ V2_TOOLS: list[Tool] = [
             "required": ["repo", "files"],
         },
     ),
+    # ──────────────────────────────────────────────────────────────────────────
+    # PHASE 2.5b: SECURITY RULE LIFECYCLE
+    # ──────────────────────────────────────────────────────────────────────────
+    Tool(
+        name="turingmind_test_opengrep_rule",
+        description=(
+            "Sandbox: Test an OpenGrep YAML rule against vulnerable and safe code snippets "
+            "BEFORE registering it. Runs in an isolated /tmp directory with UUID namespacing. "
+            "Returns structured JSON: match coordinates if the rule fires, or syntax error details. "
+            "Use this to validate AI-generated rules before committing them to .opengrep/rules/. "
+            "MAX 3 retries with degradation: pattern → pattern-regex → skip + inject no-rule gap."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "rule_yaml": {
+                    "type": "string",
+                    "description": "The complete OpenGrep YAML rule content to test",
+                },
+                "vulnerable_code": {
+                    "type": "string",
+                    "description": "Code snippet that SHOULD trigger the rule (extracted from the git diff)",
+                },
+                "safe_code": {
+                    "type": "string",
+                    "description": "Code snippet that SHOULD NOT trigger the rule (the fix)",
+                },
+                "language": {
+                    "type": "string",
+                    "description": "File extension for test fixtures (e.g. 'py', 'js', 'ts')",
+                },
+            },
+            "required": ["rule_yaml", "vulnerable_code", "safe_code", "language"],
+        },
+    ),
+    Tool(
+        name="turingmind_register_rule",
+        description=(
+            "Register a validated OpenGrep rule into the project. "
+            "Writes the .yml file to .opengrep/rules/, writes test fixtures to .opengrep/tests/, "
+            "and creates an Evidence(kind='opengrep_rule') entry on the target SpecNode. "
+            "The rule becomes active immediately on the next scan cycle. "
+            "ONLY call this after turingmind_test_opengrep_rule confirms the rule fires correctly."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "rule_id": {
+                    "type": "string",
+                    "description": "Rule identifier (e.g. 'a03-no-raw-sql-in-user-controller')",
+                },
+                "rule_yaml": {
+                    "type": "string",
+                    "description": "The validated OpenGrep YAML rule content",
+                },
+                "vulnerable_code": {
+                    "type": "string",
+                    "description": "Vulnerable code snippet for the test fixture",
+                },
+                "safe_code": {
+                    "type": "string",
+                    "description": "Safe code snippet for the test fixture",
+                },
+                "language": {
+                    "type": "string",
+                    "description": "File extension (e.g. 'py', 'js')",
+                },
+                "node_id": {
+                    "type": "string",
+                    "description": "SpecNode ID to attach the opengrep_rule Evidence to",
+                },
+                "workspace_dir": {
+                    "type": "string",
+                    "description": "Absolute path to the workspace root containing .opengrep/",
+                },
+            },
+            "required": ["rule_id", "rule_yaml", "vulnerable_code", "safe_code", "language", "workspace_dir"],
+        },
+    ),
+    Tool(
+        name="turingmind_quarantine_rule",
+        description=(
+            "Emergency disable: Move an OpenGrep rule from .opengrep/rules/ to .opengrep/archive/. "
+            "Use when a rule is causing false positives or blocking development. "
+            "The rule is preserved for audit trail but no longer fires on scans."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "rule_id": {
+                    "type": "string",
+                    "description": "Filename of the rule to quarantine (e.g. 'a03-no-raw-sql.yml')",
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "Why the rule is being quarantined",
+                },
+                "workspace_dir": {
+                    "type": "string",
+                    "description": "Absolute path to the workspace root containing .opengrep/",
+                },
+            },
+            "required": ["rule_id", "reason", "workspace_dir"],
+        },
+    ),
 ]
 
 # ──────────────────────────────────────────────────────────────────────────────

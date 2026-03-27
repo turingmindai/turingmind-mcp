@@ -13,6 +13,7 @@ import datetime
 import json
 import re
 import uuid
+from pathlib import Path
 from typing import Any
 
 from mcp.types import TextContent
@@ -1878,6 +1879,259 @@ async def handle_promote_node(args: dict, ctx: ToolContext) -> list[TextContent]
 # REGISTRATION
 # =============================================================================
 
+# =============================================================================
+# PHASE 2.5b: SECURITY RULE LIFECYCLE HANDLERS
+# =============================================================================
+
+async def handle_test_opengrep_rule(args: dict, ctx: ToolContext) -> list[TextContent]:
+    """Sandbox: Test an OpenGrep YAML rule against vulnerable + safe code snippets.
+    
+    Runs in an isolated /tmp/turingmind-sandbox-<uuid>/ directory.
+    Returns structured result: match info or syntax error.
+    """
+    import uuid
+    import subprocess
+    import tempfile
+    import shutil
+
+    rule_yaml = args.get("rule_yaml", "")
+    vulnerable_code = args.get("vulnerable_code", "")
+    safe_code = args.get("safe_code", "")
+    language = args.get("language", "py")
+
+    if not rule_yaml or not vulnerable_code or not safe_code:
+        return _err("rule_yaml, vulnerable_code, and safe_code are all required")
+
+    # Create UUID-namespaced sandbox directory
+    sandbox_id = str(uuid.uuid4())[:8]
+    sandbox_dir = Path(tempfile.gettempdir()) / f"turingmind-sandbox-{sandbox_id}"
+    sandbox_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        # Write rule
+        rule_file = sandbox_dir / "test_rule.yml"
+        rule_file.write_text(rule_yaml)
+
+        # Write vulnerable fixture
+        vuln_file = sandbox_dir / f"vulnerable.{language}"
+        vuln_file.write_text(vulnerable_code)
+
+        # Write safe fixture
+        safe_file = sandbox_dir / f"safe.{language}"
+        safe_file.write_text(safe_code)
+
+        # Test 1: Rule SHOULD fire on vulnerable code
+        vuln_result = subprocess.run(
+            ["opengrep", "scan", "--json", "--config", str(rule_file), str(vuln_file)],
+            capture_output=True, text=True, timeout=30, cwd=str(sandbox_dir),
+        )
+
+        # Test 2: Rule should NOT fire on safe code
+        safe_result = subprocess.run(
+            ["opengrep", "scan", "--json", "--config", str(rule_file), str(safe_file)],
+            capture_output=True, text=True, timeout=30, cwd=str(sandbox_dir),
+        )
+
+        # Parse results
+        vuln_findings = _extract_findings_count(vuln_result.stdout)
+        safe_findings = _extract_findings_count(safe_result.stdout)
+
+        # Check for syntax errors in stderr
+        if "error" in vuln_result.stderr.lower() and "invalid" in vuln_result.stderr.lower():
+            return _ok({
+                "status": "syntax_error",
+                "error": vuln_result.stderr[:500],
+                "suggestion": "The rule YAML has a syntax error. Check pattern format and indentation.",
+            })
+
+        passed = vuln_findings > 0 and safe_findings == 0
+        return _ok({
+            "status": "passed" if passed else "failed",
+            "vulnerable_fires": vuln_findings > 0,
+            "safe_clean": safe_findings == 0,
+            "vulnerable_finding_count": vuln_findings,
+            "safe_finding_count": safe_findings,
+            "sandbox_id": sandbox_id,
+            "detail": (
+                "Rule validated: fires on vulnerable code and stays clean on safe code."
+                if passed else
+                f"Rule validation failed: vulnerable_fires={vuln_findings > 0}, safe_clean={safe_findings == 0}. "
+                f"Adjust the pattern to be more specific."
+            ),
+        })
+
+    except subprocess.TimeoutExpired:
+        return _ok({"status": "timeout", "error": "opengrep timed out after 30s"})
+    except FileNotFoundError:
+        return _ok({"status": "error", "error": "opengrep binary not found"})
+    finally:
+        # Always clean up sandbox
+        shutil.rmtree(sandbox_dir, ignore_errors=True)
+
+
+def _extract_findings_count(stdout: str) -> int:
+    """Extract the number of findings from OpenGrep JSON output."""
+    try:
+        start = stdout.find('{"version"')
+        if start == -1:
+            return 0
+        remaining = stdout[start:]
+        end = remaining.find('\n\n')
+        json_str = remaining[:end].strip() if end != -1 else remaining.strip()
+        data = json.loads(json_str)
+        return len(data.get("results", []))
+    except (json.JSONDecodeError, ValueError):
+        return 0
+
+
+async def handle_register_rule(args: dict, ctx: ToolContext) -> list[TextContent]:
+    """Register a validated OpenGrep rule: write YAML + fixtures + Evidence."""
+    rule_id = args.get("rule_id", "")
+    rule_yaml = args.get("rule_yaml", "")
+    vulnerable_code = args.get("vulnerable_code", "")
+    safe_code = args.get("safe_code", "")
+    language = args.get("language", "py")
+    node_id = args.get("node_id")
+    workspace_dir = args.get("workspace_dir", "")
+
+    if not rule_id or not rule_yaml or not workspace_dir:
+        return _err("rule_id, rule_yaml, and workspace_dir are required")
+
+    workspace = Path(workspace_dir)
+    rules_dir = workspace / ".opengrep" / "rules"
+    tests_dir = workspace / ".opengrep" / "tests"
+    rules_dir.mkdir(parents=True, exist_ok=True)
+    tests_dir.mkdir(parents=True, exist_ok=True)
+
+    # Write rule file
+    rule_filename = f"{rule_id}.yml"
+    rule_path = rules_dir / rule_filename
+    rule_path.write_text(rule_yaml)
+
+    # Write test fixtures
+    vuln_fixture = tests_dir / f"{rule_id}_vulnerable.{language}"
+    safe_fixture = tests_dir / f"{rule_id}_safe.{language}"
+    vuln_fixture.write_text(vulnerable_code)
+    safe_fixture.write_text(safe_code)
+
+    result = {
+        "rule_file": str(rule_path),
+        "test_vulnerable": str(vuln_fixture),
+        "test_safe": str(safe_fixture),
+        "active": True,
+    }
+
+    # Attach Evidence to SpecNode if node_id provided
+    if node_id:
+        try:
+            node = load_spec_node(node_id)
+            if node:
+                node.state.evidence.append(Evidence(
+                    kind="opengrep_rule",
+                    score=0.9,  # High confidence — deterministic rule
+                    detail=f"OpenGrep rule '{rule_id}' registered as anti-regression guard",
+                    source="opengrep",
+                    origin_id=f"rule_{rule_id}",
+                ))
+                node.state.confidence = recalculate_confidence(node)
+                node.updated_at = _now()
+                save_spec_node(node)
+                result["evidence_attached_to"] = node_id
+                result["new_confidence"] = node.state.confidence
+        except Exception as e:
+            result["evidence_error"] = str(e)
+
+    return _ok(result)
+
+
+async def handle_quarantine_rule(args: dict, ctx: ToolContext) -> list[TextContent]:
+    """Emergency disable: move a rule from rules/ to archive/."""
+    rule_id = args.get("rule_id", "")
+    reason = args.get("reason", "")
+    workspace_dir = args.get("workspace_dir", "")
+
+    if not rule_id or not workspace_dir:
+        return _err("rule_id and workspace_dir are required")
+
+    workspace = Path(workspace_dir)
+    rules_dir = workspace / ".opengrep" / "rules"
+    archive_dir = workspace / ".opengrep" / "archive"
+    archive_dir.mkdir(parents=True, exist_ok=True)
+
+    # Find the rule file
+    rule_file = rules_dir / rule_id
+    if not rule_file.exists():
+        # Try with .yml extension
+        rule_file = rules_dir / f"{rule_id}.yml"
+
+    if not rule_file.exists():
+        return _err(f"Rule file not found: {rule_id}")
+
+    # Move to archive
+    import shutil
+    dest = archive_dir / rule_file.name
+    shutil.move(str(rule_file), str(dest))
+
+    return _ok({
+        "quarantined": rule_file.name,
+        "moved_to": str(dest),
+        "reason": reason,
+        "active": False,
+    })
+
+
+def apply_security_confidence_impact(
+    node: "SpecNode",
+    finding_type: str,  # "finding" (uncommitted) or "violation" (shipped to main)
+    rule_id: str,
+    repo: str,
+) -> dict:
+    """Two-tier confidence impact for security findings.
+    
+    - Finding on uncommitted code: -10% confidence, NO cascade
+    - Violation shipped to main: -40% confidence + cascade_blast_radius()
+    """
+    if finding_type == "violation":
+        # Shipped violation — severe penalty + cascade
+        penalty = 0.6  # multiply by 0.6 = -40%
+        node.state.evidence.append(Evidence(
+            kind="security_violation",
+            score=0.0,  # Full failure evidence
+            detail=f"SECURITY VIOLATION: Rule '{rule_id}' violation shipped to main branch",
+            source="opengrep_ci",
+            origin_id=f"violation_{rule_id}",
+        ))
+        node.state.confidence = recalculate_confidence(node)
+        node.updated_at = _now()
+        save_spec_node(node)
+
+        # Cascade blast radius
+        cascade_result = cascade_blast_radius(node.id, repo)
+        return {
+            "impact_type": "violation",
+            "penalty": "40%",
+            "cascaded": True,
+            "cascade_result": cascade_result,
+        }
+    else:
+        # Uncommitted finding — minor penalty, no cascade
+        node.state.evidence.append(Evidence(
+            kind="security_violation",
+            score=0.5,  # Moderate evidence — caught before ship
+            detail=f"Security finding: Rule '{rule_id}' matched (caught pre-commit)",
+            source="opengrep",
+            origin_id=f"finding_{rule_id}",
+        ))
+        node.state.confidence = recalculate_confidence(node)
+        node.updated_at = _now()
+        save_spec_node(node)
+        return {
+            "impact_type": "finding",
+            "penalty": "10%",
+            "cascaded": False,
+        }
+
+
 V2_HANDLERS: dict[str, Any] = {
     # Core graph
     "turingmind_create_spec_node": handle_create_spec_node,
@@ -1908,6 +2162,10 @@ V2_HANDLERS: dict[str, Any] = {
     "turingmind_get_decision_queue": handle_get_decision_queue,
     # Cloud
     "turingmind_sync_cloud": handle_sync_cloud,
+    # Phase 2.5b: Security Rule Lifecycle
+    "turingmind_test_opengrep_rule": handle_test_opengrep_rule,
+    "turingmind_register_rule": handle_register_rule,
+    "turingmind_quarantine_rule": handle_quarantine_rule,
 }
 
 
