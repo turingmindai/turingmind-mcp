@@ -121,7 +121,8 @@ class SecurityScanner:
             return []
 
     def run_scan(self, target_files: list[str]) -> ScanResult:
-        """Run opengrep scan against specific files using rules from rules_dir.
+        """Run opengrep scan against specific files using BOTH community rules
+        (--config auto) AND custom rules from .opengrep/rules/.
         
         Returns parsed findings and any parse errors.
         """
@@ -133,11 +134,6 @@ class SecurityScanner:
                 scan_ok=False,
                 error_message="opengrep binary not found in PATH. Install with: curl -fsSL https://get.opengrep.dev | bash"
             )
-
-        rules_path = str(self.rules_dir)
-        if not Path(rules_path).exists() or not list(Path(rules_path).glob("*.yml")):
-            logger.info("No OpenGrep rules found in %s. Scan skipped.", rules_path)
-            return ScanResult(files_scanned=0)
 
         # Build absolute paths for target files
         abs_targets = []
@@ -151,18 +147,24 @@ class SecurityScanner:
         if not abs_targets:
             return ScanResult(files_scanned=0)
 
+        # Build config flags: always use community rules + custom rules if they exist
+        config_args = ["--config", "auto"]
+        rules_path = str(self.rules_dir)
+        if Path(rules_path).exists() and list(Path(rules_path).glob("*.yml")):
+            config_args.extend(["--config", rules_path])
+
         try:
             cmd = [
                 "opengrep", "scan",
                 "--json",
-                "--config", rules_path,
+                *config_args,
                 *abs_targets,
             ]
             result = subprocess.run(
                 cmd,
                 capture_output=True,
                 text=True,
-                timeout=120,
+                timeout=180,  # 3 min for larger community ruleset
                 cwd=str(self.workspace_dir),
             )
             return self._parse_opengrep_output(result.stdout, result.stderr, len(abs_targets))
@@ -170,7 +172,7 @@ class SecurityScanner:
         except subprocess.TimeoutExpired:
             return ScanResult(
                 scan_ok=False,
-                error_message="opengrep scan timed out after 120 seconds"
+                error_message="opengrep scan timed out after 180 seconds"
             )
         except Exception as e:
             return ScanResult(
@@ -277,8 +279,12 @@ class SecurityScanner:
     def _parse_opengrep_output(self, stdout: str, stderr: str, file_count: int) -> ScanResult:
         """Parse the JSON output from opengrep scan --json.
         
-        OpenGrep JSON output follows the Semgrep schema:
+        OpenGrep's --json flag outputs UI chrome (box drawings, status text)
+        followed by a JSON block. We need to extract just the JSON portion.
+        
+        The JSON follows the Semgrep schema:
         {
+            "version": "...",
             "results": [...findings...],
             "errors": [...parse errors...]
         }
@@ -286,16 +292,28 @@ class SecurityScanner:
         result = ScanResult(files_scanned=file_count)
 
         if not stdout.strip():
-            # No output = no findings (scan was clean)
             return result
 
+        # Extract JSON block from mixed output
+        # OpenGrep prints UI text then the JSON object starting with {"version"
+        json_str = stdout
+        json_start = stdout.find('{"version"')
+        if json_start != -1:
+            # Find the end of the JSON block (followed by blank line or EOF)
+            remaining = stdout[json_start:]
+            # The JSON is a single line, terminated by newline
+            json_end = remaining.find('\n\n')
+            if json_end != -1:
+                json_str = remaining[:json_end].strip()
+            else:
+                json_str = remaining.strip()
+
         try:
-            data = json.loads(stdout)
+            data = json.loads(json_str)
         except json.JSONDecodeError:
-            # If stdout isn't valid JSON, check stderr for errors
             if stderr.strip():
                 logger.warning("OpenGrep non-JSON output. stderr: %s", stderr[:500])
-            result.error_message = f"Failed to parse opengrep JSON output: {stdout[:200]}"
+            result.error_message = f"Failed to parse opengrep JSON output"
             result.scan_ok = False
             return result
 
