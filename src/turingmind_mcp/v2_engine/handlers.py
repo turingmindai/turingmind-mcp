@@ -1471,11 +1471,19 @@ def _all_nodes_for_repo(repo: str) -> list[SpecNode]:
 def recalculate_confidence(node: SpecNode, decay: float = 0.85) -> float:
     """Compute confidence from the Evidence[] trail using a weighted-recency formula.
     Most recent evidence is weighted highest.  If no evidence, returns 0.0.
+
+    Side-effect: also updates node.state.review_depth by counting consecutive
+    trailing 'review' evidence entries with score >= 0.8.  Any non-review entry
+    (code_change, security_violation, blast_radius_cascade, etc.) breaks the
+    streak and resets the depth to 0.  This makes review_depth a derived
+    stability metric that the dashboard can display directly.
     """
     evidence = node.state.evidence
     if not evidence:
+        node.state.review_depth = 0
         return 0.0
 
+    # ── Confidence calculation (unchanged) ─────────────────────────────
     n = len(evidence)
     total_weight = 0.0
     weighted_sum = 0.0
@@ -1483,6 +1491,17 @@ def recalculate_confidence(node: SpecNode, decay: float = 0.85) -> float:
         weight = decay ** (n - 1 - i)  # most recent (last) gets weight=1.0
         weighted_sum += ev.score * weight
         total_weight += weight
+
+    # ── R1-B: Derive review_depth from the evidence trail ──────────────
+    # Walk backwards: count consecutive "review" entries with score >= 0.8.
+    # The moment we hit a non-review kind, the streak breaks.
+    depth = 0
+    for ev in reversed(evidence):
+        if ev.kind == "review" and ev.score >= 0.8:
+            depth += 1
+        else:
+            break
+    node.state.review_depth = depth
 
     return round(weighted_sum / total_weight, 4) if total_weight > 0 else 0.0
 

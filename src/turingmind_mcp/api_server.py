@@ -184,9 +184,16 @@ SEVERITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3}
 # Cache the latest security gaps so they merge into the decision queue
 _security_gaps_cache: list[dict] = []
 
+# X-3: TTL cache for prune gaps — avoids running opengrep self-tests on every DQ poll.
+# Tuple of (timestamp_seconds, gaps_list).  Re-run prune_rules() only when stale.
+_prune_cache: tuple[float, list[dict]] = (0.0, [])
+_PRUNE_TTL_SECONDS = 300  # 5 minutes
+
 @app.get("/api/v2/decision-queue")
 def get_decision_queue(repo: str, limit: int = 20):
     """Return prioritized action items derived from graph gap analysis + security findings."""
+    global _prune_cache
+
     if not repo:
         raise HTTPException(status_code=400, detail="repo is required")
     try:
@@ -197,6 +204,16 @@ def get_decision_queue(repo: str, limit: int = 20):
             last_result = scanner.run_security_cycle(repo)
             if last_result.gaps_injected:
                 gaps.extend(last_result.gaps_injected)
+
+        # X-3: Merge in rule health gaps from prune_rules() with TTL cache
+        import time as _time
+        now = _time.time()
+        if now - _prune_cache[0] > _PRUNE_TTL_SECONDS:
+            prune_gaps: list[dict] = []
+            for scanner in _scanner_cache.values():
+                prune_gaps.extend(scanner.prune_rules())
+            _prune_cache = (now, prune_gaps)
+        gaps.extend(_prune_cache[1])
         
         # Sort by severity (critical first)
         gaps.sort(key=lambda g: SEVERITY_ORDER.get(g.get("severity", "low"), 99))
