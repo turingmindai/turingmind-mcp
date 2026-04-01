@@ -605,7 +605,7 @@ def get_inventory(repo: str):
             "services": [_serialize(n) for n in inventory_nodes if n.surface_type.value == "external_service"],
             "infra": [_serialize(n) for n in inventory_nodes if n.surface_type.value == "infrastructure"],
             "api_endpoints": [_serialize(n) for n in inventory_nodes if n.surface_type.value == "api_endpoint"],
-            "features": [_serialize(n) for n in inventory_nodes if n.level.value in ("L4_FEATURE", "L5_BUSINESS_GOAL")],
+            "features": [_serialize(n) for n in inventory_nodes if n.level.value in ("L4_FEATURE", "L5_BUSINESS_GOAL") or n.surface_type.value == "internal"],
         }
         result["total"] = sum(len(v) for v in result.values() if isinstance(v, list))
         return result

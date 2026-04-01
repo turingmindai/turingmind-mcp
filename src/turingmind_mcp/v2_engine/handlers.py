@@ -1126,7 +1126,7 @@ async def handle_bootstrap_codebase(args: dict, ctx: ToolContext) -> list[TextCo
 
     repo         = args.get("repo")
     project_path = args.get("project_path")
-    patterns     = args.get("include_patterns") or ["*.py", "*.ts", "*.js", "*.jsx", "*.tsx"]
+    patterns     = args.get("include_patterns") or ["*.py", "*.ts", "*.js", "*.jsx", "*.tsx", "*.swift", "*.c", "*.cpp", "*.h", "*.m", "*.plist", "*.entitlements"]
     exclude_dirs = set(args.get("exclude_dirs") or [
         "node_modules", ".venv", "venv", "__pycache__", ".git", "dist", "build", ".next", ".mypy_cache",
         "tests", "test", "__tests__", "scripts", "fixtures", "migrations", "mocks", "e2e",
@@ -1310,6 +1310,8 @@ async def handle_bootstrap_codebase(args: dict, ctx: ToolContext) -> list[TextCo
             root / "requirements.txt",
             root / "Pipfile",
             root / "pyproject.toml",
+            root / "Package.swift",
+            root / "Podfile",
         ]
 
         for manifest_path in manifest_files:
@@ -1343,6 +1345,11 @@ async def handle_bootstrap_codebase(args: dict, ctx: ToolContext) -> list[TextCo
                 elif manifest_name in ("Pipfile", "pyproject.toml"):
                     # Best-effort: look for `package = "*"` or `package = "^1.2.3"`
                     for m in _re2.finditer(r'^([a-zA-Z0-9_\-]+)\s*=\s*["\']([^"\']+)["\']', text, _re2.MULTILINE):
+                        packages[m.group(1).lower()] = m.group(2)
+
+                elif manifest_name == "Package.swift":
+                    # Best-effort: extract repo basename and version from .package(url: ".../Alamofire.git", from: "5.0.0")
+                    for m in _re2.finditer(r'\.package\(\s*url:\s*["\'](?:.*?/)([^/]+?)(?:\.git)?["\'].*?from:\s*["\']([^"\']+)["\']', text):
                         packages[m.group(1).lower()] = m.group(2)
 
                 for pkg_name, pkg_ver in packages.items():

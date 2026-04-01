@@ -17,6 +17,7 @@ import os
 import sys
 from pathlib import Path
 from typing import Optional, Dict, Any, Set
+import uuid
 
 # Handle imports - work both when installed and when run as script
 # Add src to path if not already there (for when run as script)
@@ -138,6 +139,33 @@ def get_db() -> MemoryDatabase:
         _db = MemoryDatabase()
     return _db
 
+
+async def broadcast_trace_to_driftcop(trace_id: str, prompt: str) -> None:
+    """
+    Broadcast the active Trace-ID and associated Prompt from the IDE 
+    to the running driftcop instance via a local Unix socket.
+    """
+    sock_path = "/tmp/driftcop_trace.sock"
+    if not os.path.exists(sock_path):
+        logger.debug(f"/tmp/driftcop_trace.sock not found. Driftcop may not be running IPC listener yet. Saving trace mapping locally: {trace_id}")
+        return
+        
+    try:
+        payload = json.dumps({
+            "action": "expect_trace",
+            "trace_id": trace_id,
+            "prompt": prompt,
+            "ttl_ms": 30000
+        }) + "\n"
+        
+        reader, writer = await asyncio.open_unix_connection(sock_path)
+        writer.write(payload.encode('utf-8'))
+        await writer.drain()
+        writer.close()
+        await writer.wait_closed()
+        logger.info(f"Successfully broadcasted Trace-ID {trace_id} to DriftCop IPC.")
+    except Exception as e:
+        logger.warning(f"Failed to broadcast Trace-ID {trace_id} to DriftCop: {e}")
 
 # ============================================================================
 # MESSAGE HANDLERS
@@ -1543,6 +1571,16 @@ async def handle_message(websocket: Any, message: str) -> None:
                 response['error'] = 'Missing repo parameter'
             else:
                 response['data'] = await handle_get_tdd_status(repo)
+        
+        elif action == 'start_prompt_trace':
+            prompt_text = data.get('prompt', '')
+            if not prompt_text:
+                response['error'] = 'Missing prompt parameter'
+            else:
+                trace_id = f"T-{str(uuid.uuid4())[:8].upper()}"
+                logger.info(f"Minted new Trace-ID: {trace_id} for prompt: '{prompt_text[:50]}...'")
+                await broadcast_trace_to_driftcop(trace_id, prompt_text)
+                response['data'] = {'trace_id': trace_id, 'status': 'broadcasted'}
         
         elif action == 'validate_edit':
             repo = data.get('repo', '')
