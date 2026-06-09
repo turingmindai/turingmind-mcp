@@ -72,6 +72,16 @@ def init_db() -> None:
             )
         """)
         
+        # 4. Out-of-band Blueprints Store 
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS spec_blueprints (
+                node_id TEXT PRIMARY KEY,
+                payload TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY (node_id) REFERENCES spec_nodes(id) ON DELETE CASCADE
+            )
+        """)
+        
         # Indexes for pipeline speed
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_nodes_repo ON spec_nodes(repo)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_nodes_stage ON spec_nodes(stage)")
@@ -247,6 +257,35 @@ def get_impacted_subgraph_with_depth(upstream_id: str) -> List[tuple]:
                     queue.append((down_id, child_depth))
 
     return result
+
+# ==================================================
+# Blueprints Store (Out-of-band storage)
+# ==================================================
+
+def save_blueprint(node_id: str, payload: str) -> None:
+    """Save an architectural diagram payload separate from main node JSON bloat."""
+    import datetime
+    now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    with _get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO spec_blueprints (node_id, payload, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(node_id) DO UPDATE SET
+                payload=excluded.payload,
+                updated_at=excluded.updated_at
+        """, (node_id, payload, now_iso))
+        conn.commit()
+
+def get_blueprint(node_id: str) -> Optional[str]:
+    """Retrieve an architectural payload."""
+    with _get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT payload FROM spec_blueprints WHERE node_id = ?", (node_id,))
+        row = cursor.fetchone()
+        if row:
+            return row["payload"]
+        return None
 
 # ==================================================
 # Execution Loop Queue state

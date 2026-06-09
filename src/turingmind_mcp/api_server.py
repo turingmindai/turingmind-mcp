@@ -242,18 +242,24 @@ class SyncPayload(BaseModel):
 class CreateNodePayload(BaseModel):
     repo: str
     title: str
-    level: str                          # L0_SYSTEM, L1_FILE, L2_EXTERNAL, L3_API
+    level: str                          # L0_SYSTEM, L1_FILE, L2_EXTERNAL, L3_API, L6_PHASE, L7_PROJECT
     surface_type: str = "internal"      # api_endpoint, internal, job, hardware_bridge
     contract: dict = {}                 # {invariants: [], metrics: [], inputs: {}, outputs: {}}
     dependencies: list[str] = []
     priority: str = "medium"
     governance_tier: Optional[str] = None
+    effort_days: Optional[float] = None
+    complexity: Optional[str] = None
+    intent_justification: Optional[str] = None
 
 class UpdateNodePayload(BaseModel):
     contract: dict = {}
     dependencies: list[str] = []
     surface_type: Optional[str] = None
     priority: Optional[str] = None
+    effort_days: Optional[float] = None
+    complexity: Optional[str] = None
+    intent_justification: Optional[str] = None
 
 class IntentRecord(BaseModel):
     text: str               # Raw text of the intent item (e.g. checklist line)
@@ -374,6 +380,9 @@ def create_node(payload: CreateNodePayload):
         governance_tier=tier,
         contract=contract,
         dependencies=payload.dependencies,
+        effort_days=payload.effort_days,
+        complexity=payload.complexity,
+        intent_justification=payload.intent_justification,
     )
 
     save_spec_node(node)
@@ -410,6 +419,18 @@ def update_node(node_id: str, payload: UpdateNodePayload):
             changed = True
         except ValueError:
             pass
+
+    if payload.effort_days is not None:
+        node.effort_days = payload.effort_days
+        changed = True
+
+    if payload.complexity is not None:
+        node.complexity = payload.complexity
+        changed = True
+
+    if payload.intent_justification is not None:
+        node.intent_justification = payload.intent_justification
+        changed = True
 
     if payload.contract:
         c = payload.contract
@@ -530,12 +551,62 @@ def get_graph_nodes(repo: str, governance_tier: Optional[str] = None):
                 "evidence": n.state.evidence,
                 "contract": n.contract.model_dump() if n.contract else {},
                 "governance_tier": getattr(n, 'governance_tier', 'governed'),
+                "effort_days": getattr(n, 'effort_days', None),
+                "complexity": getattr(n, 'complexity', None),
+                "intent_justification": getattr(n, 'intent_justification', None),
                 "updated_at": n.updated_at
             })
         return {"nodes": ui_nodes, "count": len(ui_nodes)}
     except Exception as e:
         logger.error(f"Error fetching nodes: {e}")
         return {"nodes": [], "count": 0, "note": "Internal server error"}
+
+@app.get("/api/v2/graph/roadmap")
+def get_roadmap(repo: str):
+    """Return an ordered hierarchy of Project and Phase nodes for the Gantt view."""
+    if not repo:
+        raise HTTPException(status_code=400, detail="repo is required")
+    try:
+        nodes = get_all_spec_nodes(repo)
+        
+        projects = []
+        phases = []
+        features = {}
+
+        for n in nodes:
+            serialized_node = {
+                "node_id": n.id,
+                "title": n.title,
+                "level": n.level.value,
+                "stage": n.state.stage.value,
+                "status": n.state.status.value,
+                "confidence": n.state.confidence,
+                "dependencies": n.dependencies,
+                "effort_days": getattr(n, 'effort_days', None),
+                "complexity": getattr(n, 'complexity', None),
+                "intent_justification": getattr(n, 'intent_justification', None),
+                "updated_at": n.updated_at,
+            }
+
+            if n.level == NodeLevel.L7_PROJECT:
+                projects.append(serialized_node)
+            elif n.level == NodeLevel.L6_PHASE:
+                phases.append(serialized_node)
+            else:
+                features[str(n.id)] = serialized_node
+
+        # Build nest mapping
+        # In a real system, you'd trace edges from Phase -> child nodes
+        # Here we'll return raw collections and let UI assemble, or if dependencies point upward
+        return {
+            "projects": projects,
+            "phases": phases,
+            "features": features, # Passing all features for UI to map via dependencies
+            "count": len(nodes)
+        }
+    except Exception as e:
+        logger.error(f"Error fetching roadmap: {e}")
+        return {"projects": [], "phases": [], "features": {}, "count": 0}
 
 @app.post("/api/v2/graph/nodes/{node_id}/promote")
 def promote_node(node_id: str):
@@ -830,6 +901,15 @@ def verify_node(node_id: str, payload: VerifyPayload):
         return data
     except json.JSONDecodeError:
         return {"status": "success", "raw": result[0].text}
+@app.get("/api/v2/graph/blueprint/{node_id}")
+def get_node_blueprint(node_id: str):
+    from .v2_engine.database import get_blueprint
+    payload = get_blueprint(node_id)
+    if not payload:
+        raise HTTPException(status_code=404, detail=f"Blueprint for node '{node_id}' not found")
+    
+    from fastapi.responses import HTMLResponse
+    return HTMLResponse(content=payload)
 
 
 if __name__ == "__main__":

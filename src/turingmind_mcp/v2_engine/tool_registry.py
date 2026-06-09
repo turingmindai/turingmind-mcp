@@ -56,8 +56,8 @@ _SPEC_NODE_PROPS = {
     "title": {"type": "string", "description": "Short human-readable title"},
     "level": {
         "type": "string",
-        "enum": ["L0_INFRA", "L1_FILE", "L2_EXTERNAL", "L3_API", "L4_FEATURE", "L5_BUSINESS_GOAL"],
-        "description": "L0=system, L1=file, L2=external, L3=api, L4=feature, L5=business",
+        "enum": ["L0_INFRA", "L1_FILE", "L2_EXTERNAL", "L3_API", "L4_FEATURE", "L5_BUSINESS_GOAL", "L6_PHASE", "L7_PROJECT"],
+        "description": "L0=system, L1=file, ..., L6=phase (milestone), L7=project (cross-repo grouping)",
     },
     "surface_type": {
         "type": "string",
@@ -90,6 +90,19 @@ _SPEC_NODE_PROPS = {
     "priority": {
         "type": "string",
         "enum": ["critical", "high", "medium", "low"],
+    },
+    "effort_days": {
+        "type": "number",
+        "description": "Estimated calendar days to complete",
+    },
+    "complexity": {
+        "type": "string",
+        "enum": ["low", "medium", "high"],
+        "description": "Relative implementation complexity",
+    },
+    "intent_justification": {
+        "type": "string",
+        "description": "Rationale for why this node exists (e.g. from gap analysis)",
     },
 }
 
@@ -126,8 +139,29 @@ V2_TOOLS: list[Tool] = [
                 "priority": _SPEC_NODE_PROPS["priority"],
                 "surface_type": _SPEC_NODE_PROPS["surface_type"],
                 "dependencies": _SPEC_NODE_PROPS["dependencies"],
+                "effort_days": _SPEC_NODE_PROPS["effort_days"],
+                "complexity": _SPEC_NODE_PROPS["complexity"],
+                "intent_justification": _SPEC_NODE_PROPS["intent_justification"],
             },
             "required": ["node_id"],
+        },
+    ),
+    Tool(
+        name="turingmind_save_architecture_diagram",
+        description=(
+            "Store a rich HTML or Mermaid architecture representation natively into a SpecNode. "
+            "Eliminates the need to save disconnected architecture artifacts to the filesystem."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "node_id": {"type": "string", "description": "SpecNode ID to attach diagram to"},
+                "blueprint_payload": {
+                    "type": "string",
+                    "description": "Raw HTML or Mermaid text representing the visual architecture",
+                },
+            },
+            "required": ["node_id", "blueprint_payload"],
         },
     ),
     Tool(
@@ -166,7 +200,7 @@ V2_TOOLS: list[Tool] = [
                     "enum": ["internal", "api_endpoint", "job", "hardware_bridge", "all"],
                     "default": "all",
                 },
-                "level": {"type": "string", "enum": ["L0", "L1", "L2", "L3", "all"], "default": "all"},
+                "level": {"type": "string", "enum": ["L0", "L1", "L2", "L3", "L4", "L5", "L6", "L7", "all"], "default": "all"},
             },
             "required": ["repo"],
         },
@@ -627,6 +661,31 @@ V2_TOOLS: list[Tool] = [
                 },
             },
             "required": ["rule_id", "reason", "workspace_dir"],
+        },
+    ),
+    # ──────────────────────────────────────────────────────────────────────────
+    # ROADMAP & INTENT LAYER
+    # ──────────────────────────────────────────────────────────────────────────
+    Tool(
+        name="turingmind_link_intent",
+        description=(
+            "Associate a high-level intent record (e.g. from gap analysis or product requirements) "
+            "with a specific SpecNode. This updates the node's intent_justification field "
+            "to bridge the non-deterministic reasoning layer with the deterministic execution graph."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "node_id": {
+                    "type": "string",
+                    "description": "SpecNode ID to link intent to",
+                },
+                "intent_justification": {
+                    "type": "string",
+                    "description": "The rationale / gap analysis text explaining why this node exists",
+                },
+            },
+            "required": ["node_id", "intent_justification"],
         },
     ),
 ]

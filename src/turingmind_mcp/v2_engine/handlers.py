@@ -20,11 +20,13 @@ from mcp.types import TextContent
 
 from ..tools.context import ToolContext
 from .database import (
+    get_all_spec_nodes,
     get_execution_state,
     get_impacted_subgraph,
     get_impacted_subgraph_with_depth,
     get_nodes_by_stage,
     get_spec_node,
+    save_blueprint,
     save_execution_state,
     save_spec_node,
     save_spec_nodes,
@@ -144,6 +146,9 @@ async def handle_create_spec_node(args: dict, ctx: ToolContext) -> list[TextCont
         surface_type=surface,
         contract=contract,
         dependencies=args.get("dependencies", []),
+        effort_days=args.get("effort_days"),
+        complexity=args.get("complexity"),
+        intent_justification=args.get("intent_justification"),
     )
 
     save_spec_node(node)
@@ -187,10 +192,45 @@ async def handle_update_spec_node(args: dict, ctx: ToolContext) -> list[TextCont
         merged = list(set(node.dependencies + args["dependencies"]))
         node.dependencies = merged
 
+    if "effort_days" in args:
+        node.effort_days = args["effort_days"]
+        
+    if "complexity" in args:
+        node.complexity = args["complexity"]
+        
+    if "intent_justification" in args:
+        node.intent_justification = args["intent_justification"]
+
     node.updated_at = _now()
     save_spec_node(node)
     response = {"status": "updated", "node_id": node_id}
     return _ok(_append_gap_hints(response, node.repo))
+
+
+async def handle_save_architecture_diagram(args: dict, ctx: ToolContext) -> list[TextContent]:
+    node_id = args.get("node_id")
+    blueprint_payload = args.get("blueprint_payload")
+
+    if not node_id or not blueprint_payload:
+        return _err("node_id and blueprint_payload are required")
+
+    node = get_spec_node(node_id)
+    if not node:
+        return _err(f"SpecNode '{node_id}' not found")
+
+    save_blueprint(node_id, blueprint_payload)
+    
+    node.has_blueprint = True
+    node.updated_at = _now()
+    save_spec_node(node)
+
+    return _ok({
+        "status": "blueprint_saved",
+        "node_id": node_id,
+        "payload_length": len(blueprint_payload),
+        "message": f"Architecture diagram securely stored out-of-band for {node_id}.",
+    })
+
 
 
 async def handle_get_spec_status(args: dict, ctx: ToolContext) -> list[TextContent]:
@@ -240,7 +280,7 @@ async def handle_list_spec_nodes(args: dict, ctx: ToolContext) -> list[TextConte
     if surface_filter != "all":
         nodes = [n for n in nodes if n.surface_type.value == surface_filter]
     if level_filter != "all":
-        nodes = [n for n in nodes if n.level.value == level_filter]
+        nodes = [n for n in nodes if n.level.value.startswith(level_filter)]
 
     return _ok({
         "repo": repo,
@@ -2224,10 +2264,37 @@ def apply_security_confidence_impact(
         }
 
 
+# =============================================================================
+# ROADMAP & INTENT LAYER
+# =============================================================================
+
+async def handle_link_intent(args: dict, ctx: ToolContext) -> list[TextContent]:
+    node_id = args.get("node_id")
+    intent_justification = args.get("intent_justification")
+
+    if not node_id or not intent_justification:
+        return _err("node_id and intent_justification are required")
+
+    node = get_spec_node(node_id)
+    if not node:
+        return _err(f"SpecNode '{node_id}' not found")
+
+    node.intent_justification = intent_justification
+    node.updated_at = _now()
+    save_spec_node(node)
+
+    return _ok({
+        "status": "intent_linked",
+        "node_id": node_id,
+        "message": f"Successfully linked intent to SpecNode '{node.title}'."
+    })
+
+
 V2_HANDLERS: dict[str, Any] = {
     # Core graph
     "turingmind_create_spec_node": handle_create_spec_node,
     "turingmind_update_spec_node": handle_update_spec_node,
+    "turingmind_save_architecture_diagram": handle_save_architecture_diagram,
     "turingmind_get_spec_status": handle_get_spec_status,
     "turingmind_list_spec_nodes": handle_list_spec_nodes,
     "turingmind_get_ready_nodes": handle_get_ready_nodes,
@@ -2258,6 +2325,8 @@ V2_HANDLERS: dict[str, Any] = {
     "turingmind_test_opengrep_rule": handle_test_opengrep_rule,
     "turingmind_register_rule": handle_register_rule,
     "turingmind_quarantine_rule": handle_quarantine_rule,
+    # Roadmap & Intent
+    "turingmind_link_intent": handle_link_intent,
 }
 
 

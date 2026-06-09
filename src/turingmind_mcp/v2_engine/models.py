@@ -22,7 +22,8 @@ class NodeLevel(str, Enum):
     L3_API = "L3_API"                     # Network Ingress/Egress 
     L4_FEATURE = "L4_FEATURE"             # Feature/Ticket tracker
     L5_BUSINESS_GOAL = "L5_BUSINESS_GOAL" # Epic/Business Intent
-    L6_ACTION_ITEM = "L6_ACTION_ITEM"     # Decision Queue Task
+    L6_PHASE = "L6_PHASE"                 # Implementation Phase/Milestone
+    L7_PROJECT = "L7_PROJECT"             # Cross-repo Product/Project
 
 
 class SurfaceType(str, Enum):
@@ -215,6 +216,12 @@ class SpecNode(BaseModel):
 
     dependencies: List[str] = Field(default_factory=list, description="IDs of upstream nodes this node depends on")
     dependents: List[str] = Field(default_factory=list, description="IDs of downstream nodes blocked by this node")
+
+    # Intent / Roadmap fields
+    effort_days: Optional[float] = Field(default=None, description="Estimated calendar days to complete")
+    complexity: Optional[Literal["low", "medium", "high"]] = Field(default=None, description="Relative implementation complexity")
+    intent_justification: Optional[str] = Field(default=None, description="Rationale for why this node exists (e.g. from gap analysis)")
+    has_blueprint: bool = Field(default=False, description="Whether this node has an associated architecture blueprint payload stored out-of-band")
 
     created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     updated_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
