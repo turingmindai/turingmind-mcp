@@ -116,6 +116,8 @@ class MemoryDatabase:
         }
         if "node_id" not in existing_cols:
             cursor.execute("ALTER TABLE memory_entries ADD COLUMN node_id TEXT")
+        if "deleted_at" not in existing_cols:
+            cursor.execute("ALTER TABLE memory_entries ADD COLUMN deleted_at DATETIME")
 
         # Evidence Table
         cursor.execute("""
@@ -1089,8 +1091,9 @@ class MemoryDatabase:
 
         local = self.get_memory_entry(memory_id)
         cloud_updated = self._parse_db_timestamp(row.get("updated_at"))
+        cloud_deleted = self._parse_db_timestamp(row.get("deleted_at"))
         status = (row.get("status") or "active").lower()
-        is_tombstone = status in ("deprecated", "deleted")
+        is_tombstone = status in ("deprecated", "deleted") or cloud_deleted is not None
 
         if local and not is_tombstone:
             local_updated = self._parse_db_timestamp(local.get("updated_at"))
@@ -1098,7 +1101,7 @@ class MemoryDatabase:
                 return False
 
         if local:
-            return self.update_memory_entry(
+            applied = self.update_memory_entry(
                 memory_id,
                 content=row.get("content"),
                 scope=row.get("scope"),
@@ -1106,6 +1109,14 @@ class MemoryDatabase:
                 status=status,
                 yaml_definition=row.get("yaml_definition"),
             )
+            if applied and is_tombstone and row.get("deleted_at"):
+                cursor = self.conn.cursor()
+                cursor.execute(
+                    "UPDATE memory_entries SET deleted_at = ? WHERE memory_id = ?",
+                    (row.get("deleted_at"), memory_id),
+                )
+                self.conn.commit()
+            return applied
 
         cursor = self.conn.cursor()
         tags = row.get("security_tags")
@@ -1121,8 +1132,8 @@ class MemoryDatabase:
             INSERT INTO memory_entries (
                 memory_id, repo, type, content, scope, confidence,
                 status, security_tags, yaml_definition, expires_at,
-                created_by, node_id, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                created_by, node_id, created_at, updated_at, deleted_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 memory_id,
@@ -1139,6 +1150,7 @@ class MemoryDatabase:
                 row.get("node_id"),
                 row.get("created_at"),
                 row.get("updated_at"),
+                row.get("deleted_at"),
             ),
         )
         self.conn.commit()
@@ -1197,6 +1209,10 @@ class MemoryDatabase:
         if status is not None:
             updates.append("status = ?")
             params.append(status)
+            if status in ("deprecated", "deleted"):
+                updates.append("deleted_at = CURRENT_TIMESTAMP")
+            elif status == "active":
+                updates.append("deleted_at = NULL")
 
         if security_tags is not None:
             updates.append("security_tags = ?")

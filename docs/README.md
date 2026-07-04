@@ -28,11 +28,7 @@ Choose your platform for detailed setup instructions:
 ### Developer Documentation
 - **[Development](DEVELOPMENT.md)** - Architecture, implementation, parser improvements, and development guidelines
 - **[Testing Guide](TESTING_GUIDE.md)** - Testing documentation, test results, and graph functionality testing
-- **[Review](REVIEW.md)** - Code review findings, fixes, and issue prioritization
 - **[Compatibility Matrix](COMPATIBILITY_MATRIX.md)** - Platform and version compatibility
-
-### Planning & Assessment
-- **[Integration Assessment](INTEGRATION_ASSESSMENT.md)** - Current state and gap analysis
 
 ## Quick Setup
 

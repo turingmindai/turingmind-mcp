@@ -70,6 +70,19 @@ class TestBidirectionalMemorySync(unittest.TestCase):
         self.assertEqual(stats["tombstones_applied"], 1)
         self.assertEqual(self.db.get_memory_entry(mem_id)["status"], "deprecated")
 
+    def test_delete_sets_deleted_at_tombstone(self):
+        mem_id = self.db.create_memory_entry(
+            repo="owner/repo",
+            memory_type="explicit_rule",
+            content="Rotate keys monthly",
+            scope="repo",
+            confidence=0.9,
+        )
+        self.db.delete_memory_entry(mem_id, deprecate=True)
+        row = self.db.get_memory_entry(mem_id)
+        self.assertEqual(row["status"], "deprecated")
+        self.assertIsNotNone(row.get("deleted_at"))
+
     @mock.patch.object(postgres, "sync_memory_entries", return_value=1)
     @mock.patch.object(postgres, "pull_memory_entries", return_value=[])
     def test_sync_memories_bidirectional_updates_pull_cursor(self, _pull, _push):

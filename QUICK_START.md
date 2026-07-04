@@ -98,8 +98,8 @@ If something doesn't work:
 ## Documentation
 
 - **Platform Guides**: `docs/platforms/`
-- **Integration Assessment**: `docs/INTEGRATION_ASSESSMENT.md`
-- **Implementation Summary**: `IMPLEMENTATION_SUMMARY.md`
+- **Features**: `docs/FEATURES.md`
+- **Development**: `docs/DEVELOPMENT.md`
 
 ## Support
 

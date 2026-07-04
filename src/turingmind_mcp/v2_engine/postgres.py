@@ -98,6 +98,10 @@ def init_postgres():
                     "CREATE INDEX IF NOT EXISTS idx_memory_entries_repo_status "
                     "ON memory_entries(repo, status)"
                 )
+                cur.execute(
+                    "ALTER TABLE memory_entries ADD COLUMN IF NOT EXISTS deleted_at "
+                    "TIMESTAMP WITH TIME ZONE"
+                )
     except Exception as e:
         logger.error(f"Failed to initialize Postgres schema: {e}")
 
@@ -214,13 +218,18 @@ def sync_memory_entries(repo: str, entries: List[Dict[str, Any]]) -> int:
                         tags = None
                     safe_content = scrub_secrets(entry.get("content") or "")
                     safe_yaml = scrub_secrets(entry.get("yaml_definition"))
+                    status = entry.get("status") or "active"
+                    deleted_at = entry.get("deleted_at")
+                    if status in ("deprecated", "deleted") and not deleted_at:
+                        deleted_at = now_iso
                     cur.execute(
                         """
                         INSERT INTO memory_entries (
                             memory_id, repo, type, content, scope, confidence,
                             status, security_tags, yaml_definition,
-                            created_at, updated_at, expires_at, created_by, node_id
-                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                            created_at, updated_at, expires_at, created_by, node_id,
+                            deleted_at
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                         ON CONFLICT (repo, memory_id) DO UPDATE SET
                             type = EXCLUDED.type,
                             content = EXCLUDED.content,
@@ -232,7 +241,8 @@ def sync_memory_entries(repo: str, entries: List[Dict[str, Any]]) -> int:
                             updated_at = EXCLUDED.updated_at,
                             expires_at = EXCLUDED.expires_at,
                             created_by = EXCLUDED.created_by,
-                            node_id = EXCLUDED.node_id
+                            node_id = EXCLUDED.node_id,
+                            deleted_at = EXCLUDED.deleted_at
                         """,
                         (
                             entry["memory_id"],
@@ -241,7 +251,7 @@ def sync_memory_entries(repo: str, entries: List[Dict[str, Any]]) -> int:
                             safe_content,
                             entry["scope"],
                             float(entry.get("confidence") or 0.8),
-                            entry["status"],
+                            status,
                             Json(tags) if tags is not None else None,
                             safe_yaml,
                             entry.get("created_at") or now_iso,
@@ -249,6 +259,7 @@ def sync_memory_entries(repo: str, entries: List[Dict[str, Any]]) -> int:
                             entry.get("expires_at"),
                             entry.get("created_by"),
                             entry.get("node_id"),
+                            deleted_at,
                         ),
                     )
                     synced += 1
@@ -270,7 +281,7 @@ def pull_memory_entries(
     query = """
         SELECT memory_id, repo, type, content, scope, confidence, status,
                security_tags, yaml_definition, created_at, updated_at,
-               expires_at, created_by, node_id
+               expires_at, created_by, node_id, deleted_at
         FROM memory_entries
         WHERE repo = %s
     """
@@ -291,7 +302,7 @@ def pull_memory_entries(
                     tags = row.get("security_tags")
                     if tags is not None and not isinstance(tags, list):
                         row["security_tags"] = tags
-                    for key in ("created_at", "updated_at", "expires_at"):
+                    for key in ("created_at", "updated_at", "expires_at", "deleted_at"):
                         if row.get(key) is not None:
                             row[key] = row[key].isoformat()
                     rows.append(row)

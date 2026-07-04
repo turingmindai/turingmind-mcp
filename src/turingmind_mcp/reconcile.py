@@ -219,11 +219,11 @@ class ReconciliationEngine:
         vectors: Dict[str, List[float]],
         embed_method: str,
     ) -> bool:
-        if _similarity(_tokens(obs["content"]), _tokens(exemplar["content"])) >= SIMILARITY_THRESHOLD:
-            return True
-        return observations_semantically_similar(
+        if vectors and observations_semantically_similar(
             obs, exemplar, vectors, embed_method=embed_method
-        )
+        ):
+            return True
+        return _similarity(_tokens(obs["content"]), _tokens(exemplar["content"])) >= SIMILARITY_THRESHOLD
 
     # ── Pass 1: recurrence miner ─────────────────────────────────────────────
     def mine_recurrence(self, repo: str) -> Dict[str, int]:
@@ -358,6 +358,32 @@ class ReconciliationEngine:
         }
 
     # ── Pass 3: invalidation decay ───────────────────────────────────────────
+    def _ingest_git_churn_observations(
+        self,
+        repo: str,
+        snapshot: Optional[GitChurnSnapshot],
+    ) -> int:
+        """Record draft git_churn observations for paths touched outside the editor."""
+        if not snapshot or not snapshot.all_touched:
+            return 0
+
+        created = 0
+        for path in sorted(snapshot.all_touched)[:100]:
+            content = (
+                f"git churn: path '{path}' modified or deleted since last reconcile "
+                f"(HEAD {snapshot.head[:8]})"
+            )
+            self.db.create_observation(
+                repo=repo,
+                event_type="git_churn",
+                content=content,
+                source="git-churn",
+                confidence=0.35,
+                evidence=[{"type": "path", "content": path}],
+            )
+            created += 1
+        return created
+
     def apply_invalidation_decay(self, repo: str) -> Dict[str, int]:
         """Penalize memories tied to deleted files or scopes under heavy churn."""
         workspace = resolve_git_workspace(_workspace_root())
@@ -366,6 +392,7 @@ class ReconciliationEngine:
             workspace,
             since_ref=sync_state.get("last_git_head"),
         )
+        git_observations = self._ingest_git_churn_observations(repo, git_snapshot)
 
         scoped = self._active_scoped_memories(repo)
         edit_obs = self.db.list_observations(
@@ -460,6 +487,7 @@ class ReconciliationEngine:
             "invalidation_missing_file": missing_file,
             "invalidation_churn": churn_decayed,
             "invalidation_git_churn": git_churn_decayed,
+            "git_churn_observations": git_observations,
         }
 
     # ── Pass 4: verification success reinforcement ───────────────────────────

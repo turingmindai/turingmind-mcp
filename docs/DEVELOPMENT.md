@@ -386,8 +386,6 @@ For development, you can use the local source code with the MCP server:
 
 ## References
 
-- [Integration Assessment](INTEGRATION_ASSESSMENT.md)
 - [Testing Guide](TESTING_GUIDE.md)
 - [Compatibility Matrix](COMPATIBILITY_MATRIX.md)
 - [Features Documentation](FEATURES.md)
-- [Review Documentation](REVIEW.md)

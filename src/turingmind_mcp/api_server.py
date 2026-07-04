@@ -5,7 +5,7 @@ import uuid
 import hashlib
 import pathlib
 from typing import List, Optional, Any, Dict
-from fastapi import FastAPI, HTTPException, Body
+from fastapi import FastAPI, HTTPException, Body, Header
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
@@ -633,6 +633,104 @@ def list_observations(
     return {"repo": repo, "total": len(rows), "observations": rows}
 
 
+class MemorySyncPullPayload(BaseModel):
+    repo: str
+
+
+def _verify_ingest_key(x_turingmind_ingest_key: Optional[str]) -> None:
+    """Shared secret for CI/hook ingestion (not a public unauthenticated route)."""
+    expected = os.environ.get("TURINGMIND_INGEST_KEY", "").strip()
+    if not expected:
+        raise HTTPException(
+            status_code=503,
+            detail="TURINGMIND_INGEST_KEY is not configured on this API server.",
+        )
+    if not x_turingmind_ingest_key or x_turingmind_ingest_key != expected:
+        raise HTTPException(status_code=401, detail="Invalid ingest key")
+
+
+@app.post("/api/v2/sync/pull")
+async def pull_memory_sync(payload: MemorySyncPullPayload):
+    """Pull remote memory updates (tombstones + newer rows) and merge locally without pushing."""
+    if not payload.repo:
+        raise HTTPException(status_code=400, detail="repo is required")
+
+    db = _memory_db()
+    api_url = os.environ.get("TURINGMIND_API_URL", "").strip()
+    api_key = os.environ.get("TURINGMIND_API_KEY", "").strip()
+
+    try:
+        from .cloud_memory_client import pull_memories_local, pull_memories_via_cloud_api, use_cloud_sync
+
+        if use_cloud_sync(api_url, api_key):
+            stats, _ = await pull_memories_via_cloud_api(
+                db, payload.repo, api_url=api_url, api_key=api_key
+            )
+        else:
+            stats = pull_memories_local(db, payload.repo)
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("Memory pull failed")
+        raise HTTPException(status_code=500, detail=f"{type(exc).__name__}: {exc}") from exc
+
+    logger.info("Memory pull for %s: %s", payload.repo, stats)
+    return {"status": "pulled", "repo": payload.repo, **stats}
+
+
+class CIObservationPayload(BaseModel):
+    repo: str
+    workflow_name: Optional[str] = None
+    conclusion: str = "failure"
+    check_name: Optional[str] = None
+    run_url: Optional[str] = None
+    head_sha: Optional[str] = None
+    coverage_delta: Optional[float] = None
+
+
+@app.post("/api/v2/observations/ci")
+def ingest_ci_observation(
+    payload: CIObservationPayload,
+    x_turingmind_ingest_key: Optional[str] = Header(None, alias="X-TuringMind-Ingest-Key"),
+):
+    """Ingest CI workflow/check results as high-confidence draft observations."""
+    _verify_ingest_key(x_turingmind_ingest_key)
+    if not payload.repo:
+        raise HTTPException(status_code=400, detail="repo is required")
+
+    conclusion = (payload.conclusion or "failure").lower()
+    if conclusion not in ("failure", "cancelled", "timed_out", "success"):
+        raise HTTPException(status_code=400, detail="unsupported conclusion")
+
+    check = payload.check_name or payload.workflow_name or "ci_check"
+    content = f"CI {check} conclusion={conclusion}"
+    if payload.coverage_delta is not None:
+        content += f" coverage_delta={payload.coverage_delta:+.2f}"
+    if payload.head_sha:
+        content += f" sha={payload.head_sha[:12]}"
+
+    confidence = 0.65 if conclusion != "success" else 0.55
+    evidence = [{"type": "ci", "content": payload.run_url or check}]
+
+    db = _memory_db()
+    obs_id = db.create_observation(
+        repo=payload.repo,
+        event_type="ci_check",
+        content=content,
+        source="ci-webhook",
+        confidence=confidence,
+        evidence=evidence,
+    )
+    return {
+        "status": "recorded",
+        "repo": payload.repo,
+        "observation_id": obs_id,
+        "confidence": confidence,
+    }
+
+
 # ── Reconciliation — deterministic passes over observations + memories ───────
 
 class ReconcilePayload(BaseModel):
@@ -711,6 +809,34 @@ async def _start_background_loops():
         logger.info(f"Reconcile loop started (every {interval_min:g} min)")
     else:
         logger.info("Reconcile loop disabled (TURINGMIND_RECONCILE_INTERVAL_MIN <= 0)")
+
+    pull_interval_min = float(os.environ.get("TURINGMIND_CLOUD_PULL_INTERVAL_MIN", "15"))
+    api_url = os.environ.get("TURINGMIND_API_URL", "").strip()
+    api_key = os.environ.get("TURINGMIND_API_KEY", "").strip()
+    if pull_interval_min > 0:
+        from .cloud_memory_client import pull_memories_local, pull_memories_via_cloud_api, use_cloud_sync
+        from .reconcile import repos_with_activity
+
+        async def cloud_pull_loop():
+            while True:
+                await asyncio.sleep(pull_interval_min * 60)
+                if not use_cloud_sync(api_url, api_key) and not os.environ.get("POSTGRES_URI"):
+                    continue
+                try:
+                    db = _memory_db()
+                    for repo in repos_with_activity(db):
+                        if use_cloud_sync(api_url, api_key):
+                            stats, _ = await pull_memories_via_cloud_api(
+                                db, repo, api_url=api_url, api_key=api_key
+                            )
+                        else:
+                            stats = await asyncio.to_thread(pull_memories_local, db, repo)
+                        logger.info(f"Background memory pull [{repo}]: {stats}")
+                except Exception as exc:
+                    logger.warning(f"Background memory pull cycle failed: {exc}")
+
+        asyncio.create_task(cloud_pull_loop())
+        logger.info(f"Cloud memory pull loop started (every {pull_interval_min:g} min)")
 
     from .chat_observation_poller import start_chat_observation_poller
     await start_chat_observation_poller(_memory_db)

@@ -100,3 +100,80 @@ async def sync_memories_via_cloud_api(
         "cloud_repo_key": body.get("repo_key"),
     }
     return stats, None
+
+
+async def pull_memories_via_cloud_api(
+    db: Any,
+    repo: str,
+    *,
+    api_url: str,
+    api_key: str,
+    timeout: float = 60.0,
+) -> Tuple[Dict[str, Any], Optional[str]]:
+    """Pull-only cloud sync: merge remote rows locally without pushing."""
+    sync_state = db.get_repo_sync_state(repo)
+    since = sync_state.get("last_cloud_pull_at")
+    payload = {"repo": repo, "since": since, "push": []}
+
+    url = f"{api_url.rstrip('/')}/api/v2/memory/cloud/sync"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        response = await client.post(url, json=payload, headers=headers)
+
+    if response.status_code == 403:
+        raise PermissionError("Cloud memory pull denied — check repo access and API key permissions.")
+    if response.status_code == 401:
+        raise PermissionError("Cloud memory pull unauthorized — renew TURINGMIND_API_KEY.")
+    if response.status_code >= 400:
+        detail = response.text[:500]
+        raise RuntimeError(f"Cloud memory pull failed ({response.status_code}): {detail}")
+
+    body = response.json()
+    pulled = body.get("pulled") or []
+    merge_stats = db.apply_cloud_memory_rows(repo, pulled) if pulled else {
+        "memories_applied": 0,
+        "tombstones_applied": 0,
+    }
+
+    last_pull = body.get("last_cloud_pull_at")
+    if last_pull:
+        db.set_repo_sync_state(repo, last_cloud_pull_at=last_pull)
+
+    return stats, None
+
+
+def pull_memories_local(db: Any, repo: str) -> Dict[str, Any]:
+    """Pull-only sync from local Postgres dev hub (no upstream push)."""
+    from datetime import datetime, timezone
+
+    from .v2_engine import postgres as pg
+
+    if not (os.getenv("POSTGRES_URI") and pg.postgres_enabled()):
+        return {
+            "memories_pulled": 0,
+            "memories_applied": 0,
+            "tombstones_applied": 0,
+            "memories_pushed": 0,
+            "via": "none",
+        }
+
+    sync_state = db.get_repo_sync_state(repo)
+    since = sync_state.get("last_cloud_pull_at")
+    pulled = pg.pull_memory_entries(repo, since_iso=since)
+    merge_stats = db.apply_cloud_memory_rows(repo, pulled) if pulled else {
+        "memories_applied": 0,
+        "tombstones_applied": 0,
+    }
+    now_iso = datetime.now(timezone.utc).isoformat()
+    db.set_repo_sync_state(repo, last_cloud_pull_at=now_iso)
+    return {
+        "memories_pulled": len(pulled),
+        "memories_applied": merge_stats.get("memories_applied", 0),
+        "tombstones_applied": merge_stats.get("tombstones_applied", 0),
+        "memories_pushed": 0,
+        "via": "postgres",
+    }

@@ -15,8 +15,8 @@ from .memory_embeddings import (
 )
 
 OBSERVATION_SIMILARITY_THRESHOLDS: Dict[str, float] = {
-    HASH_BOW_METHOD: 0.78,
-    AZURE_TE3_SMALL_METHOD: 0.88,
+    HASH_BOW_METHOD: 0.82,
+    AZURE_TE3_SMALL_METHOD: 0.85,
 }
 
 

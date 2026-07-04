@@ -408,7 +408,6 @@ MIT — see [LICENSE](LICENSE) for details.
 ### Developer Documentation
 - **[Development Guide](docs/DEVELOPMENT.md)** - Architecture and implementation
 - **[Testing Guide](docs/TESTING_GUIDE.md)** - Testing documentation
-- **[Code Review](docs/REVIEW.md)** - Review findings and fixes
 
 See [Documentation Index](docs/README.md) for complete documentation structure.
 
