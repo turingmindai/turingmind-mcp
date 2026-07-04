@@ -215,7 +215,23 @@ def get_decision_queue(repo: str, limit: int = 20):
                 prune_gaps.extend(scanner.prune_rules())
             _prune_cache = (now, prune_gaps)
         gaps.extend(_prune_cache[1])
-        
+
+        # Merge pending reconciliation findings (promotion candidates,
+        # conflicts, stale memories, ungoverned files) so the engine's
+        # proposals surface where humans and agents already look.
+        try:
+            for f in _memory_db().list_findings(repo=repo, status="pending", limit=50):
+                gaps.append({
+                    "gap_type": f["finding_type"],
+                    "severity": f["severity"],
+                    "node_id": f.get("node_id"),
+                    "memory_id": f.get("memory_id"),
+                    "finding_id": f["finding_id"],
+                    "action": f["action"],
+                })
+        except Exception as e:
+            logger.warning(f"Reconcile findings merge failed (non-fatal): {e}")
+
         # Sort by severity (critical first)
         gaps.sort(key=lambda g: SEVERITY_ORDER.get(g.get("severity", "low"), 99))
         return {
@@ -566,6 +582,71 @@ def list_observations(
         logger.exception("Observation list failed")
         raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
     return {"repo": repo, "total": len(rows), "observations": rows}
+
+
+# ── Reconciliation — deterministic passes over observations + memories ───────
+
+class ReconcilePayload(BaseModel):
+    repo: str
+
+
+@app.post("/api/v2/reconcile")
+def run_reconciliation(payload: ReconcilePayload):
+    """Run all deterministic reconciliation passes for a repo. Idempotent:
+    findings dedup, observations only promote once, decay is time-derived."""
+    if not payload.repo:
+        raise HTTPException(status_code=400, detail="repo is required")
+    from .reconcile import reconcile_repo
+    try:
+        stats = reconcile_repo(_memory_db(), payload.repo)
+    except Exception as e:
+        logger.exception("Reconciliation failed")
+        raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
+    return {"status": "reconciled", **stats}
+
+
+class ResolveFindingPayload(BaseModel):
+    status: str  # actioned | dismissed
+
+
+@app.post("/api/v2/reconcile/findings/{finding_id}/resolve")
+def resolve_finding(finding_id: str, payload: ResolveFindingPayload):
+    """Clear a reconciliation finding off the decision queue."""
+    try:
+        ok = _memory_db().resolve_finding(finding_id, payload.status)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    if not ok:
+        raise HTTPException(status_code=404, detail=f"Finding not found: {finding_id}")
+    return {"status": payload.status, "finding_id": finding_id}
+
+
+@app.on_event("startup")
+async def _start_reconcile_loop():
+    """Background reconciliation: every N minutes, run the passes for every
+    repo with activity. The server is launchd-supervised, so this loop is the
+    'always running' half of the reconciliation design."""
+    import asyncio
+
+    interval_min = float(os.environ.get("TURINGMIND_RECONCILE_INTERVAL_MIN", "30"))
+    if interval_min <= 0:
+        logger.info("Reconcile loop disabled (TURINGMIND_RECONCILE_INTERVAL_MIN <= 0)")
+        return
+
+    async def loop():
+        from .reconcile import reconcile_repo, repos_with_activity
+        while True:
+            await asyncio.sleep(interval_min * 60)
+            try:
+                db = _memory_db()
+                for repo in repos_with_activity(db):
+                    stats = await asyncio.to_thread(reconcile_repo, db, repo)
+                    logger.info(f"Background reconcile [{repo}]: {stats}")
+            except Exception as e:
+                logger.warning(f"Background reconcile cycle failed: {e}")
+
+    asyncio.create_task(loop())
+    logger.info(f"Reconcile loop started (every {interval_min:g} min)")
 
 
 @app.post("/api/v2/graph/nodes")

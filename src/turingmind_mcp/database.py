@@ -263,8 +263,45 @@ class MemoryDatabase:
             )
         """)
 
+        # Reconciliation findings — actionable proposals produced by the
+        # deterministic passes (promotion candidates, stale memories,
+        # conflicts, ungoverned files). Surfaced through the decision queue;
+        # dedup_key prevents the same proposal from piling up every cycle.
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS reconcile_findings (
+                finding_id TEXT PRIMARY KEY,
+                repo TEXT NOT NULL,
+                finding_type TEXT NOT NULL,
+                severity TEXT NOT NULL DEFAULT 'medium',
+                action TEXT NOT NULL,
+                evidence TEXT,
+                memory_id TEXT,
+                node_id TEXT,
+                status TEXT NOT NULL DEFAULT 'pending',
+                dedup_key TEXT NOT NULL,
+                run_id TEXT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                resolved_at DATETIME,
+                UNIQUE(repo, dedup_key)
+            )
+        """)
+
+        # Reconciliation run stats — the gradient observability counter:
+        # a clogged promotion funnel and a healthy one look different here.
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS reconcile_runs (
+                run_id TEXT PRIMARY KEY,
+                repo TEXT NOT NULL,
+                stats TEXT NOT NULL,
+                started_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                finished_at DATETIME
+            )
+        """)
+
         # Create indexes
         indexes = [
+            "CREATE INDEX IF NOT EXISTS idx_findings_repo_status ON reconcile_findings(repo, status)",
+            "CREATE INDEX IF NOT EXISTS idx_reconcile_runs_repo ON reconcile_runs(repo, started_at)",
             "CREATE INDEX IF NOT EXISTS idx_observations_repo_status ON observations(repo, status)",
             "CREATE INDEX IF NOT EXISTS idx_observations_repo_event ON observations(repo, event_type)",
             "CREATE INDEX IF NOT EXISTS idx_memory_repo_type ON memory_entries(repo, type)",
@@ -652,6 +689,103 @@ class MemoryDatabase:
         )
         self.conn.commit()
         return cursor.rowcount > 0
+
+    # Reconciliation Findings / Runs
+    def create_finding(
+        self,
+        repo: str,
+        finding_type: str,
+        severity: str,
+        action: str,
+        dedup_key: str,
+        evidence: Optional[List[Dict[str, Any]]] = None,
+        memory_id: Optional[str] = None,
+        node_id: Optional[str] = None,
+        run_id: Optional[str] = None,
+    ) -> Optional[str]:
+        """Record a reconciliation finding. Returns None when a pending finding
+        with the same dedup_key already exists (proposal already on the queue)."""
+        finding_id = str(uuid.uuid4())
+        cursor = self.conn.cursor()
+        cursor.execute(
+            """
+            INSERT OR IGNORE INTO reconcile_findings (
+                finding_id, repo, finding_type, severity, action,
+                evidence, memory_id, node_id, dedup_key, run_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                finding_id,
+                repo,
+                finding_type,
+                severity,
+                action,
+                json.dumps(evidence) if evidence else None,
+                memory_id,
+                node_id,
+                dedup_key,
+                run_id,
+            ),
+        )
+        self.conn.commit()
+        return finding_id if cursor.rowcount > 0 else None
+
+    def list_findings(
+        self,
+        repo: str,
+        status: Optional[str] = "pending",
+        limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        """List reconciliation findings, pending (queue-visible) by default."""
+        cursor = self.conn.cursor()
+        query = "SELECT * FROM reconcile_findings WHERE repo = ?"
+        params: List[Any] = [repo]
+        if status and status != "all":
+            query += " AND status = ?"
+            params.append(status)
+        query += " ORDER BY created_at DESC LIMIT ?"
+        params.append(limit)
+        cursor.execute(query, params)
+        results = []
+        for row in cursor.fetchall():
+            result = dict(row)
+            if result.get("evidence"):
+                try:
+                    result["evidence"] = json.loads(result["evidence"])
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            results.append(result)
+        return results
+
+    def resolve_finding(self, finding_id: str, status: str) -> bool:
+        """Mark a finding actioned or dismissed."""
+        if status not in ("actioned", "dismissed"):
+            raise ValueError(f"Invalid finding status: {status}")
+        cursor = self.conn.cursor()
+        cursor.execute(
+            """
+            UPDATE reconcile_findings
+            SET status = ?, resolved_at = CURRENT_TIMESTAMP
+            WHERE finding_id = ?
+            """,
+            (status, finding_id),
+        )
+        self.conn.commit()
+        return cursor.rowcount > 0
+
+    def record_reconcile_run(self, repo: str, stats: Dict[str, Any]) -> str:
+        """Persist per-cycle reconciliation stats (gradient observability)."""
+        run_id = str(uuid.uuid4())
+        cursor = self.conn.cursor()
+        cursor.execute(
+            """
+            INSERT INTO reconcile_runs (run_id, repo, stats, finished_at)
+            VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+            """,
+            (run_id, repo, json.dumps(stats)),
+        )
+        self.conn.commit()
+        return run_id
 
     def update_memory_entry(
         self,
