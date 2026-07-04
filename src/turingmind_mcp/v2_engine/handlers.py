@@ -63,6 +63,19 @@ def _now() -> str:
     return datetime.datetime.now(datetime.timezone.utc).isoformat()
 
 
+# Lazy singleton for the legacy memory store — used to persist failure
+# knowledge and enrich spec status with recalled memories.
+_memory_db_instance = None
+
+
+def _get_memory_db():
+    global _memory_db_instance
+    if _memory_db_instance is None:
+        from turingmind_mcp.database import MemoryDatabase
+        _memory_db_instance = MemoryDatabase()
+    return _memory_db_instance
+
+
 # =============================================================================
 # CLOUD BACKUP
 # =============================================================================
@@ -242,6 +255,33 @@ async def handle_get_spec_status(args: dict, ctx: ToolContext) -> list[TextConte
     if not node:
         return _err(f"SpecNode '{node_id}' not found")
 
+    # Recall memories linked to this node (failure history, decisions) plus
+    # top relevant memories matched against the node title.
+    related_memories: list[dict] = []
+    try:
+        mem_db = _get_memory_db()
+        seen: set[str] = set()
+        with mem_db.transaction() as cursor:
+            cursor.execute(
+                "SELECT memory_id, type, content, confidence FROM memory_entries "
+                "WHERE node_id = ? AND status = 'active' ORDER BY updated_at DESC LIMIT 5",
+                (node_id,),
+            )
+            for row in cursor.fetchall():
+                seen.add(row[0])
+                related_memories.append(
+                    {"memory_id": row[0], "type": row[1], "content": row[2],
+                     "confidence": row[3], "link": "node"}
+                )
+        for e in mem_db.list_memory_entries(node.repo, status="active", search=node.title, limit=3):
+            if e["memory_id"] not in seen:
+                related_memories.append(
+                    {"memory_id": e["memory_id"], "type": e["type"], "content": e["content"],
+                     "confidence": e["confidence"], "link": "relevance"}
+                )
+    except Exception:
+        pass  # memory recall is best-effort; spec status must not fail on it
+
     return _ok({
         "node_id": node_id,
         "title": node.title,
@@ -253,6 +293,7 @@ async def handle_get_spec_status(args: dict, ctx: ToolContext) -> list[TextConte
         "failure_classification": node.state.failure_classification.value if node.state.failure_classification else None,
         "dependencies": node.dependencies,
         "dependents": node.dependents,
+        "related_memories": related_memories,
     })
 
 
@@ -723,6 +764,25 @@ async def handle_classify_failure(args: dict, ctx: ToolContext) -> list[TextCont
         "classification": classification.value,
         "escalation_action": escalation_map[classification],
     }
+
+    # Failure becomes durable memory: future agents touching these files or
+    # querying this node recall what broke and how it was classified.
+    try:
+        scope = node.implementation.files[0] if node.implementation.files else "repo"
+        memory_id = _get_memory_db().create_memory_entry(
+            repo=node.repo,
+            memory_type="learned_pattern",
+            content=(
+                f"Verification failure on '{node.title}' classified as "
+                f"{classification.value}. {failure_trace[:400] if failure_trace else 'No trace provided.'}"
+            ),
+            scope=scope,
+            confidence=0.7,
+            node_id=node_id,
+        )
+        response["memory_id"] = memory_id
+    except Exception:
+        pass  # memory persistence is best-effort; classification must not fail
 
     # Only cascade if this is a fresh failure (not already in FAILED state)
     if not was_already_failed:

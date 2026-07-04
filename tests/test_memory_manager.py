@@ -87,23 +87,28 @@ class TestMemoryManager(unittest.TestCase):
 
     def test_detect_conflicts(self):
         """Test conflict detection."""
-        # Create conflicting entries
-        memory_id_1 = self.manager.create_explicit_rule(
+        # Create conflicting entries (create_explicit_rule returns a dict)
+        result_1 = self.manager.create_explicit_rule(
             repo="test/repo",
             content="Always use async/await",
             scope="repo",
         )
 
-        memory_id_2 = self.manager.create_explicit_rule(
+        result_2 = self.manager.create_explicit_rule(
             repo="test/repo",
             content="Never use async/await",
             scope="repo",
         )
 
         # Detect conflicts
-        conflicts = self.manager.detect_conflicts("test/repo", memory_id_2)
+        conflicts = self.manager.detect_conflicts("test/repo", result_2["memory_id"])
         self.assertGreater(len(conflicts), 0)
         self.assertEqual(conflicts[0]["type"], "contradiction")
+
+        # Conflicts flag but never disable: both entries must stay active
+        for result in (result_1, result_2):
+            entry = self.db.get_memory_entry(result["memory_id"])
+            self.assertEqual(entry["status"], "active")
 
     def test_get_relevant_memory(self):
         """Test getting relevant memory for files."""

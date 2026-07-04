@@ -1,5 +1,6 @@
 import logging
 import datetime
+import os
 import uuid
 import hashlib
 import pathlib
@@ -328,6 +329,19 @@ def capture_intent(payload: IntentPayload):
 
     log_path.write_text(_json.dumps(existing, indent=2))
 
+    # Captured intent doubles as ephemeral memory: agents recalling context for
+    # this repo should see what was recently planned, without reading log files.
+    try:
+        _memory_manager().create_session_context(
+            repo=payload.repo,
+            content=f"Plan intent from {payload.source_file}: "
+            + "; ".join(r.text for r in payload.records[:20]),
+            scope="repo",
+            evidence=[{"type": "intent", "content": payload.source_file}],
+        )
+    except Exception as e:
+        logger.warning(f"Intent memory write failed (non-fatal): {e}")
+
     logger.info(f"Captured {len(payload.records)} intent records from {payload.source_file} for {payload.repo}")
     return {
         "status": "captured",
@@ -336,6 +350,153 @@ def capture_intent(payload: IntentPayload):
         "source_file": payload.source_file,
         "timestamp": timestamp,
         "content_hash": content_hash,
+    }
+
+
+# ── Memory endpoints — REST surface over the legacy memory store ─────────────
+# Lets hooks (Cursor afterFileEdit, Antigravity pre-push) and the CLI write and
+# recall memories without speaking MCP stdio.
+
+_memory_db_instance = None
+_memory_manager_instance = None
+
+
+def _memory_db():
+    global _memory_db_instance
+    if _memory_db_instance is None:
+        from .database import MemoryDatabase
+        _memory_db_instance = MemoryDatabase()
+    return _memory_db_instance
+
+
+def _memory_manager():
+    global _memory_manager_instance
+    if _memory_manager_instance is None:
+        from .memory_manager import MemoryManager
+        _memory_manager_instance = MemoryManager(_memory_db())
+    return _memory_manager_instance
+
+
+class MemorySavePayload(BaseModel):
+    repo: str
+    type: str                       # learned_pattern | session_context | explicit_rule
+    content: str
+    scope: str = "repo"
+    confidence: float = 0.7
+    node_id: Optional[str] = None   # optional SpecNode link
+    evidence: list[dict] = []
+    ttl_hours: Optional[int] = None # session_context expiry (default 24h)
+
+
+@app.post("/api/v2/memory")
+def save_memory(payload: MemorySavePayload):
+    """Save a memory entry. learned_pattern saves are reinforcing: an existing
+    pattern with the same content/scope gains confidence instead of duplicating."""
+    if not payload.repo or not payload.content or not payload.type:
+        raise HTTPException(status_code=400, detail="repo, type, and content are required")
+
+    db = _memory_db()
+    manager = _memory_manager()
+    reason = "; ".join(
+        str(e.get("content", "")) for e in payload.evidence if e.get("content")
+    ) or None
+
+    try:
+        if payload.type == "learned_pattern":
+            memory_id = manager.learn_pattern_from_feedback(
+                repo=payload.repo,
+                pattern=payload.content,
+                file_path=None if payload.scope == "repo" else payload.scope,
+                reason=reason,
+            )
+        elif payload.type == "session_context":
+            memory_id = manager.create_session_context(
+                repo=payload.repo,
+                content=payload.content,
+                scope=payload.scope,
+                evidence=payload.evidence,
+                expires_in_hours=payload.ttl_hours or 24,
+            )
+        else:
+            memory_id = db.create_memory_entry(
+                repo=payload.repo,
+                memory_type=payload.type,
+                content=payload.content,
+                scope=payload.scope,
+                confidence=payload.confidence,
+                node_id=payload.node_id,
+            )
+            for ev in payload.evidence:
+                db.add_evidence(
+                    memory_id=memory_id,
+                    evidence_type=ev.get("type", "manual"),
+                    content=ev.get("content", ""),
+                    file_path=ev.get("file"),
+                    line_number=ev.get("line"),
+                )
+    except Exception as e:
+        logger.exception("Memory save failed")
+        raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
+
+    if payload.node_id and payload.type in ("learned_pattern", "session_context"):
+        # Manager paths don't take node_id — link after the fact.
+        try:
+            with db.transaction() as cursor:
+                cursor.execute(
+                    "UPDATE memory_entries SET node_id = ? WHERE memory_id = ?",
+                    (payload.node_id, memory_id),
+                )
+        except Exception as e:
+            logger.warning(f"Memory node link failed (non-fatal): {e}")
+
+    return {"status": "saved", "memory_id": memory_id, "type": payload.type, "repo": payload.repo}
+
+
+@app.get("/api/v2/memory")
+def list_memory(
+    repo: str,
+    search: Optional[str] = None,
+    type: Optional[str] = None,
+    status: str = "active",
+    scope: Optional[str] = None,
+    limit: int = 20,
+    page: int = 1,
+):
+    """Recall memories, ranked by FTS relevance x confidence when `search` is given."""
+    if not repo:
+        raise HTTPException(status_code=400, detail="repo is required")
+    try:
+        entries = _memory_db().list_memory_entries(
+            repo=repo,
+            memory_type=type,
+            status=status,
+            scope=scope,
+            page=page,
+            limit=limit,
+            search=search,
+        )
+    except Exception as e:
+        logger.exception("Memory list failed")
+        # `type` is shadowed by the query parameter
+        raise HTTPException(status_code=500, detail=f"{e.__class__.__name__}: {e}")
+
+    return {
+        "repo": repo,
+        "total": len(entries),
+        "entries": [
+            {
+                "memory_id": e["memory_id"],
+                "type": e["type"],
+                "status": e["status"],
+                "content": e["content"],
+                "scope": e["scope"],
+                "confidence": e["confidence"],
+                "node_id": e.get("node_id"),
+                "created_at": e.get("created_at"),
+                "expires_at": e.get("expires_at"),
+            }
+            for e in entries
+        ],
     }
 
 
@@ -913,4 +1074,8 @@ def get_node_blueprint(node_id: str):
 
 
 if __name__ == "__main__":
-    uvicorn.run("turingmind_mcp.api_server:app", host="127.0.0.1", port=8000, reload=True)
+    # 8477 = "TM" in ASCII (T=84, M=77). Deliberately uncommon so the server
+    # never collides with dev servers, Docker forwards, or the RepoChat
+    # backend that owns 8000 on this machine.
+    port = int(os.environ.get("TURINGMIND_API_PORT", "8477"))
+    uvicorn.run("turingmind_mcp.api_server:app", host="127.0.0.1", port=port, reload=True)

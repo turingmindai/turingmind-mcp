@@ -96,6 +96,9 @@ AUTH_FREE_TOOLS = {
     "turingmind_get_memory",
     "turingmind_save_memory",
     "turingmind_list_memory",
+    "turingmind_delete_memory",
+    "turingmind_detect_conflicts",
+    "turingmind_resolve_conflict",
     "turingmind_get_audit_trail",
     "turingmind_validate_auth",
     # v2 Engine (Local constraint graph operations)

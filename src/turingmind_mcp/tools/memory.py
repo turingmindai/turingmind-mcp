@@ -13,9 +13,11 @@ def register(registry: dict) -> None:
     registry["turingmind_list_memory"] = handle_list_memory
     registry["turingmind_get_memory"] = handle_get_memory
     registry["turingmind_save_memory"] = handle_save_memory
-    # NOTE: delete_memory, detect_conflicts, resolve_conflict, simulate_impact,
-    # explain_decision, get_memory_stats are intentionally NOT registered.
-    # They have no v2 tool definitions and are not exposed to agents.
+    registry["turingmind_delete_memory"] = handle_delete_memory
+    registry["turingmind_detect_conflicts"] = handle_detect_conflicts
+    registry["turingmind_resolve_conflict"] = handle_resolve_conflict
+    # NOTE: simulate_impact, explain_decision, get_memory_stats remain
+    # unregistered — no v2 tool definitions, not exposed to agents.
 
 
 async def handle_list_memory(arguments: dict, ctx: ToolContext) -> list[TextContent]:
@@ -47,19 +49,29 @@ async def handle_list_memory(arguments: dict, ctx: ToolContext) -> list[TextCont
                 e for e in entries
                 if e.get("security_tags") and security_tag in e.get("security_tags", [])
             ]
-        return [
-            TextContent(
-                type="text",
-                text=(
-                    f"📚 **Memory Entries ({len(entries)})**\n\n"
-                    + "\n".join(
-                        f"- **{e['type']}** [{e['status']}]: {e['content'][:60]}... "
-                        f"(scope: {e['scope']}, confidence: {e['confidence']:.2f})"
-                        for e in entries[:20]
-                    )
-                ),
-            )
-        ]
+        # Machine-parseable JSON: agents need memory_id to round-trip into
+        # get_memory / save_memory, and full content to act on the entry.
+        payload = {
+            "total": len(entries),
+            "page": page,
+            "limit": limit,
+            "entries": [
+                {
+                    "memory_id": e["memory_id"],
+                    "type": e["type"],
+                    "status": e["status"],
+                    "content": e["content"],
+                    "scope": e["scope"],
+                    "confidence": e["confidence"],
+                    "security_tags": e.get("security_tags") or [],
+                    "created_at": e.get("created_at"),
+                    "updated_at": e.get("updated_at"),
+                    "expires_at": e.get("expires_at"),
+                }
+                for e in entries
+            ],
+        }
+        return [TextContent(type="text", text=json.dumps(payload, indent=2))]
     except Exception as e:
         ctx.logger.exception("List memory failed")
         return [TextContent(type="text", text=f"❌ **Failed:** {type(e).__name__}: {e}")]
@@ -82,25 +94,29 @@ async def handle_get_memory(arguments: dict, ctx: ToolContext) -> list[TextConte
                 TextContent(type="text", text=f"❌ **Memory entry not found:** `{memory_id}`")
             ]
         evidence = db.get_evidence(memory_id)
-        return [
-            TextContent(
-                type="text",
-                text=(
-                    f"📖 **Memory Entry Details**\n\n"
-                    f"- **ID:** {memory_id}\n"
-                    f"- **Type:** {entry['type']}\n"
-                    f"- **Content:** {entry['content']}\n"
-                    f"- **Scope:** {entry['scope']}\n"
-                    f"- **Confidence:** {entry['confidence']:.2f}\n"
-                    f"- **Status:** {entry['status']}\n"
-                    f"- **Evidence:** {len(evidence)} items\n"
-                    + "\n".join(
-                        f"  - {e['evidence_type']}: {e['content'][:50]}..."
-                        for e in evidence[:5]
-                    )
-                ),
-            )
-        ]
+        payload = {
+            "memory_id": memory_id,
+            "type": entry["type"],
+            "status": entry["status"],
+            "content": entry["content"],
+            "scope": entry["scope"],
+            "confidence": entry["confidence"],
+            "security_tags": entry.get("security_tags") or [],
+            "yaml_definition": entry.get("yaml_definition"),
+            "created_at": entry.get("created_at"),
+            "updated_at": entry.get("updated_at"),
+            "expires_at": entry.get("expires_at"),
+            "evidence": [
+                {
+                    "evidence_type": e["evidence_type"],
+                    "content": e["content"],
+                    "file_path": e.get("file_path"),
+                    "line_number": e.get("line_number"),
+                }
+                for e in evidence
+            ],
+        }
+        return [TextContent(type="text", text=json.dumps(payload, indent=2))]
     except Exception as e:
         ctx.logger.exception("Get memory failed")
         return [TextContent(type="text", text=f"❌ **Failed:** {type(e).__name__}: {e}")]
@@ -164,6 +180,7 @@ async def handle_save_memory(arguments: dict, ctx: ToolContext) -> list[TextCont
                     confidence=arguments.get("confidence", 0.8),
                     security_tags=arguments.get("security_tags"),
                     yaml_definition=arguments.get("yaml_definition"),
+                    node_id=arguments.get("node_id"),
                 )
         if arguments.get("evidence"):
             for ev in arguments["evidence"]:
@@ -174,18 +191,14 @@ async def handle_save_memory(arguments: dict, ctx: ToolContext) -> list[TextCont
                     file_path=ev.get("file"),
                     line_number=ev.get("line"),
                 )
-        return [
-            TextContent(
-                type="text",
-                text=(
-                    f"✅ **Memory Entry Saved**\n\n"
-                    f"- **ID:** {memory_id}\n"
-                    f"- **Type:** {memory_type}\n"
-                    f"- **Content:** {content[:100]}...\n"
-                    f"- **Scope:** {scope}"
-                ),
-            )
-        ]
+        payload = {
+            "status": "saved",
+            "memory_id": memory_id,
+            "type": memory_type,
+            "content": content,
+            "scope": scope,
+        }
+        return [TextContent(type="text", text=json.dumps(payload, indent=2))]
     except Exception as e:
         ctx.logger.exception("Save memory failed")
         return [TextContent(type="text", text=f"❌ **Failed:** {type(e).__name__}: {e}")]

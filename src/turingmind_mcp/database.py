@@ -68,9 +68,20 @@ class MemoryDatabase:
         
         # Enable foreign key constraints
         self.conn.execute("PRAGMA foreign_keys = ON")
-        
+        # WAL allows concurrent readers (stdio MCP server, REST API, bridge)
+        # against the same database file without SQLITE_BUSY storms.
+        self.conn.execute("PRAGMA journal_mode = WAL")
+
         self._initialize_schema()
-        
+
+        # Expired session context should never surface as active memory
+        try:
+            expired = self.cleanup_expired_context()
+            if expired:
+                logger.info(f"Deprecated {expired} expired session context entries")
+        except Exception as e:
+            logger.warning(f"Expired-context cleanup failed: {e}")
+
         # Register this instance for cleanup
         _db_instances.append(self)
 
@@ -93,9 +104,18 @@ class MemoryDatabase:
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                 updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                 expires_at DATETIME,
-                created_by TEXT
+                created_by TEXT,
+                node_id TEXT
             )
         """)
+
+        # Migration: add node_id link to SpecNodes for databases created
+        # before the column existed.
+        existing_cols = {
+            row[1] for row in cursor.execute("PRAGMA table_info(memory_entries)").fetchall()
+        }
+        if "node_id" not in existing_cols:
+            cursor.execute("ALTER TABLE memory_entries ADD COLUMN node_id TEXT")
 
         # Evidence Table
         cursor.execute("""
@@ -245,7 +265,66 @@ class MemoryDatabase:
             cursor.execute(index_sql)
 
         self.conn.commit()
+        self._fts_enabled = self._initialize_fts()
         logger.info(f"Database schema initialized at {self.db_path}")
+
+    def _initialize_fts(self) -> bool:
+        """Create the FTS5 full-text index over memory content.
+
+        Uses an external-content FTS5 table kept in sync with `memory_entries`
+        via triggers. Returns False when the sqlite build lacks FTS5, in which
+        case search falls back to LIKE.
+        """
+        try:
+            cursor = self.conn.cursor()
+            existed = cursor.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'memory_fts'"
+            ).fetchone()
+
+            cursor.execute("""
+                CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
+                    content,
+                    content='memory_entries',
+                    content_rowid='rowid'
+                )
+            """)
+            cursor.execute("""
+                CREATE TRIGGER IF NOT EXISTS memory_fts_ai AFTER INSERT ON memory_entries BEGIN
+                    INSERT INTO memory_fts(rowid, content) VALUES (new.rowid, new.content);
+                END
+            """)
+            cursor.execute("""
+                CREATE TRIGGER IF NOT EXISTS memory_fts_ad AFTER DELETE ON memory_entries BEGIN
+                    INSERT INTO memory_fts(memory_fts, rowid, content) VALUES ('delete', old.rowid, old.content);
+                END
+            """)
+            cursor.execute("""
+                CREATE TRIGGER IF NOT EXISTS memory_fts_au AFTER UPDATE OF content ON memory_entries BEGIN
+                    INSERT INTO memory_fts(memory_fts, rowid, content) VALUES ('delete', old.rowid, old.content);
+                    INSERT INTO memory_fts(rowid, content) VALUES (new.rowid, new.content);
+                END
+            """)
+
+            # Backfill entries created before the FTS table existed
+            if not existed:
+                cursor.execute("INSERT INTO memory_fts(memory_fts) VALUES ('rebuild')")
+
+            self.conn.commit()
+            return True
+        except sqlite3.OperationalError as e:
+            logger.warning(f"FTS5 unavailable, memory search falls back to LIKE: {e}")
+            self.conn.rollback()
+            return False
+
+    @staticmethod
+    def _fts_query(search: str) -> str:
+        """Convert a free-text search string into a safe FTS5 MATCH query.
+
+        Each whitespace token is double-quoted so user input can't inject
+        FTS syntax; tokens are OR-ed for recall over precision.
+        """
+        tokens = [t.replace('"', '""') for t in search.split() if t.strip()]
+        return " OR ".join(f'"{t}"' for t in tokens)
 
     def close(self):
         """Close database connection."""
@@ -290,8 +369,9 @@ class MemoryDatabase:
         yaml_definition: Optional[str] = None,
         expires_at: Optional[datetime] = None,
         created_by: Optional[str] = None,
+        node_id: Optional[str] = None,
     ) -> str:
-        """Create a new memory entry."""
+        """Create a new memory entry, optionally linked to a SpecNode."""
         memory_id = str(uuid.uuid4())
         security_tags_json = json.dumps(security_tags) if security_tags else None
         
@@ -303,8 +383,8 @@ class MemoryDatabase:
             """
             INSERT INTO memory_entries (
                 memory_id, repo, type, content, scope, confidence,
-                status, security_tags, yaml_definition, expires_at, created_by
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                status, security_tags, yaml_definition, expires_at, created_by, node_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 memory_id,
@@ -318,6 +398,7 @@ class MemoryDatabase:
                 yaml_definition,
                 expires_at.isoformat() if expires_at else None,
                 created_by,
+                node_id,
             ),
         )
         self.conn.commit()
@@ -346,33 +427,66 @@ class MemoryDatabase:
         limit: int = 50,
         search: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
-        """List memory entries with filtering."""
+        """List memory entries with filtering.
+
+        When `search` is given and FTS5 is available, results are matched via
+        full-text search and ranked by BM25 relevance weighted by confidence.
+        Otherwise falls back to a LIKE substring match ordered by recency.
+        """
         cursor = self.conn.cursor()
         offset = (page - 1) * limit
 
-        query = "SELECT * FROM memory_entries WHERE repo = ?"
-        params = [repo]
+        use_fts = bool(search) and getattr(self, "_fts_enabled", False)
+
+        if use_fts:
+            query = """
+                SELECT m.* FROM memory_entries m
+                JOIN memory_fts f ON f.rowid = m.rowid
+                WHERE memory_fts MATCH ? AND m.repo = ?
+            """
+            params: List[Any] = [self._fts_query(search), repo]
+        else:
+            query = "SELECT * FROM memory_entries WHERE repo = ?"
+            params = [repo]
+
+        prefix = "m." if use_fts else ""
 
         if memory_type and memory_type != "all":
-            query += " AND type = ?"
+            query += f" AND {prefix}type = ?"
             params.append(memory_type)
 
         if status and status != "all":
-            query += " AND status = ?"
+            query += f" AND {prefix}status = ?"
             params.append(status)
 
         if scope:
-            query += " AND (scope = ? OR scope = 'repo')"
+            query += f" AND ({prefix}scope = ? OR {prefix}scope = 'repo')"
             params.append(scope)
 
-        if search:
-            query += " AND content LIKE ?"
-            params.append(f"%{search}%")
+        if status == "active":
+            query += f" AND ({prefix}expires_at IS NULL OR {prefix}expires_at > datetime('now'))"
 
-        query += " ORDER BY created_at DESC LIMIT ? OFFSET ?"
+        if use_fts:
+            # bm25() is lower-is-better; dividing by confidence promotes
+            # trusted memories without letting low-relevance ones win.
+            query += " ORDER BY bm25(memory_fts) / MAX(m.confidence, 0.05) ASC LIMIT ? OFFSET ?"
+        else:
+            if search:
+                query += " AND content LIKE ?"
+                params.append(f"%{search}%")
+            query += " ORDER BY created_at DESC LIMIT ? OFFSET ?"
         params.extend([limit, offset])
 
-        cursor.execute(query, params)
+        try:
+            cursor.execute(query, params)
+        except sqlite3.OperationalError:
+            if not use_fts:
+                raise
+            # Malformed FTS query — degrade to LIKE rather than failing the tool
+            logger.warning(f"FTS query failed for {search!r}; falling back to LIKE")
+            return self._list_memory_entries_like(
+                repo, memory_type, status, scope, page, limit, search
+            )
         rows = cursor.fetchall()
 
         results = []
@@ -382,6 +496,45 @@ class MemoryDatabase:
                 result["security_tags"] = json.loads(result["security_tags"])
             results.append(result)
 
+        return results
+
+    def _list_memory_entries_like(
+        self,
+        repo: str,
+        memory_type: Optional[str],
+        status: Optional[str],
+        scope: Optional[str],
+        page: int,
+        limit: int,
+        search: Optional[str],
+    ) -> List[Dict[str, Any]]:
+        """LIKE-based fallback used when an FTS MATCH query is malformed."""
+        cursor = self.conn.cursor()
+        query = "SELECT * FROM memory_entries WHERE repo = ?"
+        params: List[Any] = [repo]
+        if memory_type and memory_type != "all":
+            query += " AND type = ?"
+            params.append(memory_type)
+        if status and status != "all":
+            query += " AND status = ?"
+            params.append(status)
+        if scope:
+            query += " AND (scope = ? OR scope = 'repo')"
+            params.append(scope)
+        if status == "active":
+            query += " AND (expires_at IS NULL OR expires_at > datetime('now'))"
+        if search:
+            query += " AND content LIKE ?"
+            params.append(f"%{search}%")
+        query += " ORDER BY created_at DESC LIMIT ? OFFSET ?"
+        params.extend([limit, (page - 1) * limit])
+        cursor.execute(query, params)
+        results = []
+        for row in cursor.fetchall():
+            result = dict(row)
+            if result.get("security_tags"):
+                result["security_tags"] = json.loads(result["security_tags"])
+            results.append(result)
         return results
 
     def update_memory_entry(

@@ -122,19 +122,25 @@ class MemoryManager:
     def _find_existing_pattern(
         self, repo: str, pattern: str, file_path: Optional[str]
     ) -> Optional[Dict[str, Any]]:
-        """Find existing pattern."""
+        """Find an existing pattern with the same content.
+
+        Prefers an exact scope match, but falls back to any scope: the same
+        pattern seen in a different file is evidence it generalizes, and
+        should reinforce the existing entry rather than duplicate it.
+        """
         patterns = self.db.list_memory_entries(
             repo, memory_type="learned_pattern", status="active"
         )
+        fallback = None
         for p in patterns:
-            if p["content"] == pattern:
-                if file_path:
-                    if p["scope"] == file_path or p["scope"] == "repo":
-                        return p
-                else:
-                    if p["scope"] == "repo":
-                        return p
-        return None
+            if p["content"] != pattern:
+                continue
+            target_scope = file_path or "repo"
+            if p["scope"] == target_scope or p["scope"] == "repo":
+                return p
+            if fallback is None:
+                fallback = p
+        return fallback
 
     def get_learned_patterns(self, repo: str, status: str = "active") -> List[Dict[str, Any]]:
         """Get learned patterns."""
@@ -359,9 +365,10 @@ class MemoryManager:
                     description=conflict_type["description"],
                 )
 
-                # Mark entries as conflicting
-                self.db.update_memory_entry(new_memory_id, status="conflict")
-                self.db.update_memory_entry(candidate["memory_id"], status="conflict")
+                # Flag only — never change entry status here. The heuristic has
+                # false positives, and auto-disabling would silently remove a
+                # valid rule from active listings. Resolution happens explicitly
+                # via resolve_conflict.
 
                 conflicts.append({
                     "conflict_id": conflict_id,

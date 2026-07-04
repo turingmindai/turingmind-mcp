@@ -205,5 +205,161 @@ class TestMemoryDatabase(unittest.TestCase):
         self.assertEqual(len(conflicts), 0)
 
 
+class TestMemorySearchFTS(unittest.TestCase):
+    """Test cases for FTS5-backed memory search."""
+
+    def setUp(self):
+        """Set up test database with searchable entries."""
+        self.temp_dir = tempfile.mkdtemp()
+        self.db_path = str(Path(self.temp_dir) / "test.db")
+        self.db = MemoryDatabase(db_path=self.db_path)
+        self.db.create_memory_entry(
+            repo="test/repo",
+            memory_type="explicit_rule",
+            content="Avoid synchronous MongoDB calls in FastAPI routes",
+            scope="repo",
+            confidence=0.9,
+        )
+        self.db.create_memory_entry(
+            repo="test/repo",
+            memory_type="learned_pattern",
+            content="Use the async motor driver for database access",
+            scope="repo",
+            confidence=0.7,
+        )
+        self.db.create_memory_entry(
+            repo="test/repo",
+            memory_type="session_context",
+            content="Working on the login page styling",
+            scope="repo",
+            confidence=0.8,
+        )
+
+    def tearDown(self):
+        """Clean up test database."""
+        self.db.close()
+        import shutil
+        shutil.rmtree(self.temp_dir)
+
+    def test_fts_enabled(self):
+        """FTS5 index should initialize on a fresh database."""
+        self.assertTrue(self.db._fts_enabled)
+
+    def test_search_matches_any_token(self):
+        """Multi-token search should OR tokens instead of requiring a substring."""
+        results = self.db.list_memory_entries("test/repo", search="MongoDB async")
+        contents = [r["content"] for r in results]
+        self.assertEqual(len(results), 2)
+        self.assertIn("Avoid synchronous MongoDB calls in FastAPI routes", contents)
+        self.assertIn("Use the async motor driver for database access", contents)
+
+    def test_search_no_match(self):
+        """Unrelated search should return nothing."""
+        results = self.db.list_memory_entries("test/repo", search="kubernetes")
+        self.assertEqual(len(results), 0)
+
+    def test_search_reflects_updates(self):
+        """FTS index should stay in sync after content updates."""
+        memory_id = self.db.create_memory_entry(
+            repo="test/repo",
+            memory_type="explicit_rule",
+            content="Original searchable text",
+            scope="repo",
+        )
+        self.db.update_memory_entry(memory_id, content="Replaced with redis caching rule")
+
+        self.assertEqual(
+            len(self.db.list_memory_entries("test/repo", search="searchable")), 0
+        )
+        results = self.db.list_memory_entries("test/repo", search="redis")
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["memory_id"], memory_id)
+
+    def test_search_reflects_deletes(self):
+        """FTS index should drop hard-deleted rows."""
+        memory_id = self.db.create_memory_entry(
+            repo="test/repo",
+            memory_type="explicit_rule",
+            content="Ephemeral graphql pagination rule",
+            scope="repo",
+        )
+        self.db.delete_memory_entry(memory_id, deprecate=False)
+        self.assertEqual(
+            len(self.db.list_memory_entries("test/repo", search="graphql")), 0
+        )
+
+    def test_search_respects_filters(self):
+        """FTS search should still honor type filters."""
+        results = self.db.list_memory_entries(
+            "test/repo", memory_type="learned_pattern", search="database"
+        )
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["type"], "learned_pattern")
+
+    def test_fts_query_quotes_syntax(self):
+        """Special FTS characters must not inject query syntax."""
+        # Would raise sqlite3.OperationalError if unquoted
+        results = self.db.list_memory_entries("test/repo", search='NEAR( "login" *')
+        contents = [r["content"] for r in results]
+        self.assertIn("Working on the login page styling", contents)
+
+
+class TestMemoryToolJSON(unittest.TestCase):
+    """Test cases for the JSON output contract of the memory tool handlers."""
+
+    def setUp(self):
+        """Set up a handler context backed by a temp database."""
+        import logging
+
+        self.temp_dir = tempfile.mkdtemp()
+        self.db_path = str(Path(self.temp_dir) / "test.db")
+        self.db = MemoryDatabase(db_path=self.db_path)
+
+        class StubContext:
+            get_db = lambda _self=None, db=self.db: db
+            get_memory_manager = None
+            logger = logging.getLogger("test")
+
+        self.ctx = StubContext()
+
+    def tearDown(self):
+        """Clean up test database."""
+        self.db.close()
+        import shutil
+        shutil.rmtree(self.temp_dir)
+
+    def test_list_and_get_round_trip(self):
+        """list_memory must expose memory_id so get_memory can be called with it."""
+        import asyncio
+        import json
+
+        from turingmind_mcp.tools.memory import handle_get_memory, handle_list_memory
+
+        long_content = "A" * 300  # would have been truncated by the old formatter
+        memory_id = self.db.create_memory_entry(
+            repo="test/repo",
+            memory_type="explicit_rule",
+            content=long_content,
+            scope="repo",
+        )
+
+        listed = asyncio.run(handle_list_memory({"repo": "test/repo"}, self.ctx))
+        payload = json.loads(listed[0].text)
+        self.assertEqual(payload["total"], 1)
+        entry = payload["entries"][0]
+        self.assertEqual(entry["memory_id"], memory_id)
+        self.assertEqual(entry["content"], long_content)
+
+        fetched = asyncio.run(
+            handle_get_memory(
+                {"repo": "test/repo", "memory_id": entry["memory_id"]}, self.ctx
+            )
+        )
+        detail = json.loads(fetched[0].text)
+        self.assertEqual(detail["memory_id"], memory_id)
+        self.assertEqual(detail["content"], long_content)
+        self.assertEqual(detail["evidence"], [])
+
+
 if __name__ == "__main__":
     unittest.main()
