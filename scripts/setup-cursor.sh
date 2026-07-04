@@ -112,6 +112,18 @@ if [ $? -eq 0 ]; then
     echo ""
     echo -e "${YELLOW}Config file: ${CONFIG_FILE}${NC}"
     echo ""
+    echo -e "${CYAN}Cursor Build Mode plugin (hooks → :8477):${NC}"
+    MCP_REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+    if [ -f "$MCP_REPO/scripts/install-launchd.sh" ]; then
+        read -p "Install background V2 API server (launchd, survives reboot)? [Y/n]: " -n 1 -r
+        echo
+        if [[ ! $REPLY =~ ^[Nn]$ ]]; then
+            bash "$MCP_REPO/scripts/install-launchd.sh" || true
+        fi
+    else
+        echo "Run from turingmind-mcp repo: bash scripts/install-launchd.sh"
+    fi
+    echo ""
     echo -e "${CYAN}For Cursor CLI:${NC}"
     echo "The same config file is used automatically"
     echo "Test: cursor agent 'Review my code using TuringMind'"

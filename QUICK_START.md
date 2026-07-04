@@ -40,10 +40,51 @@ turingmind setup cursor
 # Add: {"mcpServers": {"turingmind": {"command": "turingmind-mcp"}}}
 ```
 
+#### Cursor Build Mode plugin (background API server)
+
+Plugin **hooks** call `http://127.0.0.1:8477` — separate from MCP stdio. Install once per machine:
+
+```bash
+cd /path/to/turingmind-mcp
+python3 -m venv .venv
+.venv/bin/python -m pip install -e .
+
+# macOS: launchd (survives crash + reboot)
+bash ./scripts/install-launchd.sh
+# or: turingmind install-api-daemon
+
+# verify (use -m 3 so a stuck server doesn't hang your terminal)
+curl -m 3 http://127.0.0.1:8477/api/v2/health
+turingmind install-api-daemon status
+```
+
+Optional env file (cloud sync, default repo) — loaded by launchd **and** `api_server`:
+
+```bash
+mkdir -p ~/.turingmind
+cat >> ~/.turingmind/env <<'EOF'
+TURINGMIND_DEFAULT_REPO=org/repo-name
+TURINGMIND_LOCAL_API_URL=http://127.0.0.1:8477
+TURINGMIND_CLOUD_SYNC=1
+TURINGMIND_API_URL=https://your-sidecar.example.com
+TURINGMIND_API_KEY=tmk_...
+EOF
+bash ./scripts/install-launchd.sh   # re-run to refresh launchd env
+```
+
+Add to `~/.zshrc` so **Cursor plugin hooks** see the same values:
+
+```bash
+export TURINGMIND_MCP_PYTHON="/path/to/turingmind-mcp/.venv/bin/python3"
+export TURINGMIND_DEFAULT_REPO="org/repo-name"
+export TURINGMIND_LOCAL_API_URL="http://127.0.0.1:8477"
+```
+
 **Next Steps:**
 1. Restart Cursor IDE
 2. Verify: Settings → MCP → Check "turingmind" is active
-3. Say: "Log me into TuringMind"
+3. Load plugin from `turingmind-cursor-plugin` repo root
+4. Say: "Log me into TuringMind"
 
 ### Claude Code CLI
 
@@ -93,7 +134,8 @@ If something doesn't work:
 1. **Check installation**: `pip show turingmind-mcp`
 2. **Verify command**: `turingmind-mcp --help`
 3. **Run diagnostics**: `turingmind diagnose`
-4. **Check platform docs**: See `docs/platforms/` for detailed guides
+4. **Plugin hooks / :8477**: `turingmind install-api-daemon status` then `tail ~/.turingmind/api-server.err.log`
+5. **Check platform docs**: See `docs/platforms/` for detailed guides
 
 ## Documentation
 

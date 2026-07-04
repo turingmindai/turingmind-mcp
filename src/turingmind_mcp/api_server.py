@@ -10,6 +10,14 @@ from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv(pathlib.Path.home() / ".turingmind" / "env")
+    load_dotenv(pathlib.Path(__file__).resolve().parents[2] / ".env")
+except ImportError:
+    pass
+
 from .v2_engine.models import SpecNode, ExecutionState, SpecStatus, ExecutionStage, FailureClassification, Evidence, NodeLevel, SurfaceType, Contract, Metric
 from .v2_engine.database import get_all_spec_nodes, get_execution_state, get_spec_node, save_spec_node, save_execution_state, get_impacted_subgraph
 from .v2_engine.handlers import detect_graph_gaps, _all_nodes_for_repo, cascade_blast_radius, recalculate_confidence, _now

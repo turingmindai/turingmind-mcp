@@ -100,6 +100,12 @@ def setup_platform(platform: str, project_root: Path | None = None) -> int:
             print("1. Restart Cursor IDE")
             print("2. Verify: Settings → Tools & Integrations → MCP")
             print("3. In Cursor chat: 'Log me into TuringMind'")
+            print("4. Plugin hooks: ensure API server on :8477 (see `turingmind install-api-daemon`)")
+
+        if platform == "cursor":
+            from .daemon_setup import offer_cursor_daemon_install
+
+            offer_cursor_daemon_install()
 
         return 0
 
@@ -221,6 +227,11 @@ def diagnose() -> int:
         else:
             print(f"⚪ {platform_name}: Not configured")
 
+    from .daemon_setup import diagnose_daemon
+
+    print("\n🖥️  V2 API daemon (plugin hooks, port 8477)...")
+    diagnose_daemon()
+
     return 0
 
 
@@ -233,6 +244,7 @@ def main() -> int:
 Examples:
   turingmind setup claude_desktop    # Setup for Claude Desktop
   turingmind setup cursor            # Setup for Cursor IDE/CLI
+  turingmind install-api-daemon      # macOS: background API server (launchd)
   turingmind validate claude_desktop # Validate configuration
   turingmind diagnose                 # Diagnose installation
         """,
@@ -269,6 +281,19 @@ Examples:
     # Diagnose command
     subparsers.add_parser("diagnose", help="Diagnose installation and configuration")
 
+    # macOS launchd daemon for V2 API (Cursor plugin hooks)
+    daemon_parser = subparsers.add_parser(
+        "install-api-daemon",
+        help="Install V2 API server as launchd agent (macOS, port 8477)",
+    )
+    daemon_parser.add_argument(
+        "action",
+        nargs="?",
+        choices=["install", "uninstall", "status"],
+        default="install",
+        help="install (default), uninstall, or status",
+    )
+
     args = parser.parse_args()
 
     if not args.command:
@@ -281,6 +306,15 @@ Examples:
         return validate_config(args.platform, args.project_root)
     elif args.command == "diagnose":
         return diagnose()
+    elif args.command == "install-api-daemon":
+        from .daemon_setup import install, status, uninstall
+
+        action = args.action
+        if action == "uninstall":
+            return uninstall()
+        if action == "status":
+            return status()
+        return install()
     else:
         parser.print_help()
         return 1

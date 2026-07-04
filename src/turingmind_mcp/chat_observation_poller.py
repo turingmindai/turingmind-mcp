@@ -134,12 +134,37 @@ def _advance_observation_cursor(
     )
 
 
-async def poll_chat_observations_once(
+async def start_chat_observation_poller(get_db) -> None:
+    """Launch infinite poll loop — called from api_server startup."""
+    interval_sec = float(os.environ.get("TURINGMIND_CHAT_POLL_INTERVAL_SEC", "15"))
+    if interval_sec <= 0:
+        logger.info("Chat observation poller disabled (TURINGMIND_CHAT_POLL_INTERVAL_SEC <= 0)")
+        return
+
+    async def loop() -> None:
+        repo = _resolve_default_repo()
+        while True:
+            await asyncio.sleep(interval_sec)
+            try:
+                # Cursor DB reads can take seconds — never block the HTTP event loop.
+                stats = await asyncio.to_thread(
+                    _poll_chat_observations_sync, get_db(), repo
+                )
+                if stats.get("recorded"):
+                    logger.info("Chat poll [%s]: %s", repo, stats)
+            except Exception as exc:
+                logger.warning("Chat observation poll cycle failed: %s", exc)
+
+    asyncio.create_task(loop())
+    logger.info("Chat observation poller started (every %g s, repo=%s)", interval_sec, _resolve_default_repo())
+
+
+def _poll_chat_observations_sync(
     db: MemoryDatabase,
     repo: str,
     session_start_time: Optional[int] = None,
 ) -> Dict[str, Any]:
-    """Single poll cycle: detect ready exchange → dumb observation → advance obs cursor."""
+    """Sync poll body — run via asyncio.to_thread from the poller loop."""
     ready = _check_observation_ready(db)
     if not ready:
         return {"recorded": 0}
@@ -166,7 +191,6 @@ async def poll_chat_observations_once(
         ready.get("isUpdate", False),
     )
     if not should_capture:
-        # Mirror capture_exchange: advance cursor so filtered old chats don't retry forever.
         _advance_observation_cursor(db, composer_id, exchange_state)
         return {"recorded": 0, "skipped": True}
 
@@ -188,25 +212,3 @@ async def poll_chat_observations_once(
         obs_id[:8],
     )
     return {"recorded": 1}
-
-
-async def start_chat_observation_poller(get_db) -> None:
-    """Launch infinite poll loop — called from api_server startup."""
-    interval_sec = float(os.environ.get("TURINGMIND_CHAT_POLL_INTERVAL_SEC", "15"))
-    if interval_sec <= 0:
-        logger.info("Chat observation poller disabled (TURINGMIND_CHAT_POLL_INTERVAL_SEC <= 0)")
-        return
-
-    async def loop() -> None:
-        repo = _resolve_default_repo()
-        while True:
-            await asyncio.sleep(interval_sec)
-            try:
-                stats = await poll_chat_observations_once(get_db(), repo)
-                if stats.get("recorded"):
-                    logger.info("Chat poll [%s]: %s", repo, stats)
-            except Exception as exc:
-                logger.warning("Chat observation poll cycle failed: %s", exc)
-
-    asyncio.create_task(loop())
-    logger.info("Chat observation poller started (every %g s, repo=%s)", interval_sec, _resolve_default_repo())
