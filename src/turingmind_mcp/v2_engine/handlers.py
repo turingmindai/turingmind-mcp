@@ -13,8 +13,11 @@ import datetime
 import json
 import re
 import uuid
+import logging
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger("turingmind-mcp")
 
 from mcp.types import TextContent
 
@@ -74,6 +77,44 @@ def _get_memory_db():
         from turingmind_mcp.database import MemoryDatabase
         _memory_db_instance = MemoryDatabase()
     return _memory_db_instance
+
+
+def _save_failure_memory(node: SpecNode, classification: FailureClassification, failure_trace: str) -> Optional[str]:
+    """Saves or updates a verification failure memory to prevent duplicate entries."""
+    try:
+        db = _get_memory_db()
+        scope = node.implementation.files[0] if node.implementation.files else "repo"
+        content = (
+            f"Verification failure on '{node.title}' classified as "
+            f"{classification.value}. {failure_trace[:400] if failure_trace else 'No trace provided.'}"
+        )
+        cursor = db.conn.cursor()
+        cursor.execute(
+            "SELECT memory_id FROM memory_entries WHERE node_id = ? AND type = ? AND status = 'active'",
+            (node.id, "learned_pattern")
+        )
+        row = cursor.fetchone()
+        if row:
+            memory_id = row[0]
+            db.update_memory_entry(
+                memory_id=memory_id,
+                content=content,
+                scope=scope,
+                confidence=0.7
+            )
+        else:
+            memory_id = db.create_memory_entry(
+                repo=node.repo,
+                memory_type="learned_pattern",
+                content=content,
+                scope=scope,
+                confidence=0.7,
+                node_id=node.id,
+            )
+        return memory_id
+    except Exception as mem_err:
+        logger.warning(f"Failed to save/update failure memory for {node.id}: {mem_err}")
+        return None
 
 
 # =============================================================================
@@ -556,18 +597,73 @@ async def handle_run_verification(args: dict, ctx: ToolContext) -> list[TextCont
             node.state.confidence = confidence
             node.state.last_verified_run_id = run_id  # stored for enforcement
 
+            was_already_failed = node.state.status == SpecStatus.FAILED
+            classification = None
+            memory_id = None
+            cascade_report = None
+
             if success:
                 node.state.stage  = ExecutionStage.VERIFIED
                 node.state.status = SpecStatus.VERIFIED
+                # Tier B: positive funnel signal — still an observation, not memory.
+                try:
+                    from ..observation_capture import record_verification_success_observation
+                    record_verification_success_observation(
+                        _get_memory_db(),
+                        repo=node.repo,
+                        node_id=node_id,
+                        node_title=node.title,
+                        confidence=confidence,
+                        detail=detail,
+                        source="run_verification",
+                    )
+                except Exception as obs_err:
+                    logger.warning(f"verification success observation failed: {obs_err}")
             else:
                 node.state.status = SpecStatus.FAILED
-                node.state.failure_classification = FailureClassification.TEST_GAP
                 node.state.failure_trace = output[-1000:]  # last 1000 chars of output
+
+                # Deterministic auto-classification
+                try:
+                    node_map = {n.id: n for n in _all_nodes_for_repo(node.repo)}
+                    classification = auto_classify_failure(node, node_map)
+                except Exception as ex_class:
+                    logger.warning(f"auto_classify_failure failed: {ex_class}")
+                    classification = FailureClassification.TEST_GAP  # fallback
+                
+                node.state.failure_classification = classification
+
+                # Register in execution state failed_nodes
+                try:
+                    state = get_execution_state(node.repo)
+                    if node_id not in state.failed_nodes:
+                        state.failed_nodes.append(node_id)
+                    save_execution_state(node.repo, state)
+                except Exception as state_err:
+                    logger.warning(f"Failed to update execution state: {state_err}")
+
+                # Durable memory persistence
+                memory_id = _save_failure_memory(node, classification, node.state.failure_trace or "")
 
             node.updated_at = _now()
             save_spec_node(node)
 
-            return _ok({
+            # Cascade blast radius if not already failed
+            if not success and not was_already_failed:
+                try:
+                    cascade_report = cascade_blast_radius(node_id, node.repo)
+                except Exception as cascade_err:
+                    logger.warning(f"Failed to run cascade blast radius: {cascade_err}")
+
+            # Escalation actions map
+            escalation_map = {
+                FailureClassification.SPEC_GAP: "Escalate to Architect Mode: refine the contract invariants",
+                FailureClassification.TEST_GAP: "Escalate to Tester Mode: expand verification coverage",
+                FailureClassification.IMPLEMENTATION_BUG: "Escalate to Builder Mode: patch the implementation",
+                FailureClassification.DEPENDENCY_FAILURE: "Block this node: upstream dependency failed",
+            }
+
+            response_payload = {
                 "status": "verified" if success else "failed",
                 "node_id": node_id,
                 "passed": passed,
@@ -576,8 +672,26 @@ async def handle_run_verification(args: dict, ctx: ToolContext) -> list[TextCont
                 "evidence_count": len(node.state.evidence),
                 "detail": detail,
                 "output": output[-2000:],  # last 2000 chars for context
-                "message": f"pytest ran: {detail}. {'Node verified.' if success else 'Call turingmind_classify_failure and turingmind_apply_fix.'}",
-            })
+            }
+
+            if success:
+                response_payload["message"] = f"pytest ran: {detail}. Node verified."
+            else:
+                escalation_action = escalation_map.get(classification, "Escalate to Builder Mode")
+                response_payload["message"] = (
+                    f"pytest ran: {detail}. Failure auto-classified as {classification.value}. "
+                    f"Action: {escalation_action}. "
+                    "Call turingmind_classify_failure only to override this classification."
+                )
+                response_payload["classification"] = classification.value
+                response_payload["auto_classified"] = True
+                response_payload["escalation_action"] = escalation_action
+                if memory_id:
+                    response_payload["memory_id"] = memory_id
+                if cascade_report:
+                    response_payload["cascade_report"] = cascade_report
+
+            return _ok(response_payload)
         except subprocess.TimeoutExpired:
             return _err("pytest timed out after 120 seconds.")
         except FileNotFoundError:
@@ -614,6 +728,9 @@ async def handle_record_execution_stage(args: dict, ctx: ToolContext) -> list[Te
     node = get_spec_node(node_id)
     if not node:
         return _err(f"SpecNode '{node_id}' not found")
+
+    was_already_failed = node.state.status == SpecStatus.FAILED
+    previous_stage = node.state.stage
 
     try:
         target_stage = ExecutionStage(stage_raw)
@@ -692,8 +809,39 @@ async def handle_record_execution_stage(args: dict, ctx: ToolContext) -> list[Te
             source="unknown",
         ))
 
+    # If node is FAILED, trigger auto-classification and execution state updates
+    if target_status == SpecStatus.FAILED:
+        if not node.state.failure_classification:
+            try:
+                node_map = {n.id: n for n in _all_nodes_for_repo(node.repo)}
+                classification = auto_classify_failure(node, node_map)
+                node.state.failure_classification = classification
+            except Exception as ex_class:
+                logger.warning(f"auto_classify_failure in record_execution_stage failed: {ex_class}")
+                node.state.failure_classification = FailureClassification.TEST_GAP  # fallback
+
+        # Register in execution state failed_nodes
+        try:
+            state = get_execution_state(node.repo)
+            if node_id not in state.failed_nodes:
+                state.failed_nodes.append(node_id)
+            save_execution_state(node.repo, state)
+        except Exception as state_err:
+            logger.warning(f"Failed to update execution state: {state_err}")
+
+        # Save/update failure memory
+        if node.state.failure_classification:
+            _save_failure_memory(node, node.state.failure_classification, node.state.failure_trace or "")
+
     node.updated_at = _now()
     save_spec_node(node)
+
+    # Only cascade if fresh failure
+    if target_status == SpecStatus.FAILED and not was_already_failed:
+        try:
+            cascade_blast_radius(node_id, node.repo)
+        except Exception as cascade_err:
+            logger.warning(f"Failed to run cascade blast radius: {cascade_err}")
 
     # If node is fully verified, update execution state queues
     if node.state.stage == ExecutionStage.VERIFIED:
@@ -702,6 +850,24 @@ async def handle_record_execution_stage(args: dict, ctx: ToolContext) -> list[Te
         if node_id in state.failed_nodes:
             state.failed_nodes.remove(node_id)
         save_execution_state(node.repo, state)
+        # Only on transition into VERIFIED — run_verification records its own obs.
+        if (
+            target_stage == ExecutionStage.VERIFIED
+            and previous_stage != ExecutionStage.VERIFIED
+        ):
+            try:
+                from ..observation_capture import record_verification_success_observation
+                record_verification_success_observation(
+                    _get_memory_db(),
+                    repo=node.repo,
+                    node_id=node_id,
+                    node_title=node.title,
+                    confidence=node.state.confidence,
+                    detail=f"Stage recorded as verified (confidence={node.state.confidence:.2f})",
+                    source="record_execution_stage",
+                )
+            except Exception as obs_err:
+                logger.warning(f"verified-stage observation failed: {obs_err}")
 
     return _ok(_append_gap_hints({
         "status": "recorded",
@@ -733,6 +899,31 @@ async def handle_classify_failure(args: dict, ctx: ToolContext) -> list[TextCont
     except ValueError:
         return _err(f"Invalid classification: {classification_raw}")
 
+    existing_classification = node.state.failure_classification
+    existing_trace = node.state.failure_trace or ""
+    incoming_trace = failure_trace or ""
+
+    # Idempotent path: run_verification / record_execution_stage already classified
+    # and persisted memory. Skip redundant cascade unless the agent overrides.
+    if (
+        node.state.status == SpecStatus.FAILED
+        and existing_classification == classification
+        and (not incoming_trace or incoming_trace == existing_trace)
+    ):
+        memory_id = _save_failure_memory(node, classification, existing_trace)
+        response = {
+            "status": "already_classified",
+            "node_id": node_id,
+            "classification": classification.value,
+            "message": (
+                "Failure was already auto-classified and saved to memory. "
+                "Pass a different classification or failure_trace to override."
+            ),
+        }
+        if memory_id:
+            response["memory_id"] = memory_id
+        return _ok(response)
+
     # ── Stage 3.1: Guard — only cascade if node wasn't already FAILED.
     # If it was already FAILED (e.g. auto-set by ingest_runtime_signal which
     # already ran cascade_blast_radius), a second cascade would double-penalize
@@ -741,7 +932,8 @@ async def handle_classify_failure(args: dict, ctx: ToolContext) -> list[TextCont
 
     node.state.status = SpecStatus.FAILED
     node.state.failure_classification = classification
-    node.state.failure_trace = failure_trace
+    if incoming_trace:
+        node.state.failure_trace = incoming_trace
     node.updated_at = _now()
     save_spec_node(node)  # Persist origin FIRST before cascading
 
@@ -767,22 +959,9 @@ async def handle_classify_failure(args: dict, ctx: ToolContext) -> list[TextCont
 
     # Failure becomes durable memory: future agents touching these files or
     # querying this node recall what broke and how it was classified.
-    try:
-        scope = node.implementation.files[0] if node.implementation.files else "repo"
-        memory_id = _get_memory_db().create_memory_entry(
-            repo=node.repo,
-            memory_type="learned_pattern",
-            content=(
-                f"Verification failure on '{node.title}' classified as "
-                f"{classification.value}. {failure_trace[:400] if failure_trace else 'No trace provided.'}"
-            ),
-            scope=scope,
-            confidence=0.7,
-            node_id=node_id,
-        )
+    memory_id = _save_failure_memory(node, classification, node.state.failure_trace or "")
+    if memory_id:
         response["memory_id"] = memory_id
-    except Exception:
-        pass  # memory persistence is best-effort; classification must not fail
 
     # Only cascade if this is a fresh failure (not already in FAILED state)
     if not was_already_failed:
@@ -1856,8 +2035,9 @@ def detect_graph_gaps(repo: str) -> list[dict]:
                 "suggested_classification": suggested.value,
                 "action": (
                     f"Node '{node.title}' is in FAILED status but has no failure classification. "
-                    f"Auto-classifier suggests: '{suggested.value}'. Call turingmind_classify_failure "
-                    f"with classification='{suggested.value}' to accept, or override with your own."
+                    f"Auto-classifier suggests: '{suggested.value}'. "
+                    f"Call turingmind_run_verification or turingmind_record_execution_stage "
+                    f"to auto-classify, or turingmind_classify_failure only to accept/override manually."
                 ),
             })
 

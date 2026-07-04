@@ -622,31 +622,31 @@ def resolve_finding(finding_id: str, payload: ResolveFindingPayload):
 
 
 @app.on_event("startup")
-async def _start_reconcile_loop():
-    """Background reconciliation: every N minutes, run the passes for every
-    repo with activity. The server is launchd-supervised, so this loop is the
-    'always running' half of the reconciliation design."""
+async def _start_background_loops():
+    """Start always-on background ingestion: reconcile + chat observation poll."""
     import asyncio
 
     interval_min = float(os.environ.get("TURINGMIND_RECONCILE_INTERVAL_MIN", "30"))
-    if interval_min <= 0:
+    if interval_min > 0:
+        async def reconcile_loop():
+            from .reconcile import reconcile_repo, repos_with_activity
+            while True:
+                await asyncio.sleep(interval_min * 60)
+                try:
+                    db = _memory_db()
+                    for repo in repos_with_activity(db):
+                        stats = await asyncio.to_thread(reconcile_repo, db, repo)
+                        logger.info(f"Background reconcile [{repo}]: {stats}")
+                except Exception as e:
+                    logger.warning(f"Background reconcile cycle failed: {e}")
+
+        asyncio.create_task(reconcile_loop())
+        logger.info(f"Reconcile loop started (every {interval_min:g} min)")
+    else:
         logger.info("Reconcile loop disabled (TURINGMIND_RECONCILE_INTERVAL_MIN <= 0)")
-        return
 
-    async def loop():
-        from .reconcile import reconcile_repo, repos_with_activity
-        while True:
-            await asyncio.sleep(interval_min * 60)
-            try:
-                db = _memory_db()
-                for repo in repos_with_activity(db):
-                    stats = await asyncio.to_thread(reconcile_repo, db, repo)
-                    logger.info(f"Background reconcile [{repo}]: {stats}")
-            except Exception as e:
-                logger.warning(f"Background reconcile cycle failed: {e}")
-
-    asyncio.create_task(loop())
-    logger.info(f"Reconcile loop started (every {interval_min:g} min)")
+    from .chat_observation_poller import start_chat_observation_poller
+    await start_chat_observation_poller(_memory_db)
 
 
 @app.post("/api/v2/graph/nodes")

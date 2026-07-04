@@ -298,12 +298,47 @@ class MemoryDatabase:
             )
         """)
 
+        # Chat capture cursor — one row per Cursor composerId.
+        # Tracks what we already ingested so check_exchanges() can debounce
+        # without re-reading the full Cursor DB every poll cycle.
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS chat_capture_state (
+                composer_id TEXT PRIMARY KEY,
+                message_count INTEGER DEFAULT 0,
+                last_captured_at INTEGER,
+                last_llm_enhanced_at INTEGER,
+                last_llm_processed_prompt_index INTEGER,
+                last_llm_processed_response_index INTEGER,
+                last_captured_exchange_count INTEGER,
+                last_exchange_timestamp INTEGER,
+                processed_files_json TEXT,
+                kanban_item_hashes_json TEXT,
+                last_observation_bubble_count INTEGER,
+                last_observation_at INTEGER,
+                last_observation_exchange_timestamp INTEGER,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        existing_cols = {
+            row[1] for row in cursor.execute("PRAGMA table_info(chat_capture_state)").fetchall()
+        }
+        for col, ddl in (
+            ("last_observation_bubble_count", "INTEGER"),
+            ("last_observation_at", "INTEGER"),
+            ("last_observation_exchange_timestamp", "INTEGER"),
+        ):
+            if col not in existing_cols:
+                cursor.execute(f"ALTER TABLE chat_capture_state ADD COLUMN {col} {ddl}")
+
         # Create indexes
         indexes = [
             "CREATE INDEX IF NOT EXISTS idx_findings_repo_status ON reconcile_findings(repo, status)",
             "CREATE INDEX IF NOT EXISTS idx_reconcile_runs_repo ON reconcile_runs(repo, started_at)",
             "CREATE INDEX IF NOT EXISTS idx_observations_repo_status ON observations(repo, status)",
             "CREATE INDEX IF NOT EXISTS idx_observations_repo_event ON observations(repo, event_type)",
+            "CREATE INDEX IF NOT EXISTS idx_chat_capture_composer ON chat_capture_state(composer_id)",
             "CREATE INDEX IF NOT EXISTS idx_memory_repo_type ON memory_entries(repo, type)",
             "CREATE INDEX IF NOT EXISTS idx_memory_repo_status ON memory_entries(repo, status)",
             "CREATE INDEX IF NOT EXISTS idx_memory_repo_scope ON memory_entries(repo, scope)",
@@ -597,6 +632,146 @@ class MemoryDatabase:
                 result["security_tags"] = json.loads(result["security_tags"])
             results.append(result)
         return results
+
+    # Chat capture state — debounce cursors for Cursor composer polling
+    def get_chat_capture_state(self, composer_id: str) -> Optional[Dict[str, Any]]:
+        """Return capture cursor for a composer, or None if never seen.
+
+        Keys are camelCase to match the bridge/extension contract documented
+        in chat_capture.py (messageCount, lastCapturedAt, processedFiles, …).
+        """
+        cursor = self.conn.cursor()
+        row = cursor.execute(
+            "SELECT * FROM chat_capture_state WHERE composer_id = ?",
+            (composer_id,),
+        ).fetchone()
+        if not row:
+            return None
+
+        def _load_set(raw: Optional[str]) -> set:
+            if not raw:
+                return set()
+            try:
+                data = json.loads(raw)
+                return set(data) if isinstance(data, list) else set()
+            except (json.JSONDecodeError, TypeError):
+                return set()
+
+        return {
+            "composerId": row["composer_id"],
+            "messageCount": row["message_count"] or 0,
+            "lastCapturedAt": row["last_captured_at"] or 0,
+            "lastLLMEnhancedAt": row["last_llm_enhanced_at"] or 0,
+            "lastLLMProcessedPromptIndex": row["last_llm_processed_prompt_index"] or 0,
+            "lastLLMProcessedResponseIndex": row["last_llm_processed_response_index"] or 0,
+            "lastCapturedExchangeCount": row["last_captured_exchange_count"] or 0,
+            "lastExchangeTimestamp": row["last_exchange_timestamp"] or 0,
+            "processedFiles": _load_set(row["processed_files_json"]),
+            "kanbanItemHashes": _load_set(row["kanban_item_hashes_json"]),
+            "lastObservationBubbleCount": row["last_observation_bubble_count"] or 0,
+            "lastObservationAt": row["last_observation_at"] or 0,
+            "lastObservationExchangeTimestamp": row["last_observation_exchange_timestamp"] or 0,
+        }
+
+    def update_chat_capture_state(
+        self,
+        composer_id: str,
+        *,
+        message_count: Optional[int] = None,
+        last_captured_at: Optional[int] = None,
+        last_llm_enhanced_at: Optional[int] = None,
+        last_llm_processed_prompt_index: Optional[int] = None,
+        last_llm_processed_response_index: Optional[int] = None,
+        last_captured_exchange_count: Optional[int] = None,
+        last_exchange_timestamp: Optional[int] = None,
+        processed_files: Optional[set] = None,
+        kanban_item_hashes: Optional[set] = None,
+        last_observation_bubble_count: Optional[int] = None,
+        last_observation_at: Optional[int] = None,
+        last_observation_exchange_timestamp: Optional[int] = None,
+    ) -> bool:
+        """Upsert capture cursor. Set fields merge for processed_files / kanban hashes."""
+        existing = self.get_chat_capture_state(composer_id)
+        now = datetime.utcnow().isoformat()
+
+        merged_files = set(existing["processedFiles"]) if existing else set()
+        if processed_files:
+            merged_files.update(processed_files)
+
+        merged_hashes = set(existing["kanbanItemHashes"]) if existing else set()
+        if kanban_item_hashes:
+            merged_hashes.update(kanban_item_hashes)
+
+        if existing:
+            cursor = self.conn.cursor()
+            cursor.execute(
+                """
+                UPDATE chat_capture_state SET
+                    message_count = COALESCE(?, message_count),
+                    last_captured_at = COALESCE(?, last_captured_at),
+                    last_llm_enhanced_at = COALESCE(?, last_llm_enhanced_at),
+                    last_llm_processed_prompt_index = COALESCE(?, last_llm_processed_prompt_index),
+                    last_llm_processed_response_index = COALESCE(?, last_llm_processed_response_index),
+                    last_captured_exchange_count = COALESCE(?, last_captured_exchange_count),
+                    last_exchange_timestamp = COALESCE(?, last_exchange_timestamp),
+                    processed_files_json = ?,
+                    kanban_item_hashes_json = ?,
+                    last_observation_bubble_count = COALESCE(?, last_observation_bubble_count),
+                    last_observation_at = COALESCE(?, last_observation_at),
+                    last_observation_exchange_timestamp = COALESCE(?, last_observation_exchange_timestamp),
+                    updated_at = ?
+                WHERE composer_id = ?
+                """,
+                (
+                    message_count,
+                    last_captured_at,
+                    last_llm_enhanced_at,
+                    last_llm_processed_prompt_index,
+                    last_llm_processed_response_index,
+                    last_captured_exchange_count,
+                    last_exchange_timestamp,
+                    json.dumps(sorted(merged_files)),
+                    json.dumps(sorted(merged_hashes)),
+                    last_observation_bubble_count,
+                    last_observation_at,
+                    last_observation_exchange_timestamp,
+                    now,
+                    composer_id,
+                ),
+            )
+        else:
+            cursor = self.conn.cursor()
+            cursor.execute(
+                """
+                INSERT INTO chat_capture_state (
+                    composer_id, message_count, last_captured_at,
+                    last_llm_enhanced_at, last_llm_processed_prompt_index,
+                    last_llm_processed_response_index, last_captured_exchange_count,
+                    last_exchange_timestamp, processed_files_json,
+                    kanban_item_hashes_json,
+                    last_observation_bubble_count, last_observation_at,
+                    last_observation_exchange_timestamp, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    composer_id,
+                    message_count or 0,
+                    last_captured_at,
+                    last_llm_enhanced_at,
+                    last_llm_processed_prompt_index,
+                    last_llm_processed_response_index,
+                    last_captured_exchange_count,
+                    last_exchange_timestamp,
+                    json.dumps(sorted(merged_files)),
+                    json.dumps(sorted(merged_hashes)),
+                    last_observation_bubble_count or 0,
+                    last_observation_at,
+                    last_observation_exchange_timestamp,
+                    now,
+                ),
+            )
+        self.conn.commit()
+        return True
 
     # Observation Operations (draft beliefs — see reconciliation design)
     def create_observation(

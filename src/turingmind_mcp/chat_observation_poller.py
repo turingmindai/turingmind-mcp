@@ -1,0 +1,212 @@
+"""
+Background chat → observation poller (Tier B capture funnel).
+
+Architecture placement
+----------------------
+This module sits on the **API server** (port 8477), not the stdio MCP bridge.
+The reconcile loop already runs here; co-locating chat polling keeps all
+"always-on ingestion" in one supervised process (launchd / systemd).
+
+    Cursor SQLite  →  observation-ready check  →  extract latest bubble text
+                                                      ↓
+                                            observations (pending, conf≈0.3)
+                                                      ↓
+                                            reconcile passes (deterministic)
+
+Cursor isolation
+----------------
+Observation polling uses **separate cursor fields** on ``chat_capture_state``
+(``lastObservationBubbleCount``, etc.) so it does not advance the
+``messageCount`` / ``lastCapturedAt`` cursor used by ``capture_exchange()``.
+Both paths can run without starving the LLM chat-analysis flow.
+
+Repo scope
+----------
+Chat is workspace-local; observations attach to ``TURINGMIND_DEFAULT_REPO``
+(or git-origin fallback). We do **not** loop ``repos_with_activity()`` — that
+would mis-attribute the same composer exchange to the wrong repo.
+
+Disable with ``TURINGMIND_CHAT_POLL_INTERVAL_SEC=0``.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import os
+import re
+import subprocess
+import time
+from typing import Any, Dict, List, Optional
+
+from .chat_capture import (
+    CURRENT_CHAT_UPDATE_COOLDOWN_MS,
+    filter_to_latest_exchange,
+    should_capture_chat,
+)
+from .cursor_database_reader import (
+    extract_metadata,
+    find_cursor_database,
+    get_last_exchange_state,
+    get_most_recently_active_composer,
+)
+from .database import MemoryDatabase
+from .observation_capture import record_chat_exchange_observation
+
+logger = logging.getLogger("turingmind-mcp.chat-poller")
+
+
+def _resolve_default_repo() -> str:
+    """Match hook/CLI repo resolution: env → git origin → fallback."""
+    env = os.environ.get("TURINGMIND_DEFAULT_REPO")
+    if env:
+        return env
+    try:
+        url = subprocess.check_output(
+            ["git", "remote", "get-url", "origin"], stderr=subprocess.DEVNULL
+        ).decode().strip()
+        match = re.search(r"[:/]([^/:]+/[^/]+?)(\.git)?$", url)
+        if match:
+            return match.group(1)
+    except Exception:
+        pass
+    return "local/workspace"
+
+
+def _check_observation_ready(
+    db: MemoryDatabase,
+) -> Optional[Dict[str, Any]]:
+    """Return composer/exchange info when a dumb observation should be recorded.
+
+    Mirrors ``check_exchanges()`` readiness (complete exchange, debounce,
+    cooldown) but compares against the **observation** cursor, not the
+    capture_exchange cursor.
+    """
+    db_path = find_cursor_database()
+    if db_path is None:
+        return None
+
+    db_path_str = str(db_path)
+    most_recent = get_most_recently_active_composer(db_path_str)
+    if not most_recent or most_recent.get("bubbleCount", 0) < 2:
+        return None
+
+    composer_id = most_recent["composerId"]
+    last_activity_at = most_recent["lastActivityAt"]
+    exchange_state = get_last_exchange_state(db_path_str, composer_id)
+    if not exchange_state:
+        return None
+
+    cached = db.get_chat_capture_state(composer_id)
+    now = int(time.time() * 1000)
+    obs_bubble_count = cached.get("lastObservationBubbleCount", 0) if cached else 0
+    total_bubbles = exchange_state.get("totalBubbles", 0)
+
+    exchange_is_complete = exchange_state.get("isCompleteExchange", False)
+    has_new_exchange = total_bubbles > obs_bubble_count
+    is_write_complete = (now - (last_activity_at or 0)) >= 500
+
+    last_obs_at = cached.get("lastObservationAt", 0) if cached else 0
+    cooldown_expired = not cached or (now - last_obs_at) >= CURRENT_CHAT_UPDATE_COOLDOWN_MS
+
+    if not (exchange_is_complete and has_new_exchange and is_write_complete and cooldown_expired):
+        return None
+
+    return {
+        "composerId": composer_id,
+        "exchangeState": exchange_state,
+        "isUpdate": cached is not None,
+    }
+
+
+def _advance_observation_cursor(
+    db: MemoryDatabase,
+    composer_id: str,
+    exchange_state: Dict[str, Any],
+) -> None:
+    """Advance observation debounce cursor without touching capture_exchange fields."""
+    now = int(time.time() * 1000)
+    db.update_chat_capture_state(
+        composer_id,
+        last_observation_bubble_count=exchange_state.get("totalBubbles", 0),
+        last_observation_at=now,
+        last_observation_exchange_timestamp=exchange_state.get("lastBubbleTimestamp", 0),
+    )
+
+
+async def poll_chat_observations_once(
+    db: MemoryDatabase,
+    repo: str,
+    session_start_time: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Single poll cycle: detect ready exchange → dumb observation → advance obs cursor."""
+    ready = _check_observation_ready(db)
+    if not ready:
+        return {"recorded": 0}
+
+    composer_id = ready["composerId"]
+    exchange_state = ready["exchangeState"] or {}
+
+    db_path = find_cursor_database(composer_id)
+    if db_path is None:
+        return {"recorded": 0}
+
+    cached = db.get_chat_capture_state(composer_id)
+    last_ts = cached.get("lastObservationExchangeTimestamp", 0) if cached else 0
+    full_metadata = extract_metadata(composer_id, str(db_path))
+    if not full_metadata:
+        _advance_observation_cursor(db, composer_id, exchange_state)
+        return {"recorded": 0}
+
+    metadata = filter_to_latest_exchange(full_metadata, last_ts)
+    should_capture, _skip = should_capture_chat(
+        metadata,
+        cached,
+        session_start_time,
+        ready.get("isUpdate", False),
+    )
+    if not should_capture:
+        # Mirror capture_exchange: advance cursor so filtered old chats don't retry forever.
+        _advance_observation_cursor(db, composer_id, exchange_state)
+        return {"recorded": 0, "skipped": True}
+
+    obs_id = record_chat_exchange_observation(
+        db,
+        repo=repo,
+        composer_id=composer_id,
+        metadata=metadata,
+    )
+    if not obs_id:
+        _advance_observation_cursor(db, composer_id, exchange_state)
+        return {"recorded": 0}
+
+    _advance_observation_cursor(db, composer_id, exchange_state)
+    logger.info(
+        "Chat observation [%s] composer=%s obs=%s",
+        repo,
+        composer_id[:8],
+        obs_id[:8],
+    )
+    return {"recorded": 1}
+
+
+async def start_chat_observation_poller(get_db) -> None:
+    """Launch infinite poll loop — called from api_server startup."""
+    interval_sec = float(os.environ.get("TURINGMIND_CHAT_POLL_INTERVAL_SEC", "15"))
+    if interval_sec <= 0:
+        logger.info("Chat observation poller disabled (TURINGMIND_CHAT_POLL_INTERVAL_SEC <= 0)")
+        return
+
+    async def loop() -> None:
+        repo = _resolve_default_repo()
+        while True:
+            await asyncio.sleep(interval_sec)
+            try:
+                stats = await poll_chat_observations_once(get_db(), repo)
+                if stats.get("recorded"):
+                    logger.info("Chat poll [%s]: %s", repo, stats)
+            except Exception as exc:
+                logger.warning("Chat observation poll cycle failed: %s", exc)
+
+    asyncio.create_task(loop())
+    logger.info("Chat observation poller started (every %g s, repo=%s)", interval_sec, _resolve_default_repo())

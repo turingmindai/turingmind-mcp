@@ -399,6 +399,7 @@ class TestMemoryToolJSON(unittest.TestCase):
             memory_type="explicit_rule",
             content=long_content,
             scope="repo",
+            node_id="node_123",
         )
 
         listed = asyncio.run(handle_list_memory({"repo": "test/repo"}, self.ctx))
@@ -407,6 +408,7 @@ class TestMemoryToolJSON(unittest.TestCase):
         entry = payload["entries"][0]
         self.assertEqual(entry["memory_id"], memory_id)
         self.assertEqual(entry["content"], long_content)
+        self.assertEqual(entry["node_id"], "node_123")
 
         fetched = asyncio.run(
             handle_get_memory(
@@ -416,6 +418,7 @@ class TestMemoryToolJSON(unittest.TestCase):
         detail = json.loads(fetched[0].text)
         self.assertEqual(detail["memory_id"], memory_id)
         self.assertEqual(detail["content"], long_content)
+        self.assertEqual(detail["node_id"], "node_123")
         self.assertEqual(detail["evidence"], [])
 
 
