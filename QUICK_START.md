@@ -72,12 +72,17 @@ EOF
 bash ./scripts/install-launchd.sh   # re-run to refresh launchd env
 ```
 
-Add to `~/.zshrc` so **Cursor plugin hooks** see the same values:
+Add to `~/.zshrc` so **Cursor plugin hooks** see machine paths (repo id is auto-detected from git):
 
 ```bash
 export TURINGMIND_MCP_PYTHON="/path/to/turingmind-mcp/.venv/bin/python3"
-export TURINGMIND_DEFAULT_REPO="org/repo-name"
 export TURINGMIND_LOCAL_API_URL="http://127.0.0.1:8477"
+```
+
+Optional fallback for **non-git folders only** — put in `~/.turingmind/env`, not shell:
+
+```bash
+TURINGMIND_DEFAULT_REPO=org/repo-name
 ```
 
 **Next Steps:**

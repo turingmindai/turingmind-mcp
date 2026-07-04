@@ -22,9 +22,10 @@ Both paths can run without starving the LLM chat-analysis flow.
 
 Repo scope
 ----------
-Chat is workspace-local; observations attach to ``TURINGMIND_DEFAULT_REPO``
-(or git-origin fallback). We do **not** loop ``repos_with_activity()`` — that
-would mis-attribute the same composer exchange to the wrong repo.
+Chat is workspace-local; observations attach to the repo inferred from **git
+origin** (or ``~/.turingmind/env`` / ``TURINGMIND_DEFAULT_REPO`` as fallback).
+We do **not** loop ``repos_with_activity()`` — that would mis-attribute the
+same composer exchange to the wrong repo.
 
 Disable with ``TURINGMIND_CHAT_POLL_INTERVAL_SEC=0``.
 """
@@ -57,19 +58,29 @@ logger = logging.getLogger("turingmind-mcp.chat-poller")
 
 
 def _resolve_default_repo() -> str:
-    """Match hook/CLI repo resolution: env → git origin → fallback."""
-    env = os.environ.get("TURINGMIND_DEFAULT_REPO")
-    if env:
-        return env
+    """Git origin from process cwd first, then ~/.turingmind/env, then process env."""
     try:
         url = subprocess.check_output(
-            ["git", "remote", "get-url", "origin"], stderr=subprocess.DEVNULL
+            ["git", "remote", "get-url", "origin"],
+            cwd=os.getcwd(),
+            stderr=subprocess.DEVNULL,
         ).decode().strip()
         match = re.search(r"[:/]([^/:]+/[^/]+?)(\.git)?$", url)
         if match:
             return match.group(1)
     except Exception:
         pass
+    try:
+        from .daemon_setup import load_env_file
+
+        file_env = load_env_file()
+        if file_env.get("TURINGMIND_DEFAULT_REPO"):
+            return file_env["TURINGMIND_DEFAULT_REPO"]
+    except Exception:
+        pass
+    env = os.environ.get("TURINGMIND_DEFAULT_REPO")
+    if env:
+        return env
     return "local/workspace"
 
 
