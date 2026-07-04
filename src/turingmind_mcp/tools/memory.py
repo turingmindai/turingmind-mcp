@@ -27,6 +27,8 @@ async def handle_list_memory(arguments: dict, ctx: ToolContext) -> list[TextCont
     category = arguments.get("category", "all")
     status = arguments.get("status", "all")
     scope = arguments.get("scope")
+    branch = arguments.get("branch")
+    include_other_branches = bool(arguments.get("include_other_branches", False))
     security_tag = arguments.get("security_tag")
     page = arguments.get("page", 1)
     limit = arguments.get("limit", 50)
@@ -40,6 +42,8 @@ async def handle_list_memory(arguments: dict, ctx: ToolContext) -> list[TextCont
             memory_type=category if category != "all" else None,
             status=status if status != "all" else None,
             scope=scope,
+            branch=branch,
+            include_other_branches=include_other_branches,
             page=page,
             limit=limit,
             search=search,
@@ -63,6 +67,9 @@ async def handle_list_memory(arguments: dict, ctx: ToolContext) -> list[TextCont
                     "content": e["content"],
                     "scope": e["scope"],
                     "confidence": e["confidence"],
+                    "branch": e.get("branch"),
+                    "head_sha": e.get("head_sha"),
+                    "scope_tier": e.get("scope_tier"),
                     "node_id": e.get("node_id"),
                     "security_tags": e.get("security_tags") or [],
                     "created_at": e.get("created_at"),

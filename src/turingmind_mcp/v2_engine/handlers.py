@@ -132,7 +132,6 @@ async def handle_sync_cloud(args: dict, ctx: ToolContext) -> list[TextContent]:
 
     try:
         from .database import get_all_spec_nodes, get_execution_state
-        from .postgres import sync_cloud_state, sync_memories_bidirectional
 
         api_url, api_key = get_config()
         db = get_db()
@@ -151,12 +150,7 @@ async def handle_sync_cloud(args: dict, ctx: ToolContext) -> list[TextContent]:
             "memories_pushed": 0,
         }
         memory_sync_error: str | None = None
-        spec_synced = False
-
-        if os.getenv("POSTGRES_URI"):
-            spec_synced = sync_cloud_state(repo, nodes, edges, state)
-        else:
-            spec_synced = True
+        spec_synced = True
 
         if use_cloud_sync(api_url, api_key):
             try:
@@ -169,28 +163,22 @@ async def handle_sync_cloud(args: dict, ctx: ToolContext) -> list[TextContent]:
             except Exception as mem_err:
                 memory_sync_error = f"Memory cloud API sync failed: {mem_err}"
                 logger.warning(memory_sync_error)
-        elif os.getenv("POSTGRES_URI"):
-            try:
-                memory_sync = sync_memories_bidirectional(db, repo)
-            except Exception as mem_err:
-                memory_sync_error = f"Memory bidirectional sync failed: {mem_err}"
-                logger.warning(memory_sync_error)
         else:
             return _err(
                 "Cloud memory sync unavailable. Set TURINGMIND_CLOUD_SYNC=1 with "
-                "TURINGMIND_API_KEY, or POSTGRES_URI for local docker Postgres."
+                "TURINGMIND_API_KEY."
             )
 
         memory_ok = memory_sync_error is None
         if not spec_synced and not memory_ok:
             return _err("Failed to sync to cloud. See logs for details.")
 
-        via = "cloud API" if use_cloud_sync(api_url, api_key) else "Postgres"
+        via = "cloud API"
         payload: Dict[str, Any] = {
             "repo": repo,
             "nodes_synced": len(nodes),
             "edges_synced": len(edges),
-            "spec_cloud": bool(os.getenv("POSTGRES_URI")),
+            "spec_cloud": False,
             "spec_synced": spec_synced,
             "memory_synced": memory_ok,
             "memory_via": via if memory_ok else None,
@@ -203,8 +191,6 @@ async def handle_sync_cloud(args: dict, ctx: ToolContext) -> list[TextContent]:
         }
         if memory_sync_error:
             payload["warning"] = memory_sync_error
-        if not os.getenv("POSTGRES_URI"):
-            payload["note"] = "Spec DAG cloud sync skipped (no server POSTGRES_URI)."
         return _ok(payload)
     except Exception as e:
         return _err(f"Sync error: {e}")

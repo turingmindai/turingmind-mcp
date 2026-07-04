@@ -358,6 +358,15 @@ Tool(
                 "default": "all",
             },
             "scope": {"type": "string", "description": "Filter by scope"},
+            "branch": {
+                "type": "string",
+                "description": "Filter by git branch (requires TURINGMIND_BRANCH_MEMORY=1)",
+            },
+            "include_other_branches": {
+                "type": "boolean",
+                "description": "Include deprioritized memories from other branches",
+                "default": False,
+            },
             "security_tag": {
                 "type": "string",
                 "enum": ["auth", "crypto", "secrets", "compliance"],

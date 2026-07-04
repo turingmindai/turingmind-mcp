@@ -14,7 +14,17 @@ from turingmind_mcp.tools.context import ToolContext
 
 @pytest.fixture
 def ctx():
-    return ToolContext(get_db=mock.MagicMock(), get_config=lambda: ("", ""))
+    import logging
+    return ToolContext(
+        client=mock.MagicMock(),
+        api_url="",
+        headers={},
+        logger=logging.getLogger("test"),
+        save_api_key=lambda url, key: "",
+        version="1.0",
+        get_db=mock.MagicMock(),
+        get_config=lambda: ("", ""),
+    )
 
 
 @pytest.mark.asyncio
@@ -23,8 +33,8 @@ class TestHandleSyncCloud:
         result = await handle_sync_cloud({}, ctx)
         assert "repo is required" in result[0].text
 
-    async def test_errors_when_no_cloud_or_postgres_config(self, ctx):
-        env = {k: v for k, v in os.environ.items() if k not in ("POSTGRES_URI", "TURINGMIND_CLOUD_SYNC")}
+    async def test_errors_when_no_cloud_config(self, ctx):
+        env = {k: v for k, v in os.environ.items() if k != "TURINGMIND_CLOUD_SYNC"}
         with mock.patch.dict(os.environ, env, clear=True):
             with mock.patch("turingmind_mcp.server.get_config", return_value=("", "")):
                 with mock.patch("turingmind_mcp.server.get_db", return_value=mock.MagicMock()):
@@ -41,7 +51,6 @@ class TestHandleSyncCloud:
 
     async def test_cloud_api_path_success(self, ctx):
         with mock.patch.dict(os.environ, {"TURINGMIND_CLOUD_SYNC": "1"}, clear=False):
-            os.environ.pop("POSTGRES_URI", None)
             with mock.patch(
                 "turingmind_mcp.server.get_config",
                 return_value=("https://api.example.com", "tmk_test"),

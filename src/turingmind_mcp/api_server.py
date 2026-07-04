@@ -1,5 +1,6 @@
 import logging
 import datetime
+import json
 import os
 import uuid
 import hashlib
@@ -410,6 +411,41 @@ class MemorySavePayload(BaseModel):
     node_id: Optional[str] = None   # optional SpecNode link
     evidence: list[dict] = []
     ttl_hours: Optional[int] = None # session_context expiry (default 24h)
+    git: Optional["GitContextPayload"] = None
+
+
+class GitContextPayload(BaseModel):
+    branch: Optional[str] = None
+    head: Optional[str] = None
+    dirty: bool = False
+    default_branch: Optional[str] = None
+    scope_tier: Optional[str] = None
+
+
+def _git_storage_fields(git: Optional[GitContextPayload]) -> Dict[str, Any]:
+    """Validate hook/API git blob and map to memory/observation columns."""
+    from .git_context import (
+        git_context_from_payload,
+        git_fields_for_storage,
+        normalize_scope_tier_write,
+    )
+
+    if git is None:
+        return git_fields_for_storage(None)
+    try:
+        ctx = git_context_from_payload(git.model_dump(exclude={"scope_tier"}))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    fields = git_fields_for_storage(ctx)
+    try:
+        fields["scope_tier"] = normalize_scope_tier_write(
+            fields["branch"],
+            bool(fields["git_dirty"]),
+            git.scope_tier,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return fields
 
 
 @app.post("/api/v2/memory")
@@ -424,6 +460,7 @@ def save_memory(payload: MemorySavePayload):
     reason = "; ".join(
         str(e.get("content", "")) for e in payload.evidence if e.get("content")
     ) or None
+    git_fields = _git_storage_fields(payload.git)
 
     try:
         if payload.type == "learned_pattern":
@@ -440,6 +477,10 @@ def save_memory(payload: MemorySavePayload):
                 scope=payload.scope,
                 evidence=payload.evidence,
                 expires_in_hours=payload.ttl_hours or 24,
+                branch=git_fields["branch"],
+                head_sha=git_fields["head_sha"],
+                git_dirty=git_fields["git_dirty"],
+                scope_tier=git_fields["scope_tier"],
             )
         else:
             memory_id = db.create_memory_entry(
@@ -449,6 +490,10 @@ def save_memory(payload: MemorySavePayload):
                 scope=payload.scope,
                 confidence=payload.confidence,
                 node_id=payload.node_id,
+                branch=git_fields["branch"],
+                head_sha=git_fields["head_sha"],
+                git_dirty=git_fields["git_dirty"],
+                scope_tier=git_fields["scope_tier"],
             )
             for ev in payload.evidence:
                 db.add_evidence(
@@ -483,6 +528,8 @@ def list_memory(
     type: Optional[str] = None,
     status: str = "active",
     scope: Optional[str] = None,
+    branch: Optional[str] = None,
+    include_other_branches: bool = False,
     limit: int = 20,
     page: int = 1,
 ):
@@ -495,6 +542,8 @@ def list_memory(
             memory_type=type,
             status=status,
             scope=scope,
+            branch=branch,
+            include_other_branches=include_other_branches,
             page=page,
             limit=limit,
             search=search,
@@ -515,6 +564,9 @@ def list_memory(
                 "content": e["content"],
                 "scope": e["scope"],
                 "confidence": e["confidence"],
+                "branch": e.get("branch"),
+                "head_sha": e.get("head_sha"),
+                "scope_tier": e.get("scope_tier"),
                 "node_id": e.get("node_id"),
                 "created_at": e.get("created_at"),
                 "expires_at": e.get("expires_at"),
@@ -530,10 +582,17 @@ def get_relevant_memory(
     files: str = "",
     limit: int = 50,
     exclude_types: Optional[str] = None,
+    branch: Optional[str] = None,
+    head: Optional[str] = None,
+    dirty: Optional[bool] = None,
+    include_other_branches: bool = False,
+    include_session_context: bool = False,
 ):
     """Return active memories relevant to changed files (repo-wide + scoped matches).
 
     ``files`` is a comma-separated list of paths (e.g. ``src/auth.py,lib/utils.ts``).
+    When ``TURINGMIND_BRANCH_MEMORY=1``, pass ``branch``/``head``/``dirty`` or rely on
+    server inference from ``TURINGMIND_WORKSPACE_DIR`` (SPEC-BR-10).
     """
     if not repo:
         raise HTTPException(status_code=400, detail="repo is required")
@@ -547,6 +606,11 @@ def get_relevant_memory(
             file_paths=file_paths,
             exclude_types=skip or None,
             limit=limit,
+            branch=branch,
+            head=head,
+            dirty=dirty,
+            include_other_branches=include_other_branches,
+            include_session_context=include_session_context,
         )
     except Exception as e:
         logger.exception("Memory relevant lookup failed")
@@ -564,6 +628,9 @@ def get_relevant_memory(
                 "content": e["content"],
                 "scope": e["scope"],
                 "confidence": e["confidence"],
+                "branch": e.get("branch"),
+                "head_sha": e.get("head_sha"),
+                "scope_tier": e.get("scope_tier"),
                 "node_id": e.get("node_id"),
                 "created_at": e.get("created_at"),
                 "expires_at": e.get("expires_at"),
@@ -591,6 +658,7 @@ class ObservationRecord(BaseModel):
 class ObservationPayload(BaseModel):
     repo: str
     observations: list[ObservationRecord]
+    git: Optional[GitContextPayload] = None
 
 
 @app.post("/api/v2/observations")
@@ -600,6 +668,10 @@ def save_observations(payload: ObservationPayload):
         raise HTTPException(status_code=400, detail="repo and observations are required")
 
     db = _memory_db()
+    git_fields = _git_storage_fields(payload.git)
+    git_context_json = (
+        json.dumps(payload.git.model_dump(), sort_keys=True) if payload.git else None
+    )
     ids = []
     try:
         for obs in payload.observations:
@@ -612,6 +684,10 @@ def save_observations(payload: ObservationPayload):
                 evidence=obs.evidence or None,
                 node_id=obs.node_id,
                 observed_at=obs.observed_at,
+                branch=git_fields["branch"],
+                head_sha=git_fields["head_sha"],
+                git_dirty=git_fields["git_dirty"],
+                git_context=git_context_json,
             ))
     except Exception as e:
         logger.exception("Observation save failed")
@@ -643,6 +719,7 @@ def list_observations(
 
 class MemorySyncPullPayload(BaseModel):
     repo: str
+    branch: Optional[str] = None
 
 
 def _verify_ingest_key(x_turingmind_ingest_key: Optional[str]) -> None:
@@ -659,7 +736,7 @@ def _verify_ingest_key(x_turingmind_ingest_key: Optional[str]) -> None:
 
 @app.post("/api/v2/sync/pull")
 async def pull_memory_sync(payload: MemorySyncPullPayload):
-    """Pull remote memory updates (tombstones + newer rows) and merge locally without pushing."""
+    """Pull remote memory updates (tombstones + branch-scoped active rows) without pushing."""
     if not payload.repo:
         raise HTTPException(status_code=400, detail="repo is required")
 
@@ -668,14 +745,22 @@ async def pull_memory_sync(payload: MemorySyncPullPayload):
     api_key = os.environ.get("TURINGMIND_API_KEY", "").strip()
 
     try:
-        from .cloud_memory_client import pull_memories_local, pull_memories_via_cloud_api, use_cloud_sync
+        from .cloud_memory_client import (
+            EMPTY_MEMORY_PULL_STATS,
+            pull_memories_via_cloud_api,
+            use_cloud_sync,
+        )
 
         if use_cloud_sync(api_url, api_key):
             stats, _ = await pull_memories_via_cloud_api(
-                db, payload.repo, api_url=api_url, api_key=api_key
+                db,
+                payload.repo,
+                api_url=api_url,
+                api_key=api_key,
+                branch=payload.branch,
             )
         else:
-            stats = pull_memories_local(db, payload.repo)
+            stats = dict(EMPTY_MEMORY_PULL_STATS)
     except PermissionError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
     except RuntimeError as exc:
@@ -690,12 +775,39 @@ async def pull_memory_sync(payload: MemorySyncPullPayload):
 
 class CIObservationPayload(BaseModel):
     repo: str
+    branch: Optional[str] = None
+    pr_number: Optional[int] = None
+    head_sha: Optional[str] = None
     workflow_name: Optional[str] = None
     conclusion: str = "failure"
     check_name: Optional[str] = None
     run_url: Optional[str] = None
-    head_sha: Optional[str] = None
     coverage_delta: Optional[float] = None
+
+
+def _validate_ci_observation_payload(payload: CIObservationPayload) -> tuple[str, str, int, str]:
+    """Validate CI ingest fields (SPEC-BR-09 / TC-BR-28). Returns branch, head_sha, pr_number, check label."""
+    from .git_context import validate_branch_name, validate_head_sha
+
+    if not payload.repo or not payload.repo.strip():
+        raise HTTPException(status_code=400, detail="repo is required")
+    if not payload.branch or not str(payload.branch).strip():
+        raise HTTPException(status_code=400, detail="branch is required")
+    if payload.pr_number is None or payload.pr_number < 1:
+        raise HTTPException(status_code=400, detail="pr_number is required")
+    if not payload.head_sha or not str(payload.head_sha).strip():
+        raise HTTPException(status_code=400, detail="head_sha is required")
+
+    branch = str(payload.branch).strip()
+    head_sha = str(payload.head_sha).strip().lower()
+    try:
+        validate_branch_name(branch)
+        validate_head_sha(head_sha)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    check = payload.check_name or payload.workflow_name or "ci_check"
+    return branch, head_sha, int(payload.pr_number), check
 
 
 @app.post("/api/v2/observations/ci")
@@ -703,39 +815,59 @@ def ingest_ci_observation(
     payload: CIObservationPayload,
     x_turingmind_ingest_key: Optional[str] = Header(None, alias="X-TuringMind-Ingest-Key"),
 ):
-    """Ingest CI workflow/check results as high-confidence draft observations."""
+    """Ingest CI workflow/check results as branch-scoped draft observations (Phase 4.4)."""
     _verify_ingest_key(x_turingmind_ingest_key)
-    if not payload.repo:
-        raise HTTPException(status_code=400, detail="repo is required")
+    branch, head_sha, pr_number, check = _validate_ci_observation_payload(payload)
 
     conclusion = (payload.conclusion or "failure").lower()
     if conclusion not in ("failure", "cancelled", "timed_out", "success"):
         raise HTTPException(status_code=400, detail="unsupported conclusion")
 
-    check = payload.check_name or payload.workflow_name or "ci_check"
-    content = f"CI {check} conclusion={conclusion}"
+    content = (
+        f"CI {check} pr={pr_number} branch={branch} conclusion={conclusion} "
+        f"sha={head_sha[:12]}"
+    )
     if payload.coverage_delta is not None:
         content += f" coverage_delta={payload.coverage_delta:+.2f}"
-    if payload.head_sha:
-        content += f" sha={payload.head_sha[:12]}"
 
     confidence = 0.65 if conclusion != "success" else 0.55
-    evidence = [{"type": "ci", "content": payload.run_url or check}]
+    evidence = [
+        {"type": "ci", "content": payload.run_url or check},
+        {"type": "pr_number", "content": str(pr_number)},
+        {"type": "branch", "content": branch},
+        {"type": "head_sha", "content": head_sha},
+    ]
+    git_context_json = json.dumps(
+        {
+            "branch": branch,
+            "head": head_sha,
+            "dirty": False,
+            "pr_number": pr_number,
+        },
+        sort_keys=True,
+    )
 
     db = _memory_db()
     obs_id = db.create_observation(
-        repo=payload.repo,
+        repo=payload.repo.strip(),
         event_type="ci_check",
         content=content,
         source="ci-webhook",
         confidence=confidence,
         evidence=evidence,
+        branch=branch,
+        head_sha=head_sha,
+        git_dirty=0,
+        git_context=git_context_json,
     )
     return {
         "status": "recorded",
-        "repo": payload.repo,
+        "repo": payload.repo.strip(),
         "observation_id": obs_id,
         "confidence": confidence,
+        "branch": branch,
+        "head_sha": head_sha,
+        "pr_number": pr_number,
     }
 
 
@@ -767,8 +899,10 @@ class ResolveFindingPayload(BaseModel):
 @app.post("/api/v2/reconcile/findings/{finding_id}/resolve")
 def resolve_finding(finding_id: str, payload: ResolveFindingPayload):
     """Clear a reconciliation finding off the decision queue."""
+    from .reconcile import apply_finding_resolution
+
     try:
-        ok = _memory_db().resolve_finding(finding_id, payload.status)
+        ok = apply_finding_resolution(_memory_db(), finding_id, payload.status)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     if not ok:
@@ -822,23 +956,20 @@ async def _start_background_loops():
     api_url = os.environ.get("TURINGMIND_API_URL", "").strip()
     api_key = os.environ.get("TURINGMIND_API_KEY", "").strip()
     if pull_interval_min > 0:
-        from .cloud_memory_client import pull_memories_local, pull_memories_via_cloud_api, use_cloud_sync
+        from .cloud_memory_client import pull_memories_via_cloud_api, use_cloud_sync
         from .reconcile import repos_with_activity
 
         async def cloud_pull_loop():
             while True:
                 await asyncio.sleep(pull_interval_min * 60)
-                if not use_cloud_sync(api_url, api_key) and not os.environ.get("POSTGRES_URI"):
+                if not use_cloud_sync(api_url, api_key):
                     continue
                 try:
                     db = _memory_db()
                     for repo in repos_with_activity(db):
-                        if use_cloud_sync(api_url, api_key):
-                            stats, _ = await pull_memories_via_cloud_api(
-                                db, repo, api_url=api_url, api_key=api_key
-                            )
-                        else:
-                            stats = await asyncio.to_thread(pull_memories_local, db, repo)
+                        stats, _ = await pull_memories_via_cloud_api(
+                            db, repo, api_url=api_url, api_key=api_key
+                        )
                         logger.info(f"Background memory pull [{repo}]: {stats}")
                 except Exception as exc:
                     logger.warning(f"Background memory pull cycle failed: {exc}")

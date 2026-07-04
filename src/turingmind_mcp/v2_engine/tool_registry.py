@@ -564,9 +564,8 @@ V2_TOOLS: list[Tool] = [
     Tool(
         name="turingmind_sync_cloud",
         description=(
-            "Bidirectional memory sync for a repo. Production: calls the authenticated repochat sidecar "
-            "(TURINGMIND_CLOUD_SYNC=1 + TURINGMIND_API_KEY). Uses sidecar MONGODB_URI (Cosmos, colocated East US). "
-            "Local dev: direct POSTGRES_URI via docker-compose for optional SpecNode DAG only. "
+            "Bidirectional memory sync for a repo via "
+            "TURINGMIND_API_URL/api/v2/memory/cloud/sync (TURINGMIND_CLOUD_SYNC=1 + TURINGMIND_API_KEY). "
             "Pulls cloud tombstones and pushes active/candidate/deprecated memories upstream."
         ),
         inputSchema={

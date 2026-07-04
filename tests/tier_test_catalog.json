@@ -14,7 +14,8 @@
     },
     "gate_2": {
       "name": "Manual plugin and hook smoke",
-      "doc": "docs/memory-tier-test-plan.html#gate-2"
+      "doc": "docs/memory-tier-test-plan.html#gate-2",
+      "command": "PYTHONPATH=src python -m turingmind_mcp.memory_effectiveness_assess --repo <owner/repo>"
     }
   },
   "test_cases": [
@@ -221,15 +222,6 @@
       "expected": "repo_fact memories created once; second persist is no-op"
     },
     {
-      "id": "TC-D03",
-      "tier": "D",
-      "title": "Secret scrub before Postgres upsert",
-      "gate": "gate_0",
-      "automated": true,
-      "test": "tests.test_postgres_memory_sync::TestSyncMemoryEntries::test_scrubs_secrets_in_content",
-      "expected": "API keys redacted in SQL args"
-    },
-    {
       "id": "TC-D04",
       "tier": "D",
       "title": "Bidirectional sync tombstone LWW",
@@ -266,25 +258,6 @@
       "expected": "Paraphrase-near pair exceeds threshold"
     },
     {
-      "id": "TC-D08",
-      "tier": "D",
-      "title": "Live Postgres round-trip upsert and pull",
-      "gate": "gate_1",
-      "automated": true,
-      "requires_env": "POSTGRES_URI",
-      "test": "tests.test_tier_d_durability::test_tc_d08_live_postgres_round_trip",
-      "expected": "Row in memory_entries; pull returns synced row"
-    },
-    {
-      "id": "TC-D09",
-      "tier": "D",
-      "title": "Bidirectional sync push/pull cursor",
-      "gate": "gate_0",
-      "automated": true,
-      "test": "tests.test_bidirectional_sync::TestBidirectionalMemorySync::test_sync_memories_bidirectional_updates_pull_cursor",
-      "expected": "last_cloud_pull_at updated after sync"
-    },
-    {
       "id": "TC-E2E01",
       "tier": "E2E",
       "title": "Capture → reconcile → queue (no auto-activate)",
@@ -301,15 +274,6 @@
       "automated": true,
       "test": "tests.test_tier_e2e_funnel::test_tc_e2e02_agent_promotion_after_consent",
       "expected": "status=active after consent; recall returns active"
-    },
-    {
-      "id": "TC-E2E03",
-      "tier": "E2E",
-      "title": "Cloud sync push after activation (mocked Postgres)",
-      "gate": "gate_1",
-      "automated": true,
-      "test": "tests.test_tier_e2e_funnel::test_tc_e2e03_cloud_sync_after_promotion",
-      "expected": "sync_memories_bidirectional pushes active rows"
     },
     {
       "id": "TC-M01",
@@ -343,6 +307,61 @@
         "remember / recall / queue / reconcile"
       ],
       "expected": "Same CLI commands succeed; hook source tagged"
+    },
+    {
+      "id": "TC-ME-01",
+      "tier": "effectiveness",
+      "title": "Chat capture layer (live DB)",
+      "gate": "gate_2",
+      "automated": true,
+      "test": "tests.test_memory_effectiveness_live::test_layer_chat_capture",
+      "command": "turingmind memory-assess --repo <repo>",
+      "expected": "≥1 chat_exchange observation for repo"
+    },
+    {
+      "id": "TC-ME-02",
+      "tier": "effectiveness",
+      "title": "File-edit → memory layer",
+      "gate": "gate_2",
+      "automated": true,
+      "test": "tests.test_memory_effectiveness_live::test_memory_effectiveness_full_assessment",
+      "expected": "pass if hook artifacts exist; warn if API-only simulation"
+    },
+    {
+      "id": "TC-ME-03",
+      "tier": "effectiveness",
+      "title": "Chat → durable memory (reconcile)",
+      "gate": "gate_2",
+      "automated": true,
+      "test": "tests.test_memory_effectiveness_live::test_memory_effectiveness_full_assessment",
+      "expected": "warn when patterns_mined=0 (by design until TC-C01 recurrence)"
+    },
+    {
+      "id": "TC-ME-04",
+      "tier": "effectiveness",
+      "title": "MCP list/save/recall round-trip",
+      "gate": "gate_2",
+      "automated": true,
+      "test": "tests.test_memory_effectiveness_live::test_layer_mcp_crud",
+      "expected": "REST save, list/search, relevant recall OK"
+    },
+    {
+      "id": "TC-ME-05",
+      "tier": "effectiveness",
+      "title": "Branch recall explicit isolation",
+      "gate": "gate_2",
+      "automated": true,
+      "test": "tests.test_memory_effectiveness_live::test_layer_branch_recall_explicit",
+      "expected": "Branch memory on main, excluded on other branch"
+    },
+    {
+      "id": "TC-ME-06",
+      "tier": "effectiveness",
+      "title": "Branch recall inferred from workspace",
+      "gate": "gate_2",
+      "automated": true,
+      "test": "tests.test_memory_effectiveness_live::test_layer_branch_recall_inferred",
+      "expected": "TURINGMIND_WORKSPACE_DIR is git root; recall without branch param"
     }
   ]
 }

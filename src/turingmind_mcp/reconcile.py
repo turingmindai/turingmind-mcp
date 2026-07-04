@@ -19,8 +19,8 @@ Passes:
     6. Conflict aggregator      — unresolved memory conflicts → queue findings
     7. Missing-node detector    — OBSERVED (ungoverned) L1 nodes → governance finding
     8. Duplicate merge suggester — embedding similarity → semantic_duplicate findings
-                                  (Azure text-embedding-3-small when configured,
-                                   else hash-bow fallback)
+    9. Branch lifecycle           — merge_commit obs → branch_promotion findings;
+                                  stale branches → archive_branch_memories (SPEC-BR-06/07/11)
 
 LLM distillation belongs at the adjudication gate (agent/human reviews queue
 findings) — not in this module. See Tier D optional adjudication workflow.
@@ -32,14 +32,17 @@ background loop in the API server.
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import os
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from .database import MemoryDatabase
 from .git_churn import collect_git_churn, count_scope_git_hits, resolve_git_workspace
+from .git_context import collect_git_context
 from .memory_embeddings import (
     duplicate_threshold_for,
     index_memory_embeddings,
@@ -67,6 +70,18 @@ SCOPE_CHURN_DECAY_FACTOR = 0.9
 GIT_CHURN_EQUIVALENT_HITS = 5   # git-touched scope counts like N editor signals
 SUCCESS_REINFORCEMENT_DELTA = 0.05
 SUCCESS_REINFORCEMENT_CAP = 0.95
+STALE_BRANCH_DAYS = 30
+EVENT_MERGE_COMMIT = "merge_commit"
+PROMOTABLE_MEMORY_TYPES = frozenset({"learned_pattern", "explicit_rule"})
+
+# SPEC-BR-07: documented lifecycle finding types (no ad-hoc strings)
+LIFECYCLE_FINDING_TYPES = frozenset({"branch_promotion", "archive_branch_memories"})
+RESOLVE_ACTION_FINDING_TYPES = frozenset(LIFECYCLE_FINDING_TYPES)
+
+_SCOPE_PATH_RE = re.compile(
+    r"(?:in|changed in|file)\s+([\w./-]+\.(?:py|js|ts|tsx|jsx|go|rs|java|md|yaml|yml|json|toml|css|html))",
+    re.IGNORECASE,
+)
 
 
 def _tokens(text: str) -> frozenset:
@@ -81,6 +96,55 @@ def _similarity(a: frozenset, b: frozenset) -> float:
 
 def _dedup_key(*parts: str) -> str:
     return hashlib.sha256("|".join(parts).encode()).hexdigest()[:16]
+
+
+def _observation_branch_key(obs: dict) -> str:
+    """Bucket key for Pass 1 clustering — NULL/legacy obs share one bucket."""
+    branch = obs.get("branch")
+    return branch if branch else ""
+
+
+def _scope_for_mined_candidate(exemplar: dict) -> str:
+    """Derive scope; avoid repo-wide default when observations were branch-scoped."""
+    content = exemplar.get("content") or ""
+    match = _SCOPE_PATH_RE.search(content)
+    if match:
+        return match.group(1)
+    branch = exemplar.get("branch")
+    if branch:
+        return f"branch:{branch}"
+    return "repo"
+
+
+def _git_fields_for_mined_candidate(exemplar: dict) -> Dict[str, Any]:
+    """Inherit branch metadata from exemplar observation."""
+    branch = exemplar.get("branch")
+    git_dirty = int(exemplar.get("git_dirty") or 0)
+    if branch:
+        from .git_context import derive_scope_tier
+
+        return {
+            "branch": branch,
+            "head_sha": exemplar.get("head_sha"),
+            "git_dirty": git_dirty,
+            "scope_tier": derive_scope_tier(branch, bool(git_dirty)),
+        }
+    return {
+        "branch": None,
+        "head_sha": None,
+        "git_dirty": 0,
+        "scope_tier": "repo",
+    }
+
+
+def _memory_subject_to_churn(mem: dict, current_branch: Optional[str]) -> bool:
+    """Branch-scoped memories ignore churn on other branches (SPEC-BR-03)."""
+    mem_branch = mem.get("branch")
+    if mem_branch is None:
+        return True
+    if not current_branch or current_branch == "HEAD":
+        return False
+    return mem_branch == current_branch
 
 
 def _normalize_path(path: str) -> str:
@@ -184,7 +248,7 @@ class ReconciliationEngine:
         cursor = self.db.conn.cursor()
         rows = cursor.execute(
             """
-            SELECT memory_id, scope, confidence, type, node_id, content
+            SELECT memory_id, scope, confidence, type, node_id, content, branch
             FROM memory_entries
             WHERE repo = ? AND status = 'active'
               AND type IN ('learned_pattern', 'session_context')
@@ -207,6 +271,7 @@ class ReconciliationEngine:
         stats.update(self.aggregate_conflicts(repo))
         stats.update(self.detect_missing_nodes(repo))
         stats.update(self.suggest_duplicate_merges(repo))
+        stats.update(self.branch_lifecycle(repo))
         run_id = self.db.record_reconcile_run(repo, stats)
         stats["run_id"] = run_id
         logger.info(f"Reconciliation run {run_id} for {repo}: {stats}")
@@ -236,10 +301,11 @@ class ReconciliationEngine:
         pending = sorted(pending, key=lambda o: o.get("created_at") or "")
         embed_method, vec_map = build_observation_vectors(pending)
 
-        clusters_by_type: Dict[str, List[List[dict]]] = {}
+        clusters_by_bucket: Dict[tuple, List[List[dict]]] = {}
         for obs in pending:
             event_type = obs.get("event_type") or "unknown"
-            type_clusters = clusters_by_type.setdefault(event_type, [])
+            bucket = (_observation_branch_key(obs), event_type)
+            type_clusters = clusters_by_bucket.setdefault(bucket, [])
             for cluster in type_clusters:
                 if self._observations_match(obs, cluster[0], vec_map, embed_method):
                     cluster.append(obs)
@@ -249,7 +315,7 @@ class ReconciliationEngine:
 
         clusters: List[List[dict]] = [
             cluster
-            for type_clusters in clusters_by_type.values()
+            for type_clusters in clusters_by_bucket.values()
             for cluster in type_clusters
         ]
 
@@ -259,6 +325,7 @@ class ReconciliationEngine:
             if len(cluster) < RECURRENCE_THRESHOLD:
                 continue
             exemplar = cluster[0]
+            git_fields = _git_fields_for_mined_candidate(exemplar)
             content = (
                 f"Recurring {exemplar.get('event_type', 'activity')} ({len(cluster)}x): "
                 f"{exemplar['content']}"
@@ -267,11 +334,12 @@ class ReconciliationEngine:
                 repo=repo,
                 memory_type="learned_pattern",
                 content=content,
-                scope="repo",
+                scope=_scope_for_mined_candidate(exemplar),
                 confidence=CANDIDATE_CONFIDENCE,
                 status="candidate",
                 created_by="reconcile:recurrence_miner",
                 node_id=exemplar.get("node_id"),
+                **git_fields,
             )
             for obs in cluster:
                 self.db.resolve_observation(obs["observation_id"], "accepted", memory_id)
@@ -284,7 +352,12 @@ class ReconciliationEngine:
                     f"Pattern recurred {len(cluster)}x — promote to active learned_pattern? "
                     f"Candidate: {content[:200]}"
                 ),
-                dedup_key=_dedup_key("promotion", repo, exemplar["content"][:120]),
+                dedup_key=_dedup_key(
+                    "promotion",
+                    repo,
+                    exemplar.get("branch") or "",
+                    exemplar["content"][:120],
+                ),
                 evidence=[
                     {"type": "observation", "content": o["observation_id"]}
                     for o in cluster[:10]
@@ -387,10 +460,21 @@ class ReconciliationEngine:
     def apply_invalidation_decay(self, repo: str) -> Dict[str, int]:
         """Penalize memories tied to deleted files or scopes under heavy churn."""
         workspace = resolve_git_workspace(_workspace_root())
-        sync_state = self.db.get_repo_sync_state(repo)
+        git_ctx = collect_git_context(workspace)
+        current_branch = git_ctx.branch if git_ctx else None
+
+        since_ref: Optional[str] = None
+        if current_branch and current_branch != "HEAD":
+            since_ref = self.db.get_branch_git_cursor(repo, current_branch)
+            # First reconcile on a branch: bootstrap HEAD only — do not reuse
+            # another branch's repo-global cursor (SPEC-BR-03 / TC-BR-FS03).
+        elif since_ref is None:
+            sync_state = self.db.get_repo_sync_state(repo)
+            since_ref = sync_state.get("last_git_head")
+
         git_snapshot = collect_git_churn(
             workspace,
-            since_ref=sync_state.get("last_git_head"),
+            since_ref=since_ref,
         )
         git_observations = self._ingest_git_churn_observations(repo, git_snapshot)
 
@@ -404,19 +488,28 @@ class ReconciliationEngine:
         git_churn_decayed = 0
 
         for mem in scoped:
+            if not _memory_subject_to_churn(mem, current_branch):
+                continue
+
             scope = mem["scope"]
-            scope_path = Path(scope)
-            if not scope_path.is_absolute():
-                full_path = workspace / scope
+            if scope.startswith("branch:"):
+                # Pseudo-scope from Pass 1 — not a workspace path (SPEC-BR-02).
+                scope_path = None
+                full_path = None
             else:
-                full_path = scope_path
+                scope_path = Path(scope)
+                if not scope_path.is_absolute():
+                    full_path = workspace / scope
+                else:
+                    full_path = scope_path
 
             git_deleted = bool(
                 git_snapshot
+                and full_path is not None
                 and any(_scope_matches_file(scope, p) for p in git_snapshot.deleted)
             )
 
-            if git_deleted or not full_path.exists():
+            if full_path is not None and (git_deleted or not full_path.exists()):
                 if self._apply_confidence_penalty(
                     repo,
                     mem["memory_id"],
@@ -481,6 +574,8 @@ class ReconciliationEngine:
                     git_churn_decayed += 1
 
         if git_snapshot:
+            if current_branch and current_branch != "HEAD":
+                self.db.set_branch_git_cursor(repo, current_branch, git_snapshot.head)
             self.db.set_repo_sync_state(repo, last_git_head=git_snapshot.head)
 
         return {
@@ -657,6 +752,7 @@ class ReconciliationEngine:
             e for e in entries
             if e["type"] in ("learned_pattern", "explicit_rule", "repo_fact")
         ]
+        promoted_pairs = _promotion_lineage_pairs(entries)
         index_stats = index_memory_embeddings(self.db, entries)
 
         rows = self.db.list_memory_embeddings(repo)
@@ -678,7 +774,7 @@ class ReconciliationEngine:
 
             for id_a, id_b, sim in pair_list:
                 pair = tuple(sorted((id_a, id_b)))
-                if pair in seen_pairs:
+                if pair in seen_pairs or pair in promoted_pairs:
                     continue
                 seen_pairs.add(pair)
                 finding_id = self.db.create_finding(
@@ -708,6 +804,292 @@ class ReconciliationEngine:
             "embed_method": index_stats.get("embed_method"),
             "vec_index": sqlite_vec_enabled(),
         }
+
+    # ── Pass 9: branch lifecycle (SPEC-BR-06/07/11) ───────────────────────────
+    def branch_lifecycle(self, repo: str) -> Dict[str, int]:
+        """Merge promotions + stale-branch archive findings (consent-gated)."""
+        touched_memory_ids: set[str] = set()
+        promotions = self._propose_merge_promotions(repo, touched_memory_ids)
+        archives = self._propose_stale_archives(repo, touched_memory_ids)
+        return {
+            "branch_promotions_suggested": promotions,
+            "branch_archives_suggested": archives,
+        }
+
+    def _propose_merge_promotions(
+        self, repo: str, touched_memory_ids: set[str]
+    ) -> int:
+        """Pending merge_commit observations → branch_promotion queue items."""
+        pending = self.db.list_observations(
+            repo=repo,
+            status="pending",
+            event_type=EVENT_MERGE_COMMIT,
+            limit=50,
+        )
+        suggested = 0
+        for obs in pending:
+            source_branch = _merged_source_branch(obs)
+            if not source_branch:
+                self.db.resolve_observation(obs["observation_id"], "rejected")
+                continue
+
+            branch_memories = [
+                m
+                for m in self.db.list_memory_entries(
+                    repo=repo, status="all", limit=5000
+                )
+                if m.get("branch") == source_branch
+                and m.get("status") in ("active", "candidate")
+                and m.get("type") in PROMOTABLE_MEMORY_TYPES
+            ]
+
+            created = 0
+            for mem in branch_memories:
+                mid = mem["memory_id"]
+                if mid in touched_memory_ids:
+                    continue
+                finding_id = self.db.create_finding(
+                    repo=repo,
+                    finding_type="branch_promotion",
+                    severity="medium",
+                    action=(
+                        f"Merge detected — promote '{source_branch}' memory "
+                        f"{mid[:8]} to repo-wide (L4)?"
+                    ),
+                    dedup_key=_dedup_key(
+                        "branch_promotion", repo, source_branch, mid
+                    ),
+                    evidence=[
+                        {"type": "branch", "content": source_branch},
+                        {
+                            "type": "merge_observation",
+                            "content": obs["observation_id"],
+                        },
+                        {"type": "memory", "content": mid},
+                    ],
+                    memory_id=mid,
+                )
+                if finding_id:
+                    suggested += 1
+                    created += 1
+                    touched_memory_ids.add(mid)
+
+            self.db.resolve_observation(obs["observation_id"], "accepted")
+            if created == 0 and not branch_memories:
+                logger.debug(
+                    "Merge obs %s: no branch memories on %s",
+                    obs["observation_id"][:8],
+                    source_branch,
+                )
+        return suggested
+
+    def _propose_stale_archives(
+        self, repo: str, touched_memory_ids: set[str]
+    ) -> int:
+        """Surface stale-branch archive findings; skip memories touched this run."""
+        now = datetime.now(timezone.utc)
+        cursor = self.db.conn.cursor()
+        rows = cursor.execute(
+            """
+            SELECT branch, MAX(updated_at) AS last_activity, COUNT(*) AS cnt
+            FROM memory_entries
+            WHERE repo = ? AND branch IS NOT NULL AND status = 'active'
+            GROUP BY branch
+            """,
+            (repo,),
+        ).fetchall()
+
+        archives = 0
+        for row in rows:
+            branch = row["branch"]
+            if not branch:
+                continue
+            try:
+                last = datetime.fromisoformat(str(row["last_activity"]).replace(" ", "T"))
+                if last.tzinfo is None:
+                    last = last.replace(tzinfo=timezone.utc)
+            except (ValueError, TypeError):
+                continue
+            age_days = (now - last).total_seconds() / 86400
+            if age_days < STALE_BRANCH_DAYS:
+                continue
+
+            branch_memories = cursor.execute(
+                """
+                SELECT memory_id FROM memory_entries
+                WHERE repo = ? AND branch = ? AND status = 'active'
+                """,
+                (repo, branch),
+            ).fetchall()
+            memory_ids = [r["memory_id"] for r in branch_memories]
+            if any(mid in touched_memory_ids for mid in memory_ids):
+                continue
+
+            finding_id = self.db.create_finding(
+                repo=repo,
+                finding_type="archive_branch_memories",
+                severity="low",
+                action=(
+                    f"Branch '{branch}' inactive for {age_days:.0f}d — "
+                    f"archive {len(memory_ids)} branch-scoped memories?"
+                ),
+                dedup_key=_dedup_key("archive_branch", repo, branch),
+                evidence=[
+                    {"type": "branch", "content": branch},
+                    {"type": "memory_count", "content": str(len(memory_ids))},
+                    *(
+                        {"type": "memory", "content": mid}
+                        for mid in memory_ids[:20]
+                    ),
+                ],
+                memory_id=memory_ids[0] if memory_ids else None,
+            )
+            if finding_id:
+                archives += 1
+                touched_memory_ids.update(memory_ids)
+
+        return archives
+
+
+def _evidence_value(obs: dict, ev_type: str) -> Optional[str]:
+    for ev in obs.get("evidence") or []:
+        if ev.get("type") == ev_type:
+            content = ev.get("content")
+            return str(content) if content is not None else None
+    return None
+
+
+def _default_branch_from_obs(obs: dict) -> Optional[str]:
+    raw = obs.get("git_context")
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw) if isinstance(raw, str) else raw
+        val = data.get("default_branch")
+        return str(val) if val else None
+    except (json.JSONDecodeError, TypeError, AttributeError):
+        return None
+
+
+def _normalize_branch_name(name: str) -> str:
+    cleaned = name.strip()
+    for prefix in ("remotes/origin/", "origin/"):
+        if cleaned.startswith(prefix):
+            cleaned = cleaned[len(prefix) :]
+    if "~" in cleaned:
+        cleaned = cleaned.split("~", 1)[0]
+    if "^" in cleaned:
+        cleaned = cleaned.split("^", 1)[0]
+    return cleaned
+
+
+def _merged_source_branch(obs: dict) -> Optional[str]:
+    """Infer the merged-away feature branch from merge_commit observation."""
+    default_branch = _default_branch_from_obs(obs)
+    merge_branches = _evidence_value(obs, "merge_branches")
+    if merge_branches:
+        for raw in merge_branches.split(","):
+            name = _normalize_branch_name(raw)
+            if not name or name == "HEAD":
+                continue
+            if default_branch and name == default_branch:
+                continue
+            return name
+
+    branch = obs.get("branch")
+    if branch and branch not in ("HEAD",) and branch != default_branch:
+        return str(branch)
+    return None
+
+
+def _promotion_lineage_pairs(entries: List[dict]) -> set[tuple[str, str]]:
+    """Pairs linked by promoted_from — skip Pass 8 semantic_duplicate (SPEC-BR-06)."""
+    pairs: set[tuple[str, str]] = set()
+    for entry in entries:
+        source_id = entry.get("promoted_from")
+        if source_id:
+            pairs.add(tuple(sorted((entry["memory_id"], source_id))))
+    return pairs
+
+
+def execute_branch_promotion(db: MemoryDatabase, finding: dict) -> str:
+    """Accept branch_promotion: create L4 copy with lineage (SPEC-BR-06)."""
+    source_id = finding.get("memory_id")
+    if not source_id:
+        raise ValueError("branch_promotion finding missing memory_id")
+    source = db.get_memory_entry(source_id)
+    if not source:
+        raise ValueError(f"source memory not found: {source_id}")
+    if source.get("status") not in ("active", "candidate"):
+        raise ValueError("branch_promotion source must be active or candidate")
+
+    scope = source["scope"]
+    if scope.startswith("branch:"):
+        scope = "repo"
+
+    l4_id = db.create_memory_entry(
+        repo=source["repo"],
+        memory_type=source["type"],
+        content=source["content"],
+        scope=scope,
+        confidence=source["confidence"],
+        status="active",
+        created_by="reconcile:branch_promotion",
+        node_id=source.get("node_id"),
+        branch=None,
+        head_sha=None,
+        git_dirty=0,
+        scope_tier="repo",
+        promoted_from=source_id,
+    )
+    db.update_memory_entry(source_id, status="deprecated")
+    return l4_id
+
+
+def execute_branch_archive(db: MemoryDatabase, finding: dict) -> int:
+    """Accept archive_branch_memories: idempotent tombstone (SPEC-BR-11)."""
+    branch = None
+    for ev in finding.get("evidence") or []:
+        if ev.get("type") == "branch":
+            branch = ev.get("content")
+            break
+    if not branch:
+        raise ValueError("archive_branch_memories finding missing branch evidence")
+
+    archived = 0
+    for mem in db.list_memory_entries(repo=finding["repo"], status="active", limit=5000):
+        if mem.get("branch") != branch:
+            continue
+        if mem["status"] != "active":
+            continue
+        db.update_memory_entry(mem["memory_id"], status="deprecated")
+        archived += 1
+    return archived
+
+
+def apply_finding_resolution(
+    db: MemoryDatabase, finding_id: str, status: str
+) -> bool:
+    """Resolve a finding and run consent-gated side effects when actioned."""
+    if status not in ("actioned", "dismissed"):
+        raise ValueError(f"Invalid finding status: {status}")
+
+    finding = db.get_finding(finding_id)
+    if not finding:
+        return False
+    if finding.get("status") != "pending":
+        return True
+
+    if status == "actioned":
+        finding_type = finding.get("finding_type")
+        if finding_type not in RESOLVE_ACTION_FINDING_TYPES:
+            pass
+        elif finding_type == "branch_promotion":
+            execute_branch_promotion(db, finding)
+        elif finding_type == "archive_branch_memories":
+            execute_branch_archive(db, finding)
+
+    return db.resolve_finding(finding_id, status)
 
 
 def reconcile_repo(db: MemoryDatabase, repo: str) -> Dict[str, Any]:
