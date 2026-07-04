@@ -500,6 +500,74 @@ def list_memory(
     }
 
 
+# ── Observation endpoints — draft beliefs awaiting reconciliation ────────────
+# Hooks post observations (single or batched, e.g. a spool replay). They stay
+# out of memory recall until a reconciliation pass or explicit accept.
+
+class ObservationRecord(BaseModel):
+    event_type: str                  # edit_cluster | blocked_push | intent | ...
+    content: str
+    source: Optional[str] = None     # cursor-hook | antigravity-hook | cli
+    confidence: float = 0.3
+    evidence: list[dict] = []
+    node_id: Optional[str] = None
+    observed_at: Optional[str] = None  # client-side timestamp (spooled events
+                                       # arrive long after they happened)
+
+
+class ObservationPayload(BaseModel):
+    repo: str
+    observations: list[ObservationRecord]
+
+
+@app.post("/api/v2/observations")
+def save_observations(payload: ObservationPayload):
+    """Record draft observations. Batch-friendly so offline spools replay in one call."""
+    if not payload.repo or not payload.observations:
+        raise HTTPException(status_code=400, detail="repo and observations are required")
+
+    db = _memory_db()
+    ids = []
+    try:
+        for obs in payload.observations:
+            ids.append(db.create_observation(
+                repo=payload.repo,
+                event_type=obs.event_type,
+                content=obs.content,
+                source=obs.source,
+                confidence=obs.confidence,
+                evidence=obs.evidence or None,
+                node_id=obs.node_id,
+                observed_at=obs.observed_at,
+            ))
+    except Exception as e:
+        logger.exception("Observation save failed")
+        raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
+
+    logger.info(f"Recorded {len(ids)} observation(s) for {payload.repo}")
+    return {"status": "recorded", "repo": payload.repo, "observation_ids": ids}
+
+
+@app.get("/api/v2/observations")
+def list_observations(
+    repo: str,
+    status: str = "pending",
+    event_type: Optional[str] = None,
+    limit: int = 100,
+):
+    """List observations, defaulting to those awaiting reconciliation."""
+    if not repo:
+        raise HTTPException(status_code=400, detail="repo is required")
+    try:
+        rows = _memory_db().list_observations(
+            repo=repo, status=status, event_type=event_type, limit=limit
+        )
+    except Exception as e:
+        logger.exception("Observation list failed")
+        raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
+    return {"repo": repo, "total": len(rows), "observations": rows}
+
+
 @app.post("/api/v2/graph/nodes")
 def create_node(payload: CreateNodePayload):
     """REST endpoint to create a new SpecNode — mirrors MCP handle_create_spec_node."""

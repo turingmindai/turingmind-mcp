@@ -241,8 +241,32 @@ class MemoryDatabase:
             )
         """)
 
+        # Observations Table — draft beliefs captured by hooks/plugins.
+        # These are hypotheses, not truth: reconciliation passes (or an
+        # explicit accept) promote them into memory_entries; until then they
+        # never surface in recall.
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS observations (
+                observation_id TEXT PRIMARY KEY,
+                repo TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                content TEXT NOT NULL,
+                source TEXT,
+                confidence REAL DEFAULT 0.3,
+                evidence TEXT,
+                status TEXT NOT NULL DEFAULT 'pending',
+                node_id TEXT,
+                memory_id TEXT,
+                observed_at DATETIME,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                reconciled_at DATETIME
+            )
+        """)
+
         # Create indexes
         indexes = [
+            "CREATE INDEX IF NOT EXISTS idx_observations_repo_status ON observations(repo, status)",
+            "CREATE INDEX IF NOT EXISTS idx_observations_repo_event ON observations(repo, event_type)",
             "CREATE INDEX IF NOT EXISTS idx_memory_repo_type ON memory_entries(repo, type)",
             "CREATE INDEX IF NOT EXISTS idx_memory_repo_status ON memory_entries(repo, status)",
             "CREATE INDEX IF NOT EXISTS idx_memory_repo_scope ON memory_entries(repo, scope)",
@@ -536,6 +560,98 @@ class MemoryDatabase:
                 result["security_tags"] = json.loads(result["security_tags"])
             results.append(result)
         return results
+
+    # Observation Operations (draft beliefs — see reconciliation design)
+    def create_observation(
+        self,
+        repo: str,
+        event_type: str,
+        content: str,
+        source: Optional[str] = None,
+        confidence: float = 0.3,
+        evidence: Optional[List[Dict[str, Any]]] = None,
+        node_id: Optional[str] = None,
+        observed_at: Optional[str] = None,
+    ) -> str:
+        """Record a draft observation. Never surfaces in memory recall until
+        a reconciliation pass (or explicit accept) promotes it."""
+        observation_id = str(uuid.uuid4())
+        confidence = max(0.0, min(1.0, confidence))
+        cursor = self.conn.cursor()
+        cursor.execute(
+            """
+            INSERT INTO observations (
+                observation_id, repo, event_type, content, source,
+                confidence, evidence, node_id, observed_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                observation_id,
+                repo,
+                event_type,
+                content,
+                source,
+                confidence,
+                json.dumps(evidence) if evidence else None,
+                node_id,
+                observed_at,
+            ),
+        )
+        self.conn.commit()
+        return observation_id
+
+    def list_observations(
+        self,
+        repo: str,
+        status: Optional[str] = "pending",
+        event_type: Optional[str] = None,
+        limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        """List observations, defaulting to those awaiting reconciliation."""
+        cursor = self.conn.cursor()
+        query = "SELECT * FROM observations WHERE repo = ?"
+        params: List[Any] = [repo]
+        if status and status != "all":
+            query += " AND status = ?"
+            params.append(status)
+        if event_type:
+            query += " AND event_type = ?"
+            params.append(event_type)
+        query += " ORDER BY created_at DESC LIMIT ?"
+        params.append(limit)
+        cursor.execute(query, params)
+        results = []
+        for row in cursor.fetchall():
+            result = dict(row)
+            if result.get("evidence"):
+                try:
+                    result["evidence"] = json.loads(result["evidence"])
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            results.append(result)
+        return results
+
+    def resolve_observation(
+        self,
+        observation_id: str,
+        status: str,
+        memory_id: Optional[str] = None,
+    ) -> bool:
+        """Mark an observation accepted/rejected, optionally linking the
+        memory entry it was promoted into."""
+        if status not in ("accepted", "rejected"):
+            raise ValueError(f"Invalid observation status: {status}")
+        cursor = self.conn.cursor()
+        cursor.execute(
+            """
+            UPDATE observations
+            SET status = ?, memory_id = ?, reconciled_at = CURRENT_TIMESTAMP
+            WHERE observation_id = ?
+            """,
+            (status, memory_id, observation_id),
+        )
+        self.conn.commit()
+        return cursor.rowcount > 0
 
     def update_memory_entry(
         self,

@@ -304,6 +304,64 @@ class TestMemorySearchFTS(unittest.TestCase):
         self.assertIn("Working on the login page styling", contents)
 
 
+class TestObservations(unittest.TestCase):
+    """Test cases for the draft-observation layer."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.db = MemoryDatabase(db_path=str(Path(self.temp_dir) / "test.db"))
+
+    def tearDown(self):
+        self.db.close()
+        import shutil
+        shutil.rmtree(self.temp_dir)
+
+    def test_create_and_list_pending(self):
+        """New observations default to pending and round-trip evidence JSON."""
+        obs_id = self.db.create_observation(
+            repo="test/repo",
+            event_type="edit_cluster",
+            content="targeted_fix/high: 1 code file changed",
+            source="cursor-hook",
+            confidence=0.3,
+            evidence=[{"type": "files", "content": "src/auth.py"}],
+        )
+        rows = self.db.list_observations(repo="test/repo")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["observation_id"], obs_id)
+        self.assertEqual(rows[0]["status"], "pending")
+        self.assertEqual(rows[0]["evidence"][0]["content"], "src/auth.py")
+
+    def test_resolve_promotes_out_of_pending(self):
+        """Accepted observations leave the pending list and link their memory."""
+        obs_id = self.db.create_observation(
+            repo="test/repo", event_type="blocked_push", content="critical gap"
+        )
+        memory_id = self.db.create_memory_entry(
+            repo="test/repo", memory_type="learned_pattern",
+            content="critical gap", scope="repo",
+        )
+        self.assertTrue(self.db.resolve_observation(obs_id, "accepted", memory_id))
+        self.assertEqual(self.db.list_observations(repo="test/repo"), [])
+        accepted = self.db.list_observations(repo="test/repo", status="accepted")
+        self.assertEqual(accepted[0]["memory_id"], memory_id)
+
+    def test_resolve_rejects_invalid_status(self):
+        obs_id = self.db.create_observation(
+            repo="test/repo", event_type="intent", content="x"
+        )
+        with self.assertRaises(ValueError):
+            self.db.resolve_observation(obs_id, "maybe")
+
+    def test_observations_never_surface_in_memory_recall(self):
+        """Draft observations must not leak into memory listings."""
+        self.db.create_observation(
+            repo="test/repo", event_type="edit_cluster", content="unique-draft-token"
+        )
+        entries = self.db.list_memory_entries(repo="test/repo", search="unique-draft-token")
+        self.assertEqual(entries, [])
+
+
 class TestMemoryToolJSON(unittest.TestCase):
     """Test cases for the JSON output contract of the memory tool handlers."""
 
