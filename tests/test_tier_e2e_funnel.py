@@ -7,7 +7,6 @@ from unittest import mock
 import pytest
 
 from turingmind_mcp.reconcile import RECURRENCE_THRESHOLD
-from turingmind_mcp.v2_engine import postgres
 
 
 @pytest.mark.tier_e2e
@@ -83,23 +82,3 @@ def test_tc_e2e02_agent_promotion_after_consent(api_client, tier_repo):
     )
     assert any(e["memory_id"] == memory_id for e in recall.json()["entries"])
 
-
-@pytest.mark.tier_e2e
-@mock.patch.object(postgres, "sync_memory_entries", return_value=1)
-@mock.patch.object(postgres, "pull_memory_entries", return_value=[])
-def test_tc_e2e03_cloud_sync_after_promotion(_pull, _push, api_client, tier_repo):
-    """TC-E2E03: Bidirectional cloud sync pushes activated memories (mocked Postgres)."""
-    _client, db = api_client
-    memory_id = db.create_memory_entry(
-        repo=tier_repo,
-        memory_type="learned_pattern",
-        content="Invoice totals must use Decimal, not float",
-        scope="src/billing/invoice.py",
-        confidence=0.88,
-        status="active",
-    )
-
-    stats = postgres.sync_memories_bidirectional(db, tier_repo)
-    assert stats["memories_pushed"] == 1
-    _push.assert_called_once()
-    assert db.get_memory_entry(memory_id)["status"] == "active"

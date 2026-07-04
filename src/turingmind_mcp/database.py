@@ -118,6 +118,16 @@ class MemoryDatabase:
             cursor.execute("ALTER TABLE memory_entries ADD COLUMN node_id TEXT")
         if "deleted_at" not in existing_cols:
             cursor.execute("ALTER TABLE memory_entries ADD COLUMN deleted_at DATETIME")
+        if "branch" not in existing_cols:
+            cursor.execute("ALTER TABLE memory_entries ADD COLUMN branch TEXT")
+        if "head_sha" not in existing_cols:
+            cursor.execute("ALTER TABLE memory_entries ADD COLUMN head_sha TEXT")
+        if "git_dirty" not in existing_cols:
+            cursor.execute("ALTER TABLE memory_entries ADD COLUMN git_dirty INTEGER DEFAULT 0")
+        if "scope_tier" not in existing_cols:
+            cursor.execute("ALTER TABLE memory_entries ADD COLUMN scope_tier TEXT DEFAULT 'repo'")
+        if "promoted_from" not in existing_cols:
+            cursor.execute("ALTER TABLE memory_entries ADD COLUMN promoted_from TEXT")
 
         # Evidence Table
         cursor.execute("""
@@ -265,6 +275,18 @@ class MemoryDatabase:
             )
         """)
 
+        obs_cols = {
+            row[1] for row in cursor.execute("PRAGMA table_info(observations)").fetchall()
+        }
+        if "branch" not in obs_cols:
+            cursor.execute("ALTER TABLE observations ADD COLUMN branch TEXT")
+        if "head_sha" not in obs_cols:
+            cursor.execute("ALTER TABLE observations ADD COLUMN head_sha TEXT")
+        if "git_dirty" not in obs_cols:
+            cursor.execute("ALTER TABLE observations ADD COLUMN git_dirty INTEGER DEFAULT 0")
+        if "git_context" not in obs_cols:
+            cursor.execute("ALTER TABLE observations ADD COLUMN git_context TEXT")
+
         # Reconciliation findings — actionable proposals produced by the
         # deterministic passes (promotion candidates, stale memories,
         # conflicts, ungoverned files). Surfaced through the decision queue;
@@ -305,6 +327,16 @@ class MemoryDatabase:
                 repo TEXT PRIMARY KEY,
                 last_git_head TEXT,
                 last_cloud_pull_at TEXT
+            )
+        """)
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS branch_git_cursors (
+                repo TEXT NOT NULL,
+                branch TEXT NOT NULL,
+                last_git_head TEXT,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (repo, branch)
             )
         """)
 
@@ -364,6 +396,7 @@ class MemoryDatabase:
             "CREATE INDEX IF NOT EXISTS idx_memory_repo_type ON memory_entries(repo, type)",
             "CREATE INDEX IF NOT EXISTS idx_memory_repo_status ON memory_entries(repo, status)",
             "CREATE INDEX IF NOT EXISTS idx_memory_repo_scope ON memory_entries(repo, scope)",
+            "CREATE INDEX IF NOT EXISTS idx_memory_repo_branch ON memory_entries(repo, branch)",
             "CREATE INDEX IF NOT EXISTS idx_memory_expires_at ON memory_entries(expires_at)",
             "CREATE INDEX IF NOT EXISTS idx_evidence_memory_id ON memory_evidence(memory_id)",
             "CREATE INDEX IF NOT EXISTS idx_conflicts_repo ON memory_conflicts(repo)",
@@ -488,6 +521,11 @@ class MemoryDatabase:
         expires_at: Optional[datetime] = None,
         created_by: Optional[str] = None,
         node_id: Optional[str] = None,
+        branch: Optional[str] = None,
+        head_sha: Optional[str] = None,
+        git_dirty: int = 0,
+        scope_tier: str = "repo",
+        promoted_from: Optional[str] = None,
     ) -> str:
         """Create a new memory entry, optionally linked to a SpecNode."""
         memory_id = str(uuid.uuid4())
@@ -501,8 +539,9 @@ class MemoryDatabase:
             """
             INSERT INTO memory_entries (
                 memory_id, repo, type, content, scope, confidence,
-                status, security_tags, yaml_definition, expires_at, created_by, node_id
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                status, security_tags, yaml_definition, expires_at, created_by, node_id,
+                branch, head_sha, git_dirty, scope_tier, promoted_from
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 memory_id,
@@ -517,6 +556,11 @@ class MemoryDatabase:
                 expires_at.isoformat() if expires_at else None,
                 created_by,
                 node_id,
+                branch,
+                head_sha,
+                git_dirty,
+                scope_tier,
+                promoted_from,
             ),
         )
         self.conn.commit()
@@ -581,6 +625,8 @@ class MemoryDatabase:
         page: int = 1,
         limit: int = 50,
         search: Optional[str] = None,
+        branch: Optional[str] = None,
+        include_other_branches: bool = False,
     ) -> List[Dict[str, Any]]:
         """List memory entries with filtering.
 
@@ -618,6 +664,12 @@ class MemoryDatabase:
             query += f" AND ({prefix}scope = ? OR {prefix}scope = 'repo')"
             params.append(scope)
 
+        from .git_context import branch_memory_ranking_enabled
+
+        if branch_memory_ranking_enabled() and branch and not include_other_branches:
+            query += f" AND ({prefix}branch IS NULL OR {prefix}branch = ?)"
+            params.append(branch)
+
         if status == "active":
             query += f" AND ({prefix}expires_at IS NULL OR {prefix}expires_at > datetime('now'))"
 
@@ -651,6 +703,97 @@ class MemoryDatabase:
                 result["security_tags"] = json.loads(result["security_tags"])
             results.append(result)
 
+        return results
+
+    def list_memory_entries_for_recall(
+        self,
+        repo: str,
+        recall_branch: Optional[str],
+        recall_head: Optional[str],
+        *,
+        include_other_branches: bool = False,
+        detached: bool = False,
+        status: str = "active",
+        exclude_types: Optional[List[str]] = None,
+        limit: int = 50,
+        internal_limit: int = 500,
+    ) -> List[Dict[str, Any]]:
+        """Branch-filtered recall query — branch predicate and ORDER BY before LIMIT (SPEC-BR-04)."""
+        cursor = self.conn.cursor()
+        query = """
+            SELECT * FROM memory_entries
+            WHERE repo = ?
+              AND status = ?
+              AND deleted_at IS NULL
+        """
+        params: List[Any] = [repo, status]
+
+        if status == "active":
+            query += " AND (expires_at IS NULL OR expires_at > datetime('now'))"
+
+        if exclude_types:
+            placeholders = ",".join("?" for _ in exclude_types)
+            query += f" AND type NOT IN ({placeholders})"
+            params.extend(exclude_types)
+
+        if recall_branch is not None or recall_head is not None:
+            if not include_other_branches:
+                if detached and recall_head:
+                    query += """
+                      AND (
+                        branch IS NULL
+                        OR head_sha = ?
+                      )
+                    """
+                    params.append(recall_head)
+                elif recall_branch is not None:
+                    query += """
+                      AND (
+                        branch IS NULL
+                        OR branch = ?
+                      )
+                    """
+                    params.append(recall_branch)
+            # include_other_branches: no SQL branch filter — rank/filter in Python
+
+        if detached and recall_head:
+            query += """
+                ORDER BY
+                  CASE
+                    WHEN branch IS NULL THEN 3
+                    WHEN head_sha = ? AND git_dirty = 1 THEN 0
+                    WHEN head_sha = ? THEN 1
+                    ELSE 4
+                  END,
+                  created_at DESC
+                LIMIT ?
+            """
+            params.extend([recall_head, recall_head, internal_limit])
+        elif recall_branch is not None:
+            query += """
+                ORDER BY
+                  CASE
+                    WHEN branch IS NULL THEN 3
+                    WHEN branch = ? AND git_dirty = 1 THEN 0
+                    WHEN branch = ? THEN 1
+                    ELSE 4
+                  END,
+                  created_at DESC
+                LIMIT ?
+            """
+            params.extend([recall_branch, recall_branch, internal_limit])
+        else:
+            query += " ORDER BY created_at DESC LIMIT ?"
+            params.append(internal_limit)
+
+        cursor.execute(query, params)
+        rows = cursor.fetchall()
+        results = []
+        for row in rows:
+            result = dict(row)
+            if result.get("security_tags"):
+                result["security_tags"] = json.loads(result["security_tags"])
+            results.append(result)
         return results
 
     def _list_memory_entries_like(
@@ -843,6 +986,10 @@ class MemoryDatabase:
         evidence: Optional[List[Dict[str, Any]]] = None,
         node_id: Optional[str] = None,
         observed_at: Optional[str] = None,
+        branch: Optional[str] = None,
+        head_sha: Optional[str] = None,
+        git_dirty: int = 0,
+        git_context: Optional[str] = None,
     ) -> str:
         """Record a draft observation. Never surfaces in memory recall until
         a reconciliation pass (or explicit accept) promotes it."""
@@ -853,8 +1000,9 @@ class MemoryDatabase:
             """
             INSERT INTO observations (
                 observation_id, repo, event_type, content, source,
-                confidence, evidence, node_id, observed_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                confidence, evidence, node_id, observed_at,
+                branch, head_sha, git_dirty, git_context
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 observation_id,
@@ -866,6 +1014,10 @@ class MemoryDatabase:
                 json.dumps(evidence) if evidence else None,
                 node_id,
                 observed_at,
+                branch,
+                head_sha,
+                git_dirty,
+                git_context,
             ),
         )
         self.conn.commit()
@@ -991,6 +1143,22 @@ class MemoryDatabase:
             results.append(result)
         return results
 
+    def get_finding(self, finding_id: str) -> Optional[Dict[str, Any]]:
+        """Return a reconciliation finding by ID."""
+        row = self.conn.execute(
+            "SELECT * FROM reconcile_findings WHERE finding_id = ?",
+            (finding_id,),
+        ).fetchone()
+        if not row:
+            return None
+        result = dict(row)
+        if result.get("evidence"):
+            try:
+                result["evidence"] = json.loads(result["evidence"])
+            except (json.JSONDecodeError, TypeError):
+                pass
+        return result
+
     def resolve_finding(self, finding_id: str, status: str) -> bool:
         """Mark a finding actioned or dismissed."""
         if status not in ("actioned", "dismissed"):
@@ -1006,6 +1174,32 @@ class MemoryDatabase:
         )
         self.conn.commit()
         return cursor.rowcount > 0
+
+    def get_branch_git_cursor(self, repo: str, branch: str) -> Optional[str]:
+        """Return last reconciled HEAD for a repo branch (SPEC-BR-03)."""
+        row = self.conn.execute(
+            "SELECT last_git_head FROM branch_git_cursors WHERE repo = ? AND branch = ?",
+            (repo, branch),
+        ).fetchone()
+        if not row:
+            return None
+        return row["last_git_head"]
+
+    def set_branch_git_cursor(
+        self, repo: str, branch: str, last_git_head: Optional[str]
+    ) -> None:
+        """Upsert per-branch git HEAD cursor (SPEC-BR-03)."""
+        self.conn.execute(
+            """
+            INSERT INTO branch_git_cursors (repo, branch, last_git_head, updated_at)
+            VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(repo, branch) DO UPDATE SET
+                last_git_head = excluded.last_git_head,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            (repo, branch, last_git_head),
+        )
+        self.conn.commit()
 
     def record_reconcile_run(self, repo: str, stats: Dict[str, Any]) -> str:
         """Persist per-cycle reconciliation stats (gradient observability)."""
@@ -1100,6 +1294,14 @@ class MemoryDatabase:
             if local_updated and cloud_updated and local_updated >= cloud_updated:
                 return False
 
+        branch_fields = {
+            "branch": row.get("branch"),
+            "head_sha": row.get("head_sha"),
+            "git_dirty": int(row.get("git_dirty") or 0),
+            "scope_tier": row.get("scope_tier") or ("repo" if not row.get("branch") else "branch"),
+            "promoted_from": row.get("promoted_from"),
+        }
+
         if local:
             applied = self.update_memory_entry(
                 memory_id,
@@ -1109,14 +1311,31 @@ class MemoryDatabase:
                 status=status,
                 yaml_definition=row.get("yaml_definition"),
             )
+            cursor = self.conn.cursor()
+            cursor.execute(
+                """
+                UPDATE memory_entries SET
+                    branch = ?, head_sha = ?, git_dirty = ?,
+                    scope_tier = ?, promoted_from = ?
+                WHERE memory_id = ?
+                """,
+                (
+                    branch_fields["branch"],
+                    branch_fields["head_sha"],
+                    branch_fields["git_dirty"],
+                    branch_fields["scope_tier"],
+                    branch_fields["promoted_from"],
+                    memory_id,
+                ),
+            )
+            self.conn.commit()
             if applied and is_tombstone and row.get("deleted_at"):
-                cursor = self.conn.cursor()
                 cursor.execute(
                     "UPDATE memory_entries SET deleted_at = ? WHERE memory_id = ?",
                     (row.get("deleted_at"), memory_id),
                 )
                 self.conn.commit()
-            return applied
+            return applied or cursor.rowcount > 0
 
         cursor = self.conn.cursor()
         tags = row.get("security_tags")
@@ -1132,8 +1351,9 @@ class MemoryDatabase:
             INSERT INTO memory_entries (
                 memory_id, repo, type, content, scope, confidence,
                 status, security_tags, yaml_definition, expires_at,
-                created_by, node_id, created_at, updated_at, deleted_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                created_by, node_id, created_at, updated_at, deleted_at,
+                branch, head_sha, git_dirty, scope_tier, promoted_from
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 memory_id,
@@ -1151,6 +1371,11 @@ class MemoryDatabase:
                 row.get("created_at"),
                 row.get("updated_at"),
                 row.get("deleted_at"),
+                branch_fields["branch"],
+                branch_fields["head_sha"],
+                branch_fields["git_dirty"],
+                branch_fields["scope_tier"],
+                branch_fields["promoted_from"],
             ),
         )
         self.conn.commit()

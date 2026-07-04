@@ -46,7 +46,6 @@ dependencies = [
     "tree-sitter-python>=0.21.0",
     "tree-sitter-javascript>=0.21.0",
     "tree-sitter-typescript>=0.21.0",
-    "psycopg2-binary>=2.9.9",
     "fastapi>=0.110.0",
     "uvicorn>=0.28.0",
     "websockets>=16.0",
@@ -132,6 +131,5 @@ markers = [
     "tier_c: Tier C reconcile extension tests",
     "tier_d: Tier D durability and cloud sync tests",
     "tier_e2e: End-to-end memory funnel tests",
-    "postgres_live: Requires POSTGRES_URI environment variable",
     "meta: Catalog and harness integrity tests",
 ]

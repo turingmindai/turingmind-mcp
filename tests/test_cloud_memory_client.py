@@ -11,19 +11,19 @@ from turingmind_mcp.cloud_memory_client import use_cloud_sync, sync_memories_via
 
 
 class TestUseCloudSync:
-    def test_explicit_flag_enables_cloud(self):
-        with mock.patch.dict(os.environ, {"TURINGMIND_CLOUD_SYNC": "1", "POSTGRES_URI": "local"}):
-            assert use_cloud_sync("https://api.example.com", "tmk_test") is True
-
-    def test_local_postgres_when_uri_set_and_flag_unset(self):
-        with mock.patch.dict(os.environ, {"POSTGRES_URI": "postgresql://local"}, clear=False):
-            os.environ.pop("TURINGMIND_CLOUD_SYNC", None)
+    def test_flag_disabled_returns_false(self):
+        with mock.patch.dict(os.environ, {"TURINGMIND_CLOUD_SYNC": "0"}):
             assert use_cloud_sync("https://api.example.com", "tmk_test") is False
 
-    def test_defaults_to_cloud_without_local_postgres(self):
-        env = {k: v for k, v in os.environ.items() if k != "POSTGRES_URI" and k != "TURINGMIND_CLOUD_SYNC"}
-        with mock.patch.dict(os.environ, env, clear=True):
+    def test_defaults_to_true_when_keys_present(self):
+        with mock.patch.dict(os.environ, {}):
+            os.environ.pop("TURINGMIND_CLOUD_SYNC", None)
             assert use_cloud_sync("https://api.example.com", "tmk_test") is True
+
+    def test_returns_false_when_keys_missing(self):
+        with mock.patch.dict(os.environ, {}):
+            os.environ.pop("TURINGMIND_CLOUD_SYNC", None)
+            assert use_cloud_sync("", "") is False
 
 
 @pytest.mark.asyncio

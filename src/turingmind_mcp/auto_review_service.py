@@ -194,8 +194,14 @@ class AutoReviewService:
             # Get commit message
             commit_message = self._get_commit_message(repo_path, commit_sha)
 
-            # Get memory context
-            memory_context = self.memory_manager.get_relevant_memory(repo, changed_files)
+            # Get memory context scoped to the monitored PR branch (Phase 4.4)
+            memory_context = self.memory_manager.get_relevant_memory(
+                repo,
+                changed_files,
+                branch=branch,
+                head=commit_sha,
+                dirty=False,
+            )
 
             # Trigger review via API (if available)
             if self.api_key:

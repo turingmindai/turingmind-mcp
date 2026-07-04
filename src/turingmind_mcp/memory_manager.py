@@ -334,6 +334,10 @@ class MemoryManager:
         scope: str,
         evidence: List[Dict[str, Any]],
         expires_in_hours: int = 24,
+        branch: Optional[str] = None,
+        head_sha: Optional[str] = None,
+        git_dirty: int = 0,
+        scope_tier: str = "repo",
     ) -> str:
         """Create ephemeral session context."""
         expires_at = datetime.now() + timedelta(hours=expires_in_hours)
@@ -345,6 +349,10 @@ class MemoryManager:
             scope=scope,
             confidence=0.8,
             expires_at=expires_at,
+            branch=branch,
+            head_sha=head_sha,
+            git_dirty=git_dirty,
+            scope_tier=scope_tier,
         )
 
         # Add evidence
@@ -507,17 +515,61 @@ class MemoryManager:
         *,
         exclude_types: Optional[List[str]] = None,
         limit: int = 50,
+        branch: Optional[str] = None,
+        head: Optional[str] = None,
+        dirty: Optional[bool] = None,
+        include_other_branches: bool = False,
+        include_session_context: bool = False,
     ) -> List[Dict[str, Any]]:
-        """Return active memories relevant to ``file_paths`` (repo-wide + scoped)."""
-        skip = set(exclude_types or ["session_context"])
+        """Return active memories relevant to ``file_paths`` (repo-wide + scoped).
+
+        When ``TURINGMIND_BRANCH_MEMORY=1``, ranks by branch layer (SPEC-BR-04).
+        SPEC-BR-01 Option B: ``session_context`` excluded unless
+        ``include_session_context=True``.
+        """
+        from .branch_recall import (
+            branch_rank_score,
+            resolve_recall_context,
+            sort_entries_by_branch_rank,
+        )
+
+        skip = set(exclude_types or [])
+        if include_session_context:
+            skip.discard("session_context")
+        else:
+            skip.add("session_context")
+
+        recall = resolve_recall_context(
+            branch=branch,
+            head=head,
+            dirty=dirty,
+            include_other_branches=include_other_branches,
+        )
         normalized_files = [_normalize_memory_path(f) for f in file_paths if f]
 
-        entries = self.db.list_memory_entries(repo, status="active", limit=limit)
+        if recall.ranking_enabled:
+            entries = self.db.list_memory_entries_for_recall(
+                repo,
+                recall.branch,
+                recall.head,
+                include_other_branches=recall.include_other_branches,
+                detached=recall.detached,
+                status="active",
+                exclude_types=list(skip) if skip else None,
+                internal_limit=max(limit * 10, 200),
+            )
+        else:
+            entries = self.db.list_memory_entries(
+                repo, status="active", limit=max(limit * 5, 100)
+            )
+
         unique: List[Dict[str, Any]] = []
         seen: set[str] = set()
 
         for entry in entries:
             if entry["type"] in skip:
+                continue
+            if recall.ranking_enabled and branch_rank_score(entry, recall) <= 0:
                 continue
             scope = entry.get("scope") or "repo"
             if scope == "repo" or not normalized_files:
@@ -529,6 +581,9 @@ class MemoryManager:
                 if entry["memory_id"] not in seen:
                     seen.add(entry["memory_id"])
                     unique.append(entry)
+
+        if recall.ranking_enabled:
+            unique = sort_entries_by_branch_rank(unique, recall)
 
         return unique[:limit]
 

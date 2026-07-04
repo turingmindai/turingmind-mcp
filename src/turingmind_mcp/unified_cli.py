@@ -281,6 +281,28 @@ Examples:
     # Diagnose command
     subparsers.add_parser("diagnose", help="Diagnose installation and configuration")
 
+    # Live memory effectiveness scorecard (Gate 2)
+    assess_parser = subparsers.add_parser(
+        "memory-assess",
+        help="Assess live memory-engine layers (API :8477 + ~/.turingmind/memory.db)",
+    )
+    assess_parser.add_argument("--repo", help="Repository (owner/repo)")
+    assess_parser.add_argument(
+        "--api-url",
+        help="V2 API base URL (default TURINGMIND_LOCAL_API_URL or http://127.0.0.1:8477)",
+    )
+    assess_parser.add_argument(
+        "--workspace",
+        type=Path,
+        help="Git workspace for branch inference (default TURINGMIND_WORKSPACE_DIR)",
+    )
+    assess_parser.add_argument("--json", action="store_true", help="JSON output")
+    assess_parser.add_argument(
+        "--keep-probes",
+        action="store_true",
+        help="Leave probe memories in the database",
+    )
+
     # macOS launchd daemon for V2 API (Cursor plugin hooks)
     daemon_parser = subparsers.add_parser(
         "install-api-daemon",
@@ -306,6 +328,21 @@ Examples:
         return validate_config(args.platform, args.project_root)
     elif args.command == "diagnose":
         return diagnose()
+    elif args.command == "memory-assess":
+        from .memory_effectiveness_assess import format_report, run_assessment
+
+        try:
+            report = run_assessment(
+                repo=args.repo,
+                api_url=args.api_url,
+                workspace_dir=args.workspace,
+                cleanup_probes=not args.keep_probes,
+            )
+        except (ValueError, ConnectionError) as exc:
+            print(f"❌ {exc}")
+            return 1
+        print(format_report(report, as_json=args.json))
+        return 1 if any(layer.status == "fail" for layer in report.layers) else 0
     elif args.command == "install-api-daemon":
         from .daemon_setup import install, status, uninstall
 
