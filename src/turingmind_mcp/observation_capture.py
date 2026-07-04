@@ -30,10 +30,12 @@ What they ALWAYS do
 
 from __future__ import annotations
 
+import json
 import logging
 from typing import Any, Dict, List, Optional
 
 from .database import MemoryDatabase
+from .git_context import GitContext, collect_git_context
 
 logger = logging.getLogger("turingmind-mcp.observation-capture")
 
@@ -43,6 +45,31 @@ EVENT_CHAT_EXCHANGE = "chat_exchange"
 EVENT_VERIFICATION_SUCCESS = "verification_success"
 EVENT_GIT_REVERT = "git_revert"
 EVENT_PRE_PUSH_HIGH = "pre_push_high_gap"
+
+
+def _git_observation_fields(git: Optional[GitContext] = None) -> Dict[str, Any]:
+    """Map GitContext → create_observation kwargs (TC-BR-08 poller path)."""
+    ctx = git if git is not None else collect_git_context()
+    if ctx is None:
+        return {
+            "branch": None,
+            "head_sha": None,
+            "git_dirty": 0,
+            "git_context": None,
+        }
+    payload = {
+        "branch": ctx.branch,
+        "head": ctx.head,
+        "dirty": ctx.dirty,
+    }
+    if ctx.default_branch:
+        payload["default_branch"] = ctx.default_branch
+    return {
+        "branch": ctx.branch,
+        "head_sha": ctx.head,
+        "git_dirty": 1 if ctx.dirty else 0,
+        "git_context": json.dumps(payload, sort_keys=True),
+    }
 
 
 def record_observation(
@@ -55,6 +82,7 @@ def record_observation(
     confidence: float = 0.3,
     evidence: Optional[List[Dict[str, Any]]] = None,
     node_id: Optional[str] = None,
+    git: Optional[GitContext] = None,
 ) -> Optional[str]:
     """Append a single draft observation. Returns observation_id or None on failure.
 
@@ -64,6 +92,7 @@ def record_observation(
     """
     if not repo or not content.strip():
         return None
+    git_fields = _git_observation_fields(git)
     try:
         obs_id = db.create_observation(
             repo=repo,
@@ -73,6 +102,10 @@ def record_observation(
             confidence=confidence,
             evidence=evidence,
             node_id=node_id,
+            branch=git_fields["branch"],
+            head_sha=git_fields["head_sha"],
+            git_dirty=git_fields["git_dirty"],
+            git_context=git_fields["git_context"],
         )
         logger.info(
             "Observation recorded [%s] repo=%s type=%s id=%s",

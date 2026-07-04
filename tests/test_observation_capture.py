@@ -89,6 +89,34 @@ class TestRecordHelpers:
         assert len(rows) == 1
         assert rows[0]["source"] == "chat-poller"
 
+    def test_chat_exchange_attaches_git_context(self, db, monkeypatch):
+        from turingmind_mcp.git_context import GitContext
+
+        monkeypatch.setattr(
+            "turingmind_mcp.observation_capture.collect_git_context",
+            lambda: GitContext(
+                branch="feature/x",
+                head="c" * 40,
+                dirty=True,
+                default_branch="main",
+            ),
+        )
+        obs_id = record_chat_exchange_observation(
+            db,
+            repo="org/repo",
+            composer_id="composer-git",
+            metadata={
+                "userPrompts": [{"text": "hello"}],
+                "assistantResponses": [{"text": "world"}],
+            },
+        )
+        assert obs_id
+        row = db.list_observations("org/repo", event_type=EVENT_CHAT_EXCHANGE)[0]
+        assert row["branch"] == "feature/x"
+        assert row["head_sha"] == "c" * 40
+        assert row["git_dirty"] == 1
+        assert row["git_context"] is not None
+
 
 class TestObservationCursorIsolation:
     def test_observation_cursor_does_not_touch_capture_fields(self, db):

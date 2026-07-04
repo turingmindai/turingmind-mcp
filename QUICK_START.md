@@ -66,10 +66,22 @@ cat >> ~/.turingmind/env <<'EOF'
 TURINGMIND_DEFAULT_REPO=org/repo-name
 TURINGMIND_LOCAL_API_URL=http://127.0.0.1:8477
 TURINGMIND_CLOUD_SYNC=1
-TURINGMIND_API_URL=https://your-sidecar.example.com
+TURINGMIND_API_URL=https://api.turingmind.ai
 TURINGMIND_API_KEY=tmk_...
+TURINGMIND_BRANCH_MEMORY=1
+TURINGMIND_INGEST_KEY=generate-with-openssl-rand-hex-16
+TURINGMIND_WORKSPACE_DIR=/path/to/your/git/repo
 EOF
 bash ./scripts/install-launchd.sh   # re-run to refresh launchd env
+```
+
+CI ingest from GitHub Actions (self-hosted runner or machine with daemon):
+
+```bash
+# scripts/post-ci-observation.sh — see turingmind-mcp/scripts/
+export TURINGMIND_INGEST_KEY=...  # same value as in ~/.turingmind/env
+REPO=org/repo BRANCH=feature/x HEAD_SHA=$GITHUB_SHA PR_NUMBER=42 \
+  ./scripts/post-ci-observation.sh success
 ```
 
 Add to `~/.zshrc` so **Cursor plugin hooks** see machine paths (repo id is auto-detected from git):

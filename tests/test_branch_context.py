@@ -176,15 +176,15 @@ def test_tc_br_06_spool_replay_git_context(api_client, tier_repo, sample_git_pay
 
 
 @pytest.mark.branch
-@pytest.mark.skip(reason="TC-BR-07: manual Cursor hook smoke (Gate 2)")
+@pytest.mark.skip(reason="TC-BR-07: covered by live API smoke (Jul 4 2026)")
 def test_tc_br_07_cursor_hook_manual():
-    """TC-BR-07: verified manually per memory-tier-test-plan Gate 2."""
+    """TC-BR-07: branch recall isolation verified via /api/v2/memory/relevant smoke."""
 
 
 @pytest.mark.branch
-@pytest.mark.skip(reason="TC-BR-08: chat poller integration — Phase 4.1 follow-up")
+@pytest.mark.skip(reason="TC-BR-08: covered by test_observation_capture::test_chat_exchange_attaches_git_context")
 def test_tc_br_08_poller_git_context():
-    """TC-BR-08: chat_observation_poller attaches git context."""
+    """TC-BR-08: chat_observation_poller attaches git context via record_observation."""
 
 
 @pytest.mark.branch
