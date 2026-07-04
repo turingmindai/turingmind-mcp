@@ -17,7 +17,7 @@ import os
 import sqlite3
 import uuid
 from contextlib import contextmanager
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Generator, List, Optional, Tuple
 
@@ -298,6 +298,14 @@ class MemoryDatabase:
             )
         """)
 
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS repo_sync_state (
+                repo TEXT PRIMARY KEY,
+                last_git_head TEXT,
+                last_cloud_pull_at TEXT
+            )
+        """)
+
         # Chat capture cursor — one row per Cursor composerId.
         # Tracks what we already ingested so check_exchanges() can debounce
         # without re-reading the full Cursor DB every poll cycle.
@@ -332,6 +340,17 @@ class MemoryDatabase:
             if col not in existing_cols:
                 cursor.execute(f"ALTER TABLE chat_capture_state ADD COLUMN {col} {ddl}")
 
+        # Tier D: deterministic embeddings for duplicate-merge suggestions.
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS memory_embeddings (
+                memory_id TEXT PRIMARY KEY,
+                embedding BLOB NOT NULL,
+                method TEXT NOT NULL DEFAULT 'hash_bow_v1',
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (memory_id) REFERENCES memory_entries(memory_id) ON DELETE CASCADE
+            )
+        """)
+
         # Create indexes
         indexes = [
             "CREATE INDEX IF NOT EXISTS idx_findings_repo_status ON reconcile_findings(repo, status)",
@@ -339,6 +358,7 @@ class MemoryDatabase:
             "CREATE INDEX IF NOT EXISTS idx_observations_repo_status ON observations(repo, status)",
             "CREATE INDEX IF NOT EXISTS idx_observations_repo_event ON observations(repo, event_type)",
             "CREATE INDEX IF NOT EXISTS idx_chat_capture_composer ON chat_capture_state(composer_id)",
+            "CREATE INDEX IF NOT EXISTS idx_memory_embeddings_method ON memory_embeddings(method)",
             "CREATE INDEX IF NOT EXISTS idx_memory_repo_type ON memory_entries(repo, type)",
             "CREATE INDEX IF NOT EXISTS idx_memory_repo_status ON memory_entries(repo, status)",
             "CREATE INDEX IF NOT EXISTS idx_memory_repo_scope ON memory_entries(repo, scope)",
@@ -512,6 +532,43 @@ class MemoryDatabase:
         if result.get("security_tags"):
             result["security_tags"] = json.loads(result["security_tags"])
         return result
+
+    def upsert_memory_embedding(
+        self,
+        memory_id: str,
+        embedding: bytes,
+        method: str = "hash_bow_v1",
+    ) -> None:
+        """Store or refresh the embedding vector for a memory entry."""
+        cursor = self.conn.cursor()
+        cursor.execute(
+            """
+            INSERT INTO memory_embeddings (memory_id, embedding, method, updated_at)
+            VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(memory_id) DO UPDATE SET
+                embedding = excluded.embedding,
+                method = excluded.method,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            (memory_id, embedding, method),
+        )
+        self.conn.commit()
+
+    def list_memory_embeddings(self, repo: str) -> List[Dict[str, Any]]:
+        """Return memory_id + embedding blob for active/candidate entries in repo."""
+        cursor = self.conn.cursor()
+        rows = cursor.execute(
+            """
+            SELECT e.memory_id, e.embedding, e.method, m.content, m.type, m.status
+            FROM memory_embeddings e
+            JOIN memory_entries m ON m.memory_id = e.memory_id
+            WHERE m.repo = ?
+              AND m.status IN ('active', 'candidate')
+              AND m.type IN ('learned_pattern', 'explicit_rule', 'repo_fact')
+            """,
+            (repo,),
+        ).fetchall()
+        return [dict(r) for r in rows]
 
     def list_memory_entries(
         self,
@@ -962,6 +1019,153 @@ class MemoryDatabase:
         self.conn.commit()
         return run_id
 
+    def get_repo_sync_state(self, repo: str) -> Dict[str, Any]:
+        """Return persisted git/cloud sync cursors for a repo."""
+        row = self.conn.execute(
+            "SELECT repo, last_git_head, last_cloud_pull_at FROM repo_sync_state WHERE repo = ?",
+            (repo,),
+        ).fetchone()
+        if not row:
+            return {"repo": repo, "last_git_head": None, "last_cloud_pull_at": None}
+        return dict(row)
+
+    def set_repo_sync_state(
+        self,
+        repo: str,
+        *,
+        last_git_head: Optional[str] = None,
+        last_cloud_pull_at: Optional[str] = None,
+    ) -> None:
+        """Upsert git/cloud sync cursors."""
+        current = self.get_repo_sync_state(repo)
+        head = last_git_head if last_git_head is not None else current.get("last_git_head")
+        pulled = (
+            last_cloud_pull_at
+            if last_cloud_pull_at is not None
+            else current.get("last_cloud_pull_at")
+        )
+        self.conn.execute(
+            """
+            INSERT INTO repo_sync_state (repo, last_git_head, last_cloud_pull_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(repo) DO UPDATE SET
+                last_git_head = excluded.last_git_head,
+                last_cloud_pull_at = excluded.last_cloud_pull_at
+            """,
+            (repo, head, pulled),
+        )
+        self.conn.commit()
+
+    def list_memory_entries_for_cloud_sync(
+        self,
+        repo: str,
+        limit: int = 5000,
+    ) -> List[Dict[str, Any]]:
+        """Memories to push upstream, including tombstoned (deprecated) rows."""
+        return self.list_memory_entries(
+            repo=repo,
+            status="all",
+            limit=limit,
+        )
+
+    @staticmethod
+    def _parse_db_timestamp(value: Any) -> Optional[datetime]:
+        if value is None:
+            return None
+        try:
+            parsed = datetime.fromisoformat(str(value).replace(" ", "T"))
+            if parsed.tzinfo is None:
+                return parsed.replace(tzinfo=timezone.utc)
+            return parsed
+        except (ValueError, TypeError):
+            return None
+
+    def upsert_memory_from_cloud(self, row: Dict[str, Any]) -> bool:
+        """Apply a cloud memory row locally (last-write-wins on updated_at)."""
+        memory_id = row.get("memory_id")
+        repo = row.get("repo")
+        if not memory_id or not repo:
+            return False
+
+        local = self.get_memory_entry(memory_id)
+        cloud_updated = self._parse_db_timestamp(row.get("updated_at"))
+        status = (row.get("status") or "active").lower()
+        is_tombstone = status in ("deprecated", "deleted")
+
+        if local and not is_tombstone:
+            local_updated = self._parse_db_timestamp(local.get("updated_at"))
+            if local_updated and cloud_updated and local_updated >= cloud_updated:
+                return False
+
+        if local:
+            return self.update_memory_entry(
+                memory_id,
+                content=row.get("content"),
+                scope=row.get("scope"),
+                confidence=float(row.get("confidence") or local.get("confidence") or 0.8),
+                status=status,
+                yaml_definition=row.get("yaml_definition"),
+            )
+
+        cursor = self.conn.cursor()
+        tags = row.get("security_tags")
+        if isinstance(tags, list):
+            tags_json = json.dumps(tags)
+        elif isinstance(tags, str):
+            tags_json = tags
+        else:
+            tags_json = None
+
+        cursor.execute(
+            """
+            INSERT INTO memory_entries (
+                memory_id, repo, type, content, scope, confidence,
+                status, security_tags, yaml_definition, expires_at,
+                created_by, node_id, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                memory_id,
+                repo,
+                row.get("type") or "learned_pattern",
+                row.get("content") or "",
+                row.get("scope") or "repo",
+                float(row.get("confidence") or 0.8),
+                status,
+                tags_json,
+                row.get("yaml_definition"),
+                row.get("expires_at"),
+                row.get("created_by"),
+                row.get("node_id"),
+                row.get("created_at"),
+                row.get("updated_at"),
+            ),
+        )
+        self.conn.commit()
+        return True
+
+    def apply_cloud_memory_rows(
+        self,
+        repo: str,
+        rows: List[Dict[str, Any]],
+    ) -> Dict[str, int]:
+        """Merge pulled cloud memories; propagate tombstones (deprecated/deleted)."""
+        applied = 0
+        tombstoned = 0
+        for row in rows:
+            if row.get("repo") != repo:
+                continue
+            status = (row.get("status") or "active").lower()
+            before = self.get_memory_entry(row["memory_id"])
+            before_active = before and before.get("status") == "active"
+            if not self.upsert_memory_from_cloud(row):
+                continue
+            if status in ("deprecated", "deleted") and before_active:
+                tombstoned += 1
+            else:
+                applied += 1
+        return {"memories_applied": applied, "tombstones_applied": tombstoned}
+
     def update_memory_entry(
         self,
         memory_id: str,
@@ -1014,7 +1218,7 @@ class MemoryDatabase:
         return cursor.rowcount > 0
 
     def delete_memory_entry(self, memory_id: str, deprecate: bool = True) -> bool:
-        """Delete or deprecate a memory entry."""
+        """Delete or deprecate a memory entry (deprecated rows sync as tombstones)."""
         if deprecate:
             return self.update_memory_entry(memory_id, status="deprecated")
 

@@ -58,6 +58,7 @@ TOOL_GROUPS = {
         "turingmind_bootstrap_codebase",
         "turingmind_get_decision_queue",
         "turingmind_sync_codebase",
+        "turingmind_sync_cloud",
     ],
 }
 

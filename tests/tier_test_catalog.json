@@ -1,0 +1,348 @@
+{
+  "version": "1.0",
+  "branch": "feature/memory-loop",
+  "updated": "2026-07-04",
+  "invariant": "Capture dumb → reconcile deterministic → activate only with consent",
+  "gates": {
+    "gate_0": {
+      "name": "Automated unit and integration",
+      "command": "PYTHONPATH=src python -m pytest tests/ -v"
+    },
+    "gate_1": {
+      "name": "API lab (TestClient + optional docker Postgres)",
+      "command": "PYTHONPATH=src python -m pytest tests/test_tier_*.py -v"
+    },
+    "gate_2": {
+      "name": "Manual plugin and hook smoke",
+      "doc": "docs/memory-tier-test-plan.html#gate-2"
+    }
+  },
+  "test_cases": [
+    {
+      "id": "TC-A01",
+      "tier": "A",
+      "title": "API health responds OK",
+      "gate": "gate_1",
+      "automated": true,
+      "test": "tests.test_tier_a_signal_quality::test_tc_a01_api_health",
+      "steps": ["GET /api/v2/health"],
+      "expected": "Response 200 with {\"status\":\"ok\"}"
+    },
+    {
+      "id": "TC-A02",
+      "tier": "A",
+      "title": "REST memory save and list round-trip",
+      "gate": "gate_1",
+      "automated": true,
+      "test": "tests.test_tier_a_signal_quality::test_tc_a02_memory_save_and_list",
+      "expected": "Saved memory appears with memory_id and node_id"
+    },
+    {
+      "id": "TC-A03",
+      "tier": "A",
+      "title": "MCP list/get expose node_id for linked memories",
+      "gate": "gate_0",
+      "automated": true,
+      "test": "tests.test_database::TestMemoryToolJSON::test_list_and_get_round_trip",
+      "expected": "list_memory and get_memory JSON include node_id"
+    },
+    {
+      "id": "TC-A04",
+      "tier": "A",
+      "title": "Observations never auto-promote to active recall",
+      "gate": "gate_1",
+      "automated": true,
+      "test": "tests.test_tier_a_signal_quality::test_tc_a04_observations_not_in_recall",
+      "expected": "Observation content absent from active memory recall"
+    },
+    {
+      "id": "TC-A05",
+      "tier": "A",
+      "title": "Pytest failure auto-classification is idempotent",
+      "gate": "gate_0",
+      "automated": true,
+      "test": "tests.test_v2_verification::test_verification_failure_auto_classification",
+      "expected": "classify_failure memory created; re-run does not duplicate"
+    },
+    {
+      "id": "TC-B01",
+      "tier": "B",
+      "title": "Chat exchange observation recorded",
+      "gate": "gate_0",
+      "automated": true,
+      "test": "tests.test_observation_capture::TestRecordHelpers::test_chat_exchange",
+      "expected": "chat_exchange row with user/assistant excerpt"
+    },
+    {
+      "id": "TC-B02",
+      "tier": "B",
+      "title": "Git revert observation recorded",
+      "gate": "gate_0",
+      "automated": true,
+      "test": "tests.test_observation_capture::TestRecordHelpers::test_git_revert",
+      "expected": "git_revert obs with reverted file paths"
+    },
+    {
+      "id": "TC-B03",
+      "tier": "B",
+      "title": "Verification success observation links node_id",
+      "gate": "gate_0",
+      "automated": true,
+      "test": "tests.test_observation_capture::TestRecordHelpers::test_verification_success",
+      "expected": "verification_success obs references node"
+    },
+    {
+      "id": "TC-B04",
+      "tier": "B",
+      "title": "HIGH pre-push gap observation (low confidence)",
+      "gate": "gate_0",
+      "automated": true,
+      "test": "tests.test_observation_capture::TestRecordHelpers::test_pre_push_high",
+      "expected": "pre_push_high_gap obs with confidence ~0.4"
+    },
+    {
+      "id": "TC-B05",
+      "tier": "B",
+      "title": "Observation REST ingest via API",
+      "gate": "gate_1",
+      "automated": true,
+      "test": "tests.test_tier_b_funnel::test_tc_b05_observations_api_batch",
+      "expected": "Observations stored as pending drafts"
+    },
+    {
+      "id": "TC-B06",
+      "tier": "B",
+      "title": "Poller cursor isolation from chat capture",
+      "gate": "gate_0",
+      "automated": true,
+      "test": "tests.test_observation_capture::TestObservationCursorIsolation::test_observation_cursor_does_not_touch_capture_fields",
+      "expected": "lastObservation* fields do not overwrite chat cursor"
+    },
+    {
+      "id": "TC-B07",
+      "tier": "B",
+      "title": "CRITICAL pre-push block records observation",
+      "gate": "gate_2",
+      "automated": false,
+      "manual_steps": [
+        "Seed CRITICAL gap in decision queue",
+        "Run pre-push hook on sandbox repo"
+      ],
+      "expected": "Push blocked; blocked_push observation spooled or persisted"
+    },
+    {
+      "id": "TC-C01",
+      "tier": "C",
+      "title": "Recurrence mines candidate + promotion finding",
+      "gate": "gate_0",
+      "automated": true,
+      "test": "tests.test_reconcile::TestRecurrenceMiner::test_recurring_observations_become_candidate",
+      "expected": "candidate memory + promotion_candidate finding; obs consumed"
+    },
+    {
+      "id": "TC-C02",
+      "tier": "C",
+      "title": "Event-type isolation in clustering",
+      "gate": "gate_0",
+      "automated": true,
+      "test": "tests.test_reconcile::TestEventTypeClustering::test_different_event_types_not_clustered",
+      "expected": "git_revert and edit_cluster never merge"
+    },
+    {
+      "id": "TC-C03",
+      "tier": "C",
+      "title": "Revert scope confidence penalty",
+      "gate": "gate_0",
+      "automated": true,
+      "test": "tests.test_reconcile::TestRevertPenalty::test_revert_penalizes_scope_matched_memory",
+      "expected": "Active memory confidence ×0.75 when scope reverted"
+    },
+    {
+      "id": "TC-C04",
+      "tier": "C",
+      "title": "Invalidation decay for missing scope file",
+      "gate": "gate_0",
+      "automated": true,
+      "test": "tests.test_reconcile::TestInvalidationDecay::test_missing_scope_file_decays_memory",
+      "expected": "Finding + confidence decay when scoped file deleted"
+    },
+    {
+      "id": "TC-C05",
+      "tier": "C",
+      "title": "Git churn invalidation pass",
+      "gate": "gate_0",
+      "automated": true,
+      "test": "tests.test_git_invalidation::TestGitInvalidation::test_git_touch_triggers_churn_without_editor_observations",
+      "expected": "Git diff since last_git_head contributes to invalidation"
+    },
+    {
+      "id": "TC-C06",
+      "tier": "C",
+      "title": "Reconcile via API surfaces findings on decision queue",
+      "gate": "gate_1",
+      "automated": true,
+      "test": "tests.test_tier_c_reconcile::test_tc_c06_reconcile_api_decision_queue",
+      "expected": "promotion_candidate in queue; no auto-active memories"
+    },
+    {
+      "id": "TC-C07",
+      "tier": "C",
+      "title": "Semantic Pass 1 clustering (Jaccard or embedding)",
+      "gate": "gate_0",
+      "automated": true,
+      "test": "tests.test_observation_clustering::TestSemanticRecurrenceMining::test_paraphrase_observations_cluster_for_mining",
+      "expected": "Similar obs cluster within same event_type"
+    },
+    {
+      "id": "TC-C08",
+      "tier": "C",
+      "title": "Verification success reinforces node-linked pattern",
+      "gate": "gate_0",
+      "automated": true,
+      "test": "tests.test_reconcile::TestVerificationReinforcement::test_success_obs_reinforces_node_memory",
+      "expected": "+0.05 confidence on linked learned_pattern"
+    },
+    {
+      "id": "TC-D01",
+      "tier": "D",
+      "title": "Semantic duplicate finding (hash_bow offline)",
+      "gate": "gate_0",
+      "automated": true,
+      "test": "tests.test_reconcile::TestDuplicateMergeSuggestions::test_paraphrase_pair_creates_semantic_duplicate_finding",
+      "expected": "semantic_duplicate finding when paraphrase-near actives exist"
+    },
+    {
+      "id": "TC-D02",
+      "tier": "D",
+      "title": "Bootstrap repo_facts idempotent",
+      "gate": "gate_0",
+      "automated": true,
+      "test": "tests.test_memory_manager::TestMemoryManager::test_extract_and_persist_repo_facts",
+      "expected": "repo_fact memories created once; second persist is no-op"
+    },
+    {
+      "id": "TC-D03",
+      "tier": "D",
+      "title": "Secret scrub before Postgres upsert",
+      "gate": "gate_0",
+      "automated": true,
+      "test": "tests.test_postgres_memory_sync::TestSyncMemoryEntries::test_scrubs_secrets_in_content",
+      "expected": "API keys redacted in SQL args"
+    },
+    {
+      "id": "TC-D04",
+      "tier": "D",
+      "title": "Bidirectional sync tombstone LWW",
+      "gate": "gate_0",
+      "automated": true,
+      "test": "tests.test_bidirectional_sync::TestBidirectionalMemorySync::test_cloud_tombstone_wins_over_newer_local_active",
+      "expected": "Cloud deprecated status wins over newer local active"
+    },
+    {
+      "id": "TC-D05",
+      "tier": "D",
+      "title": "Recall by changed files excludes session_context",
+      "gate": "gate_0",
+      "automated": true,
+      "test": "tests.test_tier_d_durability::test_tc_d05_relevant_memory_api_excludes_session_context",
+      "expected": "session_context omitted from relevant recall"
+    },
+    {
+      "id": "TC-D06",
+      "tier": "D",
+      "title": "LLM draft does not auto-activate memory",
+      "gate": "gate_0",
+      "automated": true,
+      "test": "tests.test_memory_distillation::TestMemoryDistillation::test_draft_returns_scrubbed_content",
+      "expected": "Draft text returned; memory status unchanged"
+    },
+    {
+      "id": "TC-D07",
+      "tier": "D",
+      "title": "Embedding duplicate pair detection (brute-force path)",
+      "gate": "gate_0",
+      "automated": true,
+      "test": "tests.test_memory_vec_index::TestMemoryVecIndex::test_brute_force_finds_similar_pair",
+      "expected": "Paraphrase-near pair exceeds threshold"
+    },
+    {
+      "id": "TC-D08",
+      "tier": "D",
+      "title": "Live Postgres round-trip upsert and pull",
+      "gate": "gate_1",
+      "automated": true,
+      "requires_env": "POSTGRES_URI",
+      "test": "tests.test_tier_d_durability::test_tc_d08_live_postgres_round_trip",
+      "expected": "Row in memory_entries; pull returns synced row"
+    },
+    {
+      "id": "TC-D09",
+      "tier": "D",
+      "title": "Bidirectional sync push/pull cursor",
+      "gate": "gate_0",
+      "automated": true,
+      "test": "tests.test_bidirectional_sync::TestBidirectionalMemorySync::test_sync_memories_bidirectional_updates_pull_cursor",
+      "expected": "last_cloud_pull_at updated after sync"
+    },
+    {
+      "id": "TC-E2E01",
+      "tier": "E2E",
+      "title": "Capture → reconcile → queue (no auto-activate)",
+      "gate": "gate_1",
+      "automated": true,
+      "test": "tests.test_tier_e2e_funnel::test_tc_e2e01_capture_reconcile_queue",
+      "expected": "Candidate only; findings on queue"
+    },
+    {
+      "id": "TC-E2E02",
+      "tier": "E2E",
+      "title": "Agent promotion after queue consent",
+      "gate": "gate_1",
+      "automated": true,
+      "test": "tests.test_tier_e2e_funnel::test_tc_e2e02_agent_promotion_after_consent",
+      "expected": "status=active after consent; recall returns active"
+    },
+    {
+      "id": "TC-E2E03",
+      "tier": "E2E",
+      "title": "Cloud sync push after activation (mocked Postgres)",
+      "gate": "gate_1",
+      "automated": true,
+      "test": "tests.test_tier_e2e_funnel::test_tc_e2e03_cloud_sync_after_promotion",
+      "expected": "sync_memories_bidirectional pushes active rows"
+    },
+    {
+      "id": "TC-M01",
+      "tier": "plugin",
+      "title": "Cursor on-file-change writes session_context + edit_cluster",
+      "gate": "gate_2",
+      "automated": false,
+      "manual_steps": [
+        "Edit file in Cursor with hook installed",
+        "GET /api/v2/observations"
+      ],
+      "expected": "edit_cluster observation; not direct learned_pattern"
+    },
+    {
+      "id": "TC-M02",
+      "tier": "plugin",
+      "title": "Antigravity post-commit revert hook",
+      "gate": "gate_2",
+      "automated": false,
+      "manual_steps": ["git revert commit with hook installed"],
+      "expected": "git_revert observation or spool entry"
+    },
+    {
+      "id": "TC-M03",
+      "tier": "plugin",
+      "title": "Claude/Codex CLI parity",
+      "gate": "gate_2",
+      "automated": false,
+      "manual_steps": [
+        "turingmind setup in sandbox",
+        "remember / recall / queue / reconcile"
+      ],
+      "expected": "Same CLI commands succeed; hook source tagged"
+    }
+  ]
+}

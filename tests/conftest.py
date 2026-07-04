@@ -1,14 +1,40 @@
-"""
-Pytest Configuration
+"""Shared fixtures for memory tier test suites."""
 
-Provides fixtures and configuration for all tests.
-"""
+from __future__ import annotations
 
-import sys
-from pathlib import Path
+import pytest
 
-# Add src to Python path for imports
-project_root = Path(__file__).parent.parent
-src_path = project_root / "src"
-if str(src_path) not in sys.path:
-    sys.path.insert(0, str(src_path))
+from turingmind_mcp.database import MemoryDatabase
+from turingmind_mcp.memory_manager import MemoryManager
+
+TIER_SANDBOX_REPO = "test-org/tier-sandbox"
+
+
+@pytest.fixture
+def tier_repo() -> str:
+    return TIER_SANDBOX_REPO
+
+
+@pytest.fixture
+def memory_db(tmp_path):
+    db = MemoryDatabase(str(tmp_path / "memory.db"))
+    yield db
+    db.close()
+
+
+@pytest.fixture
+def api_client(memory_db):
+    """FastAPI TestClient backed by an isolated memory database."""
+    import turingmind_mcp.api_server as api_mod
+
+    manager = MemoryManager(memory_db)
+    previous_db = api_mod._memory_db_instance
+    previous_manager = api_mod._memory_manager_instance
+    api_mod._memory_db_instance = memory_db
+    api_mod._memory_manager_instance = manager
+    from fastapi.testclient import TestClient
+
+    client = TestClient(api_mod.app)
+    yield client, memory_db
+    api_mod._memory_db_instance = previous_db
+    api_mod._memory_manager_instance = previous_manager

@@ -14,7 +14,9 @@ import json
 import logging
 import re
 import uuid
+from collections import Counter
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from .database import MemoryDatabase
@@ -30,40 +32,96 @@ class MemoryManager:
         self.db = db
 
     # Repo Facts (auto-extracted, read-only)
-    def extract_repo_facts(self, repo: str, files: List[str]) -> List[Dict[str, Any]]:
-        """Extract repo facts from codebase."""
-        facts = []
+    def extract_repo_facts(
+        self,
+        repo: str,
+        files: List[str],
+        project_root: Optional[Path] = None,
+    ) -> List[Dict[str, Any]]:
+        """Extract repo facts from an indexed file list (bootstrap / sync)."""
+        facts: List[Dict[str, Any]] = []
+        if not files:
+            return facts
 
-        # Detect framework from package.json
-        if "package.json" in files:
-            try:
-                # This would need actual file reading - simplified for now
-                facts.append({
-                    "type": "repo_fact",
-                    "content": "Uses Node.js/JavaScript framework",
-                    "scope": "repo",
-                    "confidence": 0.9,
-                    "evidence": ["package.json detected"],
-                })
-            except Exception as e:
-                logger.warning(f"Failed to extract framework fact: {e}")
+        normalized = [f.replace("\\", "/") for f in files]
+        basenames = {Path(f).name for f in normalized}
+        ext_counts = Counter(Path(f).suffix.lower() for f in normalized if Path(f).suffix)
 
-        # Detect monorepo structure
-        if self._detect_monorepo(files):
+        def _add(content: str, confidence: float, evidence: List[str]) -> None:
             facts.append({
                 "type": "repo_fact",
-                "content": "Monorepo structure detected",
+                "content": content,
                 "scope": "repo",
-                "confidence": 0.95,
-                "evidence": ["Multiple package.json files", "Workspace configuration"],
+                "confidence": confidence,
+                "evidence": evidence,
             })
+
+        if "package.json" in basenames or any(n.endswith("/package.json") for n in normalized):
+            _add("Node.js / JavaScript project (package.json present)", 0.9, ["package.json"])
+        if "pyproject.toml" in basenames or "requirements.txt" in basenames:
+            _add("Python project (pyproject.toml or requirements.txt present)", 0.9,
+                 [n for n in ("pyproject.toml", "requirements.txt") if n in basenames])
+        if "go.mod" in basenames:
+            _add("Go module project (go.mod present)", 0.9, ["go.mod"])
+        if "Cargo.toml" in basenames:
+            _add("Rust project (Cargo.toml present)", 0.9, ["Cargo.toml"])
+        if self._detect_monorepo(normalized):
+            _add("Monorepo structure detected (multiple package manifests)", 0.95,
+                 ["multiple package.json or workspace roots"])
+
+        top_ext = ext_counts.most_common(3)
+        if top_ext:
+            langs = ", ".join(f"{ext or '(no ext)'}×{count}" for ext, count in top_ext)
+            _add(f"Primary file types: {langs}", 0.85, [f"{len(normalized)} files indexed"])
+
+        if len(normalized) >= 500:
+            _add(f"Large codebase (~{len(normalized)} indexed source files)", 0.8,
+                 ["bootstrap file count"])
+
+        if project_root:
+            root = Path(project_root)
+            for marker, label in (
+                ("kubernetes", "Kubernetes manifests present"),
+                (".github/workflows", "GitHub Actions CI present"),
+                ("docker-compose.yml", "Docker Compose present"),
+                ("Dockerfile", "Dockerfile present"),
+            ):
+                if (root / marker).exists():
+                    _add(label, 0.85, [marker])
 
         return facts
 
+    def persist_repo_facts(self, repo: str, facts: List[Dict[str, Any]]) -> List[str]:
+        """Upsert repo_fact memories — skip duplicates by exact content."""
+        existing = self.db.list_memory_entries(
+            repo, memory_type="repo_fact", status="active"
+        )
+        known = {e["content"] for e in existing}
+        created: List[str] = []
+        for fact in facts:
+            content = fact.get("content", "").strip()
+            if not content or content in known:
+                continue
+            memory_id = self.db.create_memory_entry(
+                repo=repo,
+                memory_type="repo_fact",
+                content=content,
+                scope=fact.get("scope", "repo"),
+                confidence=fact.get("confidence", 0.9),
+                status="active",
+                created_by="bootstrap:repo_facts",
+            )
+            for ev in fact.get("evidence") or []:
+                if isinstance(ev, str):
+                    self.db.add_evidence(memory_id, "bootstrap", ev)
+            known.add(content)
+            created.append(memory_id)
+        return created
+
     def _detect_monorepo(self, files: List[str]) -> bool:
         """Detect if repository is a monorepo."""
-        package_json_count = sum(1 for f in files if "package.json" in f)
-        return package_json_count > 1
+        pkg_count = sum(1 for f in files if f.endswith("package.json") or "/package.json" in f)
+        return pkg_count > 1
 
     def get_repo_facts(self, repo: str) -> List[Dict[str, Any]]:
         """Get all repo facts for a repository."""
@@ -443,35 +501,56 @@ class MemoryManager:
         )
 
     def get_relevant_memory(
-        self, repo: str, file_paths: List[str]
+        self,
+        repo: str,
+        file_paths: List[str],
+        *,
+        exclude_types: Optional[List[str]] = None,
+        limit: int = 50,
     ) -> List[Dict[str, Any]]:
-        """Get memory entries relevant to specific files."""
-        relevant = []
+        """Return active memories relevant to ``file_paths`` (repo-wide + scoped)."""
+        skip = set(exclude_types or ["session_context"])
+        normalized_files = [_normalize_memory_path(f) for f in file_paths if f]
 
-        # Get repo-level memory
-        repo_memory = self.db.list_memory_entries(repo, status="active")
-        relevant.extend(repo_memory)
+        entries = self.db.list_memory_entries(repo, status="active", limit=limit)
+        unique: List[Dict[str, Any]] = []
+        seen: set[str] = set()
 
-        # Get file-specific memory
-        for file_path in file_paths:
-            file_memory = self.db.list_memory_entries(
-                repo, scope=file_path, status="active"
-            )
-            relevant.extend(file_memory)
+        for entry in entries:
+            if entry["type"] in skip:
+                continue
+            scope = entry.get("scope") or "repo"
+            if scope == "repo" or not normalized_files:
+                if entry["memory_id"] not in seen:
+                    seen.add(entry["memory_id"])
+                    unique.append(entry)
+                continue
+            if any(_memory_scope_matches(scope, fp) for fp in normalized_files):
+                if entry["memory_id"] not in seen:
+                    seen.add(entry["memory_id"])
+                    unique.append(entry)
 
-        # Remove duplicates
-        seen = set()
-        unique = []
-        for entry in relevant:
-            if entry["memory_id"] not in seen:
-                seen.add(entry["memory_id"])
-                unique.append(entry)
-
-        return unique
+        return unique[:limit]
 
     # Cleanup
     def cleanup_expired_context(self) -> int:
         """Cleanup expired session context."""
         return self.db.cleanup_expired_context()
 
+
+def _normalize_memory_path(path: str) -> str:
+    return path.replace("\\", "/").lstrip("./")
+
+
+def _memory_scope_matches(scope: str, file_path: str) -> bool:
+    """True when a memory scope overlaps a file path."""
+    if not scope or scope == "repo":
+        return False
+    scope_n = _normalize_memory_path(scope)
+    file_n = _normalize_memory_path(file_path)
+    if scope_n == file_n:
+        return True
+    if file_n.endswith("/" + scope_n) or scope_n.endswith("/" + file_n):
+        return True
+    return scope_n in file_n or file_n in scope_n
 

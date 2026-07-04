@@ -561,6 +561,22 @@ V2_TOOLS: list[Tool] = [
             "required": ["repo", "files"],
         },
     ),
+    Tool(
+        name="turingmind_sync_cloud",
+        description=(
+            "Bidirectional memory sync for a repo. Production: calls the authenticated repochat sidecar "
+            "(TURINGMIND_CLOUD_SYNC=1 + TURINGMIND_API_KEY). Uses sidecar MONGODB_URI (Cosmos, colocated East US). "
+            "Local dev: direct POSTGRES_URI via docker-compose for optional SpecNode DAG only. "
+            "Pulls cloud tombstones and pushes active/candidate/deprecated memories upstream."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "repo": {"type": "string", "description": "Repository (owner/repo or GitHub URL)"},
+            },
+            "required": ["repo"],
+        },
+    ),
     # ──────────────────────────────────────────────────────────────────────────
     # PHASE 2.5b: SECURITY RULE LIFECYCLE
     # ──────────────────────────────────────────────────────────────────────────

@@ -516,6 +516,55 @@ def list_memory(
     }
 
 
+@app.get("/api/v2/memory/relevant")
+def get_relevant_memory(
+    repo: str,
+    files: str = "",
+    limit: int = 50,
+    exclude_types: Optional[str] = None,
+):
+    """Return active memories relevant to changed files (repo-wide + scoped matches).
+
+    ``files`` is a comma-separated list of paths (e.g. ``src/auth.py,lib/utils.ts``).
+    """
+    if not repo:
+        raise HTTPException(status_code=400, detail="repo is required")
+
+    file_paths = [f.strip() for f in files.split(",") if f.strip()]
+    skip = [t.strip() for t in (exclude_types or "session_context").split(",") if t.strip()]
+
+    try:
+        entries = _memory_manager().get_relevant_memory(
+            repo=repo,
+            file_paths=file_paths,
+            exclude_types=skip or None,
+            limit=limit,
+        )
+    except Exception as e:
+        logger.exception("Memory relevant lookup failed")
+        raise HTTPException(status_code=500, detail=f"{e.__class__.__name__}: {e}")
+
+    return {
+        "repo": repo,
+        "files": file_paths,
+        "total": len(entries),
+        "entries": [
+            {
+                "memory_id": e["memory_id"],
+                "type": e["type"],
+                "status": e["status"],
+                "content": e["content"],
+                "scope": e["scope"],
+                "confidence": e["confidence"],
+                "node_id": e.get("node_id"),
+                "created_at": e.get("created_at"),
+                "expires_at": e.get("expires_at"),
+            }
+            for e in entries
+        ],
+    }
+
+
 # ── Observation endpoints — draft beliefs awaiting reconciliation ────────────
 # Hooks post observations (single or batched, e.g. a spool replay). They stay
 # out of memory recall until a reconciliation pass or explicit accept.
@@ -619,6 +668,24 @@ def resolve_finding(finding_id: str, payload: ResolveFindingPayload):
     if not ok:
         raise HTTPException(status_code=404, detail=f"Finding not found: {finding_id}")
     return {"status": payload.status, "finding_id": finding_id}
+
+
+@app.post("/api/v2/reconcile/findings/{finding_id}/draft")
+def draft_finding(finding_id: str):
+    """Optional LLM distillation: draft reviewable memory text for a queue finding.
+
+    Does not save or activate anything — agent/human must approve separately.
+    """
+    from .memory_distillation import DistillationError, draft_finding as distill
+
+    try:
+        result = distill(_memory_db(), finding_id)
+    except DistillationError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.exception("Finding draft failed")
+        raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
+    return result
 
 
 @app.on_event("startup")

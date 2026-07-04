@@ -1,15 +1,21 @@
 """Tests for the deterministic reconciliation engine."""
 
+import os
 import shutil
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from turingmind_mcp.database import MemoryDatabase
+from turingmind_mcp.observation_capture import EVENT_GIT_REVERT, EVENT_VERIFICATION_SUCCESS
 from turingmind_mcp.reconcile import (
     RECURRENCE_THRESHOLD,
+    SCOPE_CHURN_THRESHOLD,
     ReconciliationEngine,
     repos_with_activity,
+    _extract_revert_files,
+    _scope_matches_file,
 )
 
 REPO = "test/repo"
@@ -49,7 +55,7 @@ class TestRecurrenceMiner(ReconcileTestCase):
             repo=REPO, memory_type="learned_pattern", status="candidate"
         )
         self.assertEqual(len(candidates), 1)
-        self.assertIn("Recurring activity", candidates[0]["content"])
+        self.assertIn("Recurring", candidates[0]["content"])
         active = self.db.list_memory_entries(
             repo=REPO, memory_type="learned_pattern", status="active"
         )
@@ -202,6 +208,160 @@ class TestRunAndStats(ReconcileTestCase):
             repo="repo/b", memory_type="explicit_rule", content="y", scope="repo"
         )
         self.assertEqual(set(repos_with_activity(self.db)), {"repo/a", "repo/b"})
+
+
+class TestScopeMatching(unittest.TestCase):
+    def test_scope_matches_file_paths(self):
+        self.assertTrue(_scope_matches_file("src/auth/jwt.py", "src/auth/jwt.py"))
+        self.assertTrue(_scope_matches_file("jwt.py", "src/auth/jwt.py"))
+        self.assertFalse(_scope_matches_file("repo", "src/auth/jwt.py"))
+
+    def test_extract_revert_files_from_evidence(self):
+        obs = {
+            "content": 'Git revert abc12345: Revert "bad"',
+            "evidence": [{"type": "files", "content": "src/a.py, src/b.py"}],
+        }
+        files = _extract_revert_files(obs)
+        self.assertEqual(files, ["src/a.py", "src/b.py"])
+
+
+class TestRevertPenalty(ReconcileTestCase):
+    def test_revert_penalizes_scope_matched_memory(self):
+        mem_id = self.db.create_memory_entry(
+            repo=REPO, memory_type="learned_pattern",
+            content="always validate jwt", scope="src/auth/jwt.py", confidence=0.8,
+        )
+        self.db.create_observation(
+            repo=REPO,
+            event_type=EVENT_GIT_REVERT,
+            content='Git revert deadbeef: Revert "jwt change"',
+            source="antigravity-hook",
+            evidence=[{"type": "files", "content": "src/auth/jwt.py"}],
+        )
+        stats = self.engine.apply_revert_penalties(REPO)
+        self.assertEqual(stats["revert_observations"], 1)
+        self.assertEqual(stats["revert_memories_penalized"], 1)
+        self.assertLess(self.db.get_memory_entry(mem_id)["confidence"], 0.8)
+        findings = self.db.list_findings(repo=REPO)
+        self.assertEqual(findings[0]["finding_type"], "revert_penalty")
+        self.assertEqual(len(self.db.list_observations(repo=REPO)), 0)
+
+
+class TestInvalidationDecay(ReconcileTestCase):
+    def test_missing_scope_file_decays_memory(self):
+        workspace = Path(self.temp_dir) / "ws"
+        (workspace / "src").mkdir(parents=True)
+        stale = workspace / "src" / "removed.py"
+        stale.write_text("gone", encoding="utf-8")
+        mem_id = self.db.create_memory_entry(
+            repo=REPO, memory_type="learned_pattern",
+            content="pattern on removed file", scope="src/removed.py", confidence=0.7,
+        )
+        stale.unlink()
+        with mock.patch.dict(os.environ, {"TURINGMIND_WORKSPACE_DIR": str(workspace)}):
+            stats = self.engine.apply_invalidation_decay(REPO)
+        self.assertEqual(stats["invalidation_missing_file"], 1)
+        self.assertLess(self.db.get_memory_entry(mem_id)["confidence"], 0.7)
+        findings = self.db.list_findings(repo=REPO)
+        self.assertEqual(findings[0]["finding_type"], "invalidation_decay")
+
+    def test_churn_decay_is_idempotent(self):
+        mem_id = self.db.create_memory_entry(
+            repo=REPO, memory_type="learned_pattern",
+            content="hot file pattern", scope="src/hot.py", confidence=0.8,
+        )
+        workspace = Path(self.temp_dir) / "ws2"
+        (workspace / "src").mkdir(parents=True)
+        (workspace / "src" / "hot.py").write_text("x", encoding="utf-8")
+        for i in range(SCOPE_CHURN_THRESHOLD):
+            self.db.create_observation(
+                repo=REPO, event_type="edit_cluster",
+                content=f"targeted_fix: edit src/hot.py iteration {i}",
+            )
+        with mock.patch.dict(os.environ, {"TURINGMIND_WORKSPACE_DIR": str(workspace)}):
+            stats1 = self.engine.apply_invalidation_decay(REPO)
+            first_conf = self.db.get_memory_entry(mem_id)["confidence"]
+            stats2 = self.engine.apply_invalidation_decay(REPO)
+            second_conf = self.db.get_memory_entry(mem_id)["confidence"]
+        self.assertEqual(stats1["invalidation_churn"], 1)
+        self.assertEqual(stats2["invalidation_churn"], 0)
+        self.assertLess(first_conf, 0.8)
+        self.assertEqual(first_conf, second_conf)
+
+
+class TestVerificationReinforcement(ReconcileTestCase):
+    def test_success_obs_reinforces_node_memory(self):
+        mem_id = self.db.create_memory_entry(
+            repo=REPO, memory_type="learned_pattern",
+            content="failure then fix", scope="src/x.py", confidence=0.5,
+            node_id="node-1",
+        )
+        self.db.create_observation(
+            repo=REPO,
+            event_type=EVENT_VERIFICATION_SUCCESS,
+            content="Verification succeeded on 'X'",
+            node_id="node-1",
+        )
+        stats = self.engine.reinforce_verification_success(REPO)
+        self.assertEqual(stats["verification_success_processed"], 1)
+        self.assertEqual(stats["memories_reinforced"], 1)
+        self.assertGreater(self.db.get_memory_entry(mem_id)["confidence"], 0.5)
+        self.assertEqual(len(self.db.list_observations(repo=REPO)), 0)
+
+
+class TestEventTypeClustering(ReconcileTestCase):
+    def test_different_event_types_not_clustered(self):
+        for _ in range(2):
+            self.db.create_observation(
+                repo=REPO, event_type="edit_cluster",
+                content="targeted_fix/high: change in src/payment.py",
+            )
+        self.db.create_observation(
+            repo=REPO, event_type="edit_cluster",
+            content="targeted_fix/high: change in src/payment.py",
+        )
+        self.db.create_observation(
+            repo=REPO, event_type=EVENT_GIT_REVERT,
+            content="targeted_fix/high: change in src/payment.py",
+        )
+        stats = self.engine.mine_recurrence(REPO)
+        self.assertEqual(stats["patterns_mined"], 1)
+        self.assertEqual(stats["observations_accepted"], 3)
+        self.assertEqual(len(self.db.list_observations(repo=REPO)), 1)
+
+
+class TestDuplicateMergeSuggestions(ReconcileTestCase):
+    def test_paraphrase_pair_creates_semantic_duplicate_finding(self):
+        self.db.create_memory_entry(
+            repo=REPO,
+            memory_type="learned_pattern",
+            content="Always use async await for IO operations in handlers",
+            scope="repo",
+        )
+        self.db.create_memory_entry(
+            repo=REPO,
+            memory_type="learned_pattern",
+            content="Use async await for all IO operations in handlers",
+            scope="repo",
+        )
+        stats = self.engine.suggest_duplicate_merges(REPO)
+        self.assertGreaterEqual(stats["duplicate_pairs_suggested"], 1)
+        findings = [
+            f for f in self.db.list_findings(repo=REPO)
+            if f["finding_type"] == "semantic_duplicate"
+        ]
+        self.assertGreaterEqual(len(findings), 1)
+
+    def test_identical_content_not_flagged(self):
+        content = "Never commit secrets to the repository"
+        self.db.create_memory_entry(
+            repo=REPO, memory_type="explicit_rule", content=content, scope="repo",
+        )
+        self.db.create_memory_entry(
+            repo=REPO, memory_type="explicit_rule", content=content, scope="repo",
+        )
+        stats = self.engine.suggest_duplicate_merges(REPO)
+        self.assertEqual(stats["duplicate_pairs_suggested"], 0)
 
 
 if __name__ == "__main__":

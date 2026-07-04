@@ -15,7 +15,7 @@ import re
 import uuid
 import logging
 from pathlib import Path
-from typing import Any
+from typing import Any, Dict
 
 logger = logging.getLogger("turingmind-mcp")
 
@@ -126,30 +126,86 @@ async def handle_sync_cloud(args: dict, ctx: ToolContext) -> list[TextContent]:
     if not repo:
         return _err("repo is required")
 
+    import os
+    from ..cloud_memory_client import sync_memories_via_cloud_api, use_cloud_sync
+    from ..server import get_config, get_db
+
     try:
         from .database import get_all_spec_nodes, get_execution_state
-        from .postgres import sync_cloud_state
-        
+        from .postgres import sync_cloud_state, sync_memories_bidirectional
+
+        api_url, api_key = get_config()
+        db = get_db()
         nodes = get_all_spec_nodes(repo)
         state = get_execution_state(repo)
-        
-        # Derive edges from node.dependencies (authoritative source of truth)
-        # Note: SQLite edge_graph table has no 'repo' column, so we cannot query by repo.
+
         edges = []
         for node in nodes:
             for dep_id in node.dependencies:
                 edges.append((dep_id, node.id))
-        
-        success = sync_cloud_state(repo, nodes, edges, state)
-        if success:
-            return _ok({
-                "repo": repo,
-                "nodes_synced": len(nodes),
-                "edges_synced": len(edges),
-                "message": "Successfully synchronized local state to TuringMind Cloud Postgres."
-            })
+
+        memory_sync: Dict[str, Any] = {
+            "memories_pulled": 0,
+            "memories_applied": 0,
+            "tombstones_applied": 0,
+            "memories_pushed": 0,
+        }
+        memory_sync_error: str | None = None
+        spec_synced = False
+
+        if os.getenv("POSTGRES_URI"):
+            spec_synced = sync_cloud_state(repo, nodes, edges, state)
         else:
-            return _err("Failed to sync to Cloud Database. See logs for Postgres adapter errors.")
+            spec_synced = True
+
+        if use_cloud_sync(api_url, api_key):
+            try:
+                memory_sync, memory_sync_error = await sync_memories_via_cloud_api(
+                    db,
+                    repo,
+                    api_url=api_url,
+                    api_key=api_key,
+                )
+            except Exception as mem_err:
+                memory_sync_error = f"Memory cloud API sync failed: {mem_err}"
+                logger.warning(memory_sync_error)
+        elif os.getenv("POSTGRES_URI"):
+            try:
+                memory_sync = sync_memories_bidirectional(db, repo)
+            except Exception as mem_err:
+                memory_sync_error = f"Memory bidirectional sync failed: {mem_err}"
+                logger.warning(memory_sync_error)
+        else:
+            return _err(
+                "Cloud memory sync unavailable. Set TURINGMIND_CLOUD_SYNC=1 with "
+                "TURINGMIND_API_KEY, or POSTGRES_URI for local docker Postgres."
+            )
+
+        memory_ok = memory_sync_error is None
+        if not spec_synced and not memory_ok:
+            return _err("Failed to sync to cloud. See logs for details.")
+
+        via = "cloud API" if use_cloud_sync(api_url, api_key) else "Postgres"
+        payload: Dict[str, Any] = {
+            "repo": repo,
+            "nodes_synced": len(nodes),
+            "edges_synced": len(edges),
+            "spec_cloud": bool(os.getenv("POSTGRES_URI")),
+            "spec_synced": spec_synced,
+            "memory_synced": memory_ok,
+            "memory_via": via if memory_ok else None,
+            **memory_sync,
+            "message": (
+                f"Synchronized memories via {via} (pull tombstones + push upstream)."
+                if memory_ok
+                else "Spec DAG synced; memory cloud sync failed — see warning."
+            ),
+        }
+        if memory_sync_error:
+            payload["warning"] = memory_sync_error
+        if not os.getenv("POSTGRES_URI"):
+            payload["note"] = "Spec DAG cloud sync skipped (no server POSTGRES_URI)."
+        return _ok(payload)
     except Exception as e:
         return _err(f"Sync error: {e}")
 
@@ -1720,6 +1776,17 @@ async def handle_bootstrap_codebase(args: dict, ctx: ToolContext) -> list[TextCo
 
 
     total_files = sum(len(v) for v in module_groups.values())
+    all_indexed_files = [f for files in module_groups.values() for f in files]
+
+    repo_facts_created: list[str] = []
+    if not dry_run and ctx.get_memory_manager:
+        try:
+            mgr = ctx.get_memory_manager()
+            facts = mgr.extract_repo_facts(repo, all_indexed_files, project_root=root)
+            repo_facts_created = mgr.persist_repo_facts(repo, facts)
+        except Exception as exc:
+            logger.warning("repo_facts extraction failed (non-fatal): %s", exc)
+
     return _ok({
         "status": "bootstrapped" if not dry_run else "dry_run",
         "repo": repo,
@@ -1727,11 +1794,13 @@ async def handle_bootstrap_codebase(args: dict, ctx: ToolContext) -> list[TextCo
         "nodes_dry_run": len(created) if dry_run else 0,
         "nodes_skipped": len(skipped),
         "observed_created": observed_created,
+        "repo_facts_created": len(repo_facts_created),
         "created": created,
         "skipped": skipped,
         "message": (
             f"{'Would create' if dry_run else 'Created'} {len(created)} L2 SpecNodes from {total_files} files. "
             + (f"Deep scan: {len(observed_created)} observed L3/L4 nodes auto-inventoried. " if observed_created else "")
+            + (f"Repo facts: {len(repo_facts_created)} memory entries. " if repo_facts_created else "")
             + "Contracts are blank — fill in invariants and metrics progressively."
         ),
     })
