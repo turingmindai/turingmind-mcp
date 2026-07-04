@@ -247,6 +247,7 @@ Examples:
   turingmind install-api-daemon      # macOS: background API server (launchd)
   turingmind validate claude_desktop # Validate configuration
   turingmind diagnose                 # Diagnose installation
+  turingmind memory-assess --repo org/repo   # Live memory scorecard (Gate 2)
         """,
     )
 

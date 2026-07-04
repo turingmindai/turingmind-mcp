@@ -554,13 +554,38 @@ def assess_branch_recall_inferred(
                 evidence={"workspace_dir": str(workspace), "branch": git_payload["branch"]},
             )
 
+        explicit = client.get(
+            "/api/v2/memory/relevant",
+            params={
+                "repo": repo,
+                "files": scope_file,
+                "branch": git_payload["branch"],
+                "head": git_payload.get("head"),
+                "dirty": str(git_payload.get("dirty", False)).lower(),
+            },
+            timeout=10.0,
+        )
+        explicit_ids = (
+            {e["memory_id"] for e in explicit.json().get("entries", [])}
+            if explicit.status_code == 200
+            else set()
+        )
+        if memory_id in explicit_ids:
+            return LayerResult(
+                layer="Branch recall (inferred)",
+                status="fail",
+                notes=(
+                    "Probe recalls with explicit branch params but not server inference — "
+                    "reinstall API daemon: `turingmind install-api-daemon install` "
+                    "(launchd still has stale TURINGMIND_WORKSPACE_DIR)"
+                ),
+                evidence={"workspace_dir": str(workspace), "api_inferred_ids": list(ids)},
+            )
+
         return LayerResult(
             layer="Branch recall (inferred)",
             status="fail",
-            notes=(
-                f"Workspace is git root ({workspace}) but branch-scoped probe not recalled "
-                "without explicit branch — restart API after fixing env"
-            ),
+            notes="Branch probe not recalled with or without explicit branch params",
             evidence={"workspace_dir": str(workspace), "returned_ids": list(ids)},
         )
     except httpx.HTTPError as exc:
