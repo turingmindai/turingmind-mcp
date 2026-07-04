@@ -52,8 +52,12 @@ coverage.xml
 *.mo
 *.pot
 
-# Environments
+# Environments and local secrets (never commit)
 .env
+.env.*
+.env*
+*.bak
+mcp_server.log
 .venv
 env/
 venv/
