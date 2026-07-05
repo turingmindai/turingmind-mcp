@@ -2,12 +2,27 @@
 
 from __future__ import annotations
 
+import json
+import logging
 import uuid
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
+from turingmind_mcp.tools.context import ToolContext
 from turingmind_mcp.v2_engine.database import get_all_spec_nodes
+
+
+@pytest.fixture
+def tool_ctx():
+    return ToolContext(
+        client=MagicMock(),
+        api_url="",
+        headers={},
+        logger=logging.getLogger("test"),
+        save_api_key=lambda url, key: "",
+        version="1.0",
+    )
 
 
 @pytest.fixture
@@ -120,9 +135,9 @@ def test_bootstrap_if_empty_requires_repo(api_client):
 
 
 @pytest.mark.asyncio
-async def test_mcp_decision_queue_honors_scope_memory(memory_db, tier_repo, monkeypatch):
+async def test_mcp_decision_queue_honors_scope_memory(memory_db, tier_repo, monkeypatch, tool_ctx):
     """MCP handler applies the same memory scope filter as REST."""
-    from turingmind_mcp.v2_engine.handlers import handle_get_decision_queue, ToolContext
+    from turingmind_mcp.v2_engine.handlers import handle_get_decision_queue
 
     monkeypatch.setenv("TURINGMIND_DB_PATH", memory_db.db_path)
     from turingmind_mcp.v2_engine import database as v2db
@@ -135,10 +150,8 @@ async def test_mcp_decision_queue_honors_scope_memory(memory_db, tier_repo, monk
     ):
         result = await handle_get_decision_queue(
             {"repo": tier_repo, "scope": "memory", "limit": 10},
-            ToolContext(),
+            tool_ctx,
         )
-
-    import json
 
     payload = json.loads(result[0].text)
     types = {item.get("gap_type") for item in payload["decision_queue"]}
