@@ -1,99 +1,128 @@
 """
 SQLite database interface for the v2 Deterministic Constraint Engine.
-Provides a strict graph-based schema mapping to SpecNodes and Execution loop queues.
+
+SpecNode graph tables live in the same file as operational memory
+(``~/.turingmind/memory.db``). Legacy ``v2_memory.db`` is migrated on first
+``MemoryDatabase`` open via ``db_migration.migrate_legacy_v2_if_needed``.
 """
 
 import logging
-import os
 import sqlite3
 from collections import deque
-from typing import List, Optional
+from contextlib import contextmanager
+from typing import Generator, List, Optional
 
+from ..db_paths import ensure_db_dir, resolve_primary_db_path
+from ..unified_schema import initialize_v2_schema
 from .models import SpecNode, ExecutionState, ExecutionStage, FailureClassification
 
 logger = logging.getLogger(__name__)
 
-# v2 Database lives isolated from the legacy system
-DB_DIR = os.path.expanduser("~/.turingmind")
-DB_PATH = os.path.join(DB_DIR, "v2_memory.db")
+# When set, save_spec_node/save_spec_nodes use this connection and skip commit.
+_write_conn: Optional[sqlite3.Connection] = None
 
-def _get_connection() -> sqlite3.Connection:
-    """Gets a SQLite connection mapped to WAL mode for concurrent multi-agent safety."""
-    if not os.path.exists(DB_DIR):
-        os.makedirs(DB_DIR, exist_ok=True)
-        
-    conn = sqlite3.connect(DB_PATH, timeout=10.0)
+# Optional override for tests (patch this module attribute).
+DB_PATH: Optional[str] = None
+DB_DIR = None  # deprecated; kept so existing tests can patch DB_DIR without error
+
+
+def _connection_path() -> str:
+    if DB_PATH is not None:
+        return DB_PATH
+    return resolve_primary_db_path()
+
+
+def _open_connection() -> sqlite3.Connection:
+    """Open a new SQLite connection (never returns the active write-transaction conn)."""
+    db_path = _connection_path()
+    ensure_db_dir(db_path)
+
+    conn = sqlite3.connect(db_path, timeout=10.0)
     conn.row_factory = sqlite3.Row
-    # Enable Write-Ahead Logging for simultaneous Cursor CLI / AIDD UI access
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA busy_timeout=5000;")
-    # SQLite disables FK enforcement by default — must enable per-connection
     conn.execute("PRAGMA foreign_keys=ON;")
     return conn
 
+
+def _get_connection() -> sqlite3.Connection:
+    """Return the active write-transaction connection or open a standalone one."""
+    if _write_conn is not None:
+        return _write_conn
+    return _open_connection()
+
+
+def _borrow_connection(
+    explicit: Optional[sqlite3.Connection] = None,
+) -> tuple[sqlite3.Connection, bool]:
+    """Return ``(connection, owned)``. Owned connections must be closed by caller.
+
+    Never use ``with conn:`` on borrowed write-transaction connections — that
+    would commit an in-flight ``BEGIN`` from atomic sync.
+    """
+    if explicit is not None:
+        return explicit, False
+    if _write_conn is not None:
+        return _write_conn, False
+    return _open_connection(), True
+
+
+def _release_connection(conn: sqlite3.Connection, owned: bool) -> None:
+    if owned:
+        conn.close()
+
+
+@contextmanager
+def use_write_connection(conn: sqlite3.Connection) -> Generator[sqlite3.Connection, None, None]:
+    """Route v2 writes through an external connection (caller owns transaction)."""
+    global _write_conn
+    previous = _write_conn
+    _write_conn = conn
+    try:
+        yield conn
+    finally:
+        _write_conn = previous
+
+
 def init_db() -> None:
-    """Initializes the rigorous Constraint Schema."""
-    with _get_connection() as conn:
-        cursor = conn.cursor()
-        
-        # 1. Atomic Constraints Table
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS spec_nodes (
-                id TEXT PRIMARY KEY,
-                repo TEXT NOT NULL,
-                level TEXT NOT NULL,
-                surface_type TEXT NOT NULL,
-                status TEXT NOT NULL,
-                stage TEXT NOT NULL,
-                confidence REAL NOT NULL,
-                data TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            )
-        """)
-        
-        # 2. Directed Acyclic Graph Edges (For traversing blast radius)
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS edge_graph (
-                upstream_id TEXT NOT NULL,
-                downstream_id TEXT NOT NULL,
-                PRIMARY KEY (upstream_id, downstream_id),
-                FOREIGN KEY (upstream_id) REFERENCES spec_nodes(id) ON DELETE CASCADE,
-                FOREIGN KEY (downstream_id) REFERENCES spec_nodes(id) ON DELETE CASCADE
-            )
-        """)
-        
-        # 3. Global Control Plane 
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS execution_state (
-                repo TEXT PRIMARY KEY,
-                data TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            )
-        """)
-        
-        # 4. Out-of-band Blueprints Store 
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS spec_blueprints (
-                node_id TEXT PRIMARY KEY,
-                payload TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                FOREIGN KEY (node_id) REFERENCES spec_nodes(id) ON DELETE CASCADE
-            )
-        """)
-        
-        # Indexes for pipeline speed
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_nodes_repo ON spec_nodes(repo)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_nodes_stage ON spec_nodes(stage)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_downstream ON edge_graph(downstream_id)")
-        
+    """Initialize the v2 constraint schema in the unified store (idempotent)."""
+    conn = _open_connection()
+    try:
+        initialize_v2_schema(conn.cursor())
         conn.commit()
+    finally:
+        conn.close()
 
-# ==================================================
-# DAG operations
-# ==================================================
 
-def save_spec_node(node: SpecNode) -> None:
+def _persist_spec_node(conn: sqlite3.Connection, node: SpecNode) -> None:
+    """Write one SpecNode row and dependency edges."""
+    cursor = conn.cursor()
+    node_json = node.model_dump_json()
+    cursor.execute("""
+        INSERT INTO spec_nodes 
+        (id, repo, level, surface_type, status, stage, confidence, data, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+            status=excluded.status,
+            stage=excluded.stage,
+            confidence=excluded.confidence,
+            data=excluded.data,
+            updated_at=excluded.updated_at
+    """, (
+        node.id, node.repo, node.level.value, node.surface_type.value,
+        node.state.status.value, node.state.stage.value, node.state.confidence,
+        node_json, node.created_at, node.updated_at
+    ))
+
+    cursor.execute("DELETE FROM edge_graph WHERE downstream_id = ?", (node.id,))
+    for upstream_id in node.dependencies:
+        cursor.execute("""
+            INSERT OR IGNORE INTO edge_graph (upstream_id, downstream_id) 
+            VALUES (?, ?)
+        """, (upstream_id, node.id))
+
+
+def save_spec_node(node: SpecNode, conn: Optional[sqlite3.Connection] = None) -> None:
     """Save a SpecNode and strictly sync its dependency edges in the mathematical graph."""
     # Evidence FIFO rotation — cap at 100 most recent entries to prevent
     # unbounded JSON blob growth after hundreds of CI runs.
@@ -101,60 +130,48 @@ def save_spec_node(node: SpecNode) -> None:
     if len(node.state.evidence) > MAX_EVIDENCE:
         node.state.evidence = node.state.evidence[-MAX_EVIDENCE:]
 
-    with _get_connection() as conn:
-        cursor = conn.cursor()
-        
-        # Store node as JSON payload with indexed fast-access columns
-        node_json = node.model_dump_json()
-        cursor.execute("""
-            INSERT INTO spec_nodes 
-            (id, repo, level, surface_type, status, stage, confidence, data, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(id) DO UPDATE SET
-                status=excluded.status,
-                stage=excluded.stage,
-                confidence=excluded.confidence,
-                data=excluded.data,
-                updated_at=excluded.updated_at
-        """, (
-            node.id, node.repo, node.level.value, node.surface_type.value,
-            node.state.status.value, node.state.stage.value, node.state.confidence,
-            node_json, node.created_at, node.updated_at
-        ))
-        
-        # Rebuild edges based strictly on node.dependencies
-        # If node.dependencies = ['auth_node'], this node is DOWNSTREAM of 'auth_node'
-        cursor.execute("DELETE FROM edge_graph WHERE downstream_id = ?", (node.id,))
-        for upstream_id in node.dependencies:
-            cursor.execute("""
-                INSERT OR IGNORE INTO edge_graph (upstream_id, downstream_id) 
-                VALUES (?, ?)
-            """, (upstream_id, node.id))
-            
-        conn.commit()
+    external = conn is not None or _write_conn is not None
+    active_conn = conn or _get_connection()
+    owned = conn is None and _write_conn is None
+    try:
+        _persist_spec_node(active_conn, node)
+        if not external:
+            active_conn.commit()
+    finally:
+        if owned:
+            active_conn.close()
 
-def get_spec_node(node_id: str) -> Optional[SpecNode]:
+
+def get_spec_node(
+    node_id: str,
+    conn: Optional[sqlite3.Connection] = None,
+) -> Optional[SpecNode]:
     """Retrieve an atomic constraint node."""
-    with _get_connection() as conn:
-        cursor = conn.cursor()
+    active, owned = _borrow_connection(conn)
+    try:
+        cursor = active.cursor()
         cursor.execute("SELECT data FROM spec_nodes WHERE id = ?", (node_id,))
         row = cursor.fetchone()
         if row:
             return SpecNode.model_validate_json(row["data"])
         return None
+    finally:
+        _release_connection(active, owned)
 
 
-def save_spec_nodes(nodes: List[SpecNode]) -> None:
-    """Atomically persist multiple SpecNodes in a single SQLite transaction.
-    If any write fails the entire batch is rolled back, preserving graph consistency.
-    Used by cascade_blast_radius to ensure the entire impact radius is updated atomically.
-    """
+def save_spec_nodes(nodes: List[SpecNode], conn: Optional[sqlite3.Connection] = None) -> None:
+    """Atomically persist multiple SpecNodes in a single SQLite transaction."""
     if not nodes:
         return
-    conn = _get_connection()
+
+    external = conn is not None or _write_conn is not None
+    active_conn = conn or _get_connection()
+    owned = conn is None and _write_conn is None
+    owns_transaction = not external
     try:
-        conn.execute("BEGIN")
-        cursor = conn.cursor()
+        if owns_transaction:
+            active_conn.execute("BEGIN")
+        cursor = active_conn.cursor()
         for node in nodes:
             cursor.execute("""
                 UPDATE spec_nodes
@@ -168,30 +185,41 @@ def save_spec_nodes(nodes: List[SpecNode]) -> None:
                 node.updated_at,
                 node.id,
             ))
-        conn.execute("COMMIT")
+        if owns_transaction:
+            active_conn.execute("COMMIT")
     except Exception:
-        conn.execute("ROLLBACK")
+        if owns_transaction:
+            active_conn.execute("ROLLBACK")
         raise
     finally:
-        conn.close()
+        if owned:
+            active_conn.close()
 
 
 def get_nodes_by_stage(repo: str, stage: ExecutionStage) -> List[SpecNode]:
     """Fetch the exact nodes occupying a specific column in the manufacturing pipeline."""
-    with _get_connection() as conn:
-        cursor = conn.cursor()
+    active, owned = _borrow_connection()
+    try:
+        cursor = active.cursor()
         cursor.execute("""
             SELECT data FROM spec_nodes 
             WHERE repo = ? AND stage = ?
             ORDER BY created_at ASC
         """, (repo, stage.value))
-        
-        return [SpecNode.model_validate_json(row["data"]) for row in cursor.fetchall()]
 
-def get_all_spec_nodes(repo: str) -> List[SpecNode]:
+        return [SpecNode.model_validate_json(row["data"]) for row in cursor.fetchall()]
+    finally:
+        _release_connection(active, owned)
+
+
+def get_all_spec_nodes(
+    repo: str,
+    conn: Optional[sqlite3.Connection] = None,
+) -> List[SpecNode]:
     """Fetch all spec nodes for a repo (used for bootstrap deduplication)."""
-    with _get_connection() as conn:
-        cursor = conn.cursor()
+    active, owned = _borrow_connection(conn)
+    try:
+        cursor = active.cursor()
         cursor.execute("""
             SELECT data FROM spec_nodes
             WHERE repo = ?
@@ -204,19 +232,21 @@ def get_all_spec_nodes(repo: str) -> List[SpecNode]:
             except Exception:
                 pass
         return nodes
+    finally:
+        _release_connection(active, owned)
 
 
-def get_impacted_subgraph(upstream_id: str) -> List[str]:
-    """
-    The core Safe Change engine primitive: Returns all nodes downstream from an origin node.
-    If 'upstream_id' (API endpoint) changes, EVERYTHING downstream must be invalidated.
-    Uses iterative BFS to avoid stack overflow on large DAGs.
-    """
+def get_impacted_subgraph(
+    upstream_id: str,
+    conn: Optional[sqlite3.Connection] = None,
+) -> List[str]:
+    """Return all nodes downstream from an origin node (BFS)."""
     impacted: set[str] = set()
     queue: deque[str] = deque([upstream_id])
 
-    with _get_connection() as conn:
-        cursor = conn.cursor()
+    active, owned = _borrow_connection(conn)
+    try:
+        cursor = active.cursor()
         while queue:
             current = queue.popleft()
             cursor.execute(
@@ -227,22 +257,24 @@ def get_impacted_subgraph(upstream_id: str) -> List[str]:
                 if down_id not in impacted:
                     impacted.add(down_id)
                     queue.append(down_id)
+    finally:
+        _release_connection(active, owned)
 
     return list(impacted)
 
 
-def get_impacted_subgraph_with_depth(upstream_id: str) -> List[tuple]:
-    """
-    Like get_impacted_subgraph but returns (node_id, depth) tuples.
-    Depth 1 = direct dependents, depth 2 = dependents of dependents, etc.
-    Used by cascade_blast_radius for distance-attenuated confidence penalties.
-    """
+def get_impacted_subgraph_with_depth(
+    upstream_id: str,
+    conn: Optional[sqlite3.Connection] = None,
+) -> List[tuple]:
+    """Like get_impacted_subgraph but returns (node_id, depth) tuples."""
     result: list[tuple] = []
     visited: set[str] = set()
-    queue: deque[tuple] = deque([(upstream_id, 0)])  # (node_id, depth)
+    queue: deque[tuple] = deque([(upstream_id, 0)])
 
-    with _get_connection() as conn:
-        cursor = conn.cursor()
+    active, owned = _borrow_connection(conn)
+    try:
+        cursor = active.cursor()
         while queue:
             current, depth = queue.popleft()
             cursor.execute(
@@ -255,18 +287,19 @@ def get_impacted_subgraph_with_depth(upstream_id: str) -> List[tuple]:
                     child_depth = depth + 1
                     result.append((down_id, child_depth))
                     queue.append((down_id, child_depth))
+    finally:
+        _release_connection(active, owned)
 
     return result
 
-# ==================================================
-# Blueprints Store (Out-of-band storage)
-# ==================================================
 
 def save_blueprint(node_id: str, payload: str) -> None:
     """Save an architectural diagram payload separate from main node JSON bloat."""
     import datetime
+
     now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
-    with _get_connection() as conn:
+    conn = _open_connection()
+    try:
         cursor = conn.cursor()
         cursor.execute("""
             INSERT INTO spec_blueprints (node_id, payload, updated_at)
@@ -276,37 +309,46 @@ def save_blueprint(node_id: str, payload: str) -> None:
                 updated_at=excluded.updated_at
         """, (node_id, payload, now_iso))
         conn.commit()
+    finally:
+        conn.close()
+
 
 def get_blueprint(node_id: str) -> Optional[str]:
     """Retrieve an architectural payload."""
-    with _get_connection() as conn:
-        cursor = conn.cursor()
+    active, owned = _borrow_connection()
+    try:
+        cursor = active.cursor()
         cursor.execute("SELECT payload FROM spec_blueprints WHERE node_id = ?", (node_id,))
         row = cursor.fetchone()
         if row:
             return row["payload"]
         return None
+    finally:
+        _release_connection(active, owned)
 
-# ==================================================
-# Execution Loop Queue state
-# ==================================================
 
 def get_execution_state(repo: str) -> ExecutionState:
     """Loads the Control Plane data for the system."""
-    with _get_connection() as conn:
-        cursor = conn.cursor()
+    active, owned = _borrow_connection()
+    try:
+        cursor = active.cursor()
         cursor.execute("SELECT data FROM execution_state WHERE repo = ?", (repo,))
         row = cursor.fetchone()
         if row:
             return ExecutionState.model_validate_json(row["data"])
         return ExecutionState()
+    finally:
+        _release_connection(active, owned)
+
 
 def save_execution_state(repo: str, state: ExecutionState) -> None:
     """Updates the global metrics, ready_queue, and failed_queues."""
     import datetime
+
     now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
-    
-    with _get_connection() as conn:
+
+    conn = _open_connection()
+    try:
         cursor = conn.cursor()
         cursor.execute("""
             INSERT INTO execution_state (repo, data, updated_at)
@@ -316,6 +358,8 @@ def save_execution_state(repo: str, state: ExecutionState) -> None:
                 updated_at=excluded.updated_at
         """, (repo, state.model_dump_json(), now_iso))
         conn.commit()
+    finally:
+        conn.close()
 
-# Expose init on import
+
 init_db()

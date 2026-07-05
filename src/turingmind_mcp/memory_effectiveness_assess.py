@@ -65,7 +65,9 @@ class AssessmentReport:
 
 
 def default_db_path() -> Path:
-    return Path(os.environ.get("TURINGMIND_MEMORY_DB", Path.home() / ".turingmind" / "memory.db"))
+    from .db_paths import resolve_primary_db_path
+
+    return Path(resolve_primary_db_path())
 
 
 def default_api_url() -> str:

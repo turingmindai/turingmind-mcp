@@ -37,10 +37,13 @@ from mcp.server.stdio import stdio_server
 from mcp.types import TextContent, Tool
 from pydantic import BaseModel, Field
 
-# Load .env file if it exists (before other imports that might use env vars)
+# Load install env + repo .env before other imports that read os.environ
+_install_env = Path.home() / ".turingmind" / "env"
+if _install_env.exists():
+    load_dotenv(_install_env, override=False)
 _env_path = Path(__file__).parent.parent.parent / ".env"
 if _env_path.exists():
-    load_dotenv(_env_path)
+    load_dotenv(_env_path, override=False)
     logging.getLogger("turingmind-mcp").debug(f"Loaded environment variables from {_env_path}")
 
 # Import new modules
@@ -326,6 +329,13 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 
     logger.info(f"Executing tool: {name}")
 
+    # Check session policies and prepend warnings
+    db = get_db()
+    repo = arguments.get("repo") if arguments else None
+    policy_warning = None
+    if repo:
+        policy_warning = await asyncio.to_thread(check_control_plane_policies, repo, db)
+
     # ── Fast path: local handler (v2 engine, code intelligence, memory) ──
     # These never touch the network — no need to open an httpx client.
     handler = get_handler(name)
@@ -346,7 +356,10 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 entity_indexer_cls=EntityIndexer,
                 get_chat_analysis_agent=get_chat_analysis_agent,
             )
-            return await handler(arguments, context)
+            res = await handler(arguments, context)
+            if policy_warning and isinstance(res, list):
+                res.insert(0, TextContent(type="text", text=policy_warning))
+            return res
         except Exception as e:
             logger.exception(f"Local tool {name} failed")
             return [TextContent(type="text", text=f"❌ **Error:** {type(e).__name__}: {e}")]
@@ -418,6 +431,37 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 
     # Unreachable: all branches above return, but satisfies type checker
     return [TextContent(type="text", text=f"❌ **Error:** unexpected code path for tool `{name}`.")]
+
+
+def check_control_plane_policies(repo: str, db: MemoryDatabase) -> Optional[str]:
+    """Check session policies and return a formatted markdown warning if a policy is violated."""
+    warnings = []
+    # 1. Check active session policy state (drift)
+    try:
+        cursor = db.conn.cursor()
+        cursor.execute(
+            "SELECT policy_state FROM coding_sessions WHERE repo = ? ORDER BY last_seen_at DESC LIMIT 1",
+            (repo,)
+        )
+        row = cursor.fetchone()
+        if row and row["policy_state"] == "drift":
+            warnings.append("⚠️ **TuringMind Policy Warning [TM-DRIFT-002]:** Subsystem drift detected in this session. Working set contains cross-module changes.")
+    except Exception as e:
+        logger.debug(f"Failed to check session policy: {e}")
+
+    # 2. Check for unresolved pending findings (TM-QUEUE-003)
+    try:
+        findings = db.list_findings(repo=repo, status="pending")
+        if len(findings) > 0:
+            has_critical = any(f.get("severity") == "critical" for f in findings)
+            if has_critical or len(findings) >= 50:
+                warnings.append("⚠️ **TuringMind Policy Warning [TM-QUEUE-003]:** Active findings queue threshold exceeded or unresolved critical findings exist.")
+    except Exception as e:
+        logger.debug(f"Failed to check findings queue policy: {e}")
+
+    if warnings:
+        return "\n\n".join(warnings)
+    return None
 
 
 # ============================================================================

@@ -309,4 +309,4 @@ class TestChatAnalysisAgentPassing:
         call_args = mock_llm_provider.call.call_args
         prompt = call_args[0][0] if call_args[0] else call_args[1].get("prompt", "")
         assert "Previous work done" in prompt or "PREVIOUS ANALYSIS" in prompt
-        assert "NEW MESSAGES" in prompt or "new messages" in prompt.lower()
+        assert "new message" in prompt.lower() and "new response" in prompt.lower()

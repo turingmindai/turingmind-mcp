@@ -29,16 +29,19 @@ def memory_db(tmp_path):
 def api_client(memory_db):
     """FastAPI TestClient backed by an isolated memory database."""
     import turingmind_mcp.api_server as api_mod
+    from turingmind_mcp.recall_bundle import reset_recall_history_cache
 
     manager = MemoryManager(memory_db)
     previous_db = api_mod._memory_db_instance
     previous_manager = api_mod._memory_manager_instance
     api_mod._memory_db_instance = memory_db
     api_mod._memory_manager_instance = manager
+    reset_recall_history_cache()
     from fastapi.testclient import TestClient
 
     client = TestClient(api_mod.app)
     yield client, memory_db
+    reset_recall_history_cache()
     api_mod._memory_db_instance = previous_db
     api_mod._memory_manager_instance = previous_manager
 

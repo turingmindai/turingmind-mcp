@@ -15,6 +15,7 @@ import atexit
 import json
 import os
 import sqlite3
+import threading
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -22,6 +23,10 @@ from pathlib import Path
 from typing import Any, Dict, Generator, List, Optional, Tuple
 
 import logging
+
+from .db_paths import ensure_db_dir, resolve_primary_db_path
+from .db_migration import migrate_legacy_v2_if_needed
+from .unified_schema import ensure_node_integrity_triggers, initialize_v2_schema
 
 logger = logging.getLogger("turingmind-mcp")
 
@@ -50,15 +55,15 @@ class MemoryDatabase:
     def __init__(self, db_path: Optional[str] = None):
         """Initialize database connection."""
         if db_path is None:
-            # Default to ~/.turingmind/memory.db
-            config_dir = Path.home() / ".turingmind"
-            config_dir.mkdir(mode=0o700, exist_ok=True)
-            db_path = str(config_dir / "memory.db")
+            db_path = resolve_primary_db_path()
+        else:
+            db_path = str(Path(db_path).expanduser())
 
+        ensure_db_dir(db_path)
         self.db_path = db_path
-        self.conn = sqlite3.connect(db_path, check_same_thread=False)
-        self.conn.row_factory = sqlite3.Row
+        self._local = threading.local()
         self._closed = False
+        self._defer_commit = False
         
         # Set secure file permissions (read/write for owner only)
         try:
@@ -66,13 +71,18 @@ class MemoryDatabase:
         except Exception as e:
             logger.warning(f"Failed to set database file permissions: {e}")
         
-        # Enable foreign key constraints
-        self.conn.execute("PRAGMA foreign_keys = ON")
-        # WAL allows concurrent readers (stdio MCP server, REST API, bridge)
-        # against the same database file without SQLITE_BUSY storms.
-        self.conn.execute("PRAGMA journal_mode = WAL")
+        # Initialize WAL mode on main thread connection
+        conn = self.conn
+        conn.execute("PRAGMA journal_mode = WAL")
 
         self._initialize_schema()
+
+        migration = migrate_legacy_v2_if_needed(self.db_path)
+        if migration.get("migrated"):
+            logger.info(
+                "Unified store migration complete: %s",
+                migration.get("tables_copied"),
+            )
 
         # Expired session context should never surface as active memory
         try:
@@ -88,6 +98,9 @@ class MemoryDatabase:
     def _initialize_schema(self):
         """Create database tables if they don't exist."""
         cursor = self.conn.cursor()
+
+        # SpecNode graph (v2) — must exist before node_id integrity triggers
+        initialize_v2_schema(cursor)
 
         # Memory Entries Table
         cursor.execute("""
@@ -385,6 +398,32 @@ class MemoryDatabase:
             )
         """)
 
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS coding_sessions (
+                session_id TEXT PRIMARY KEY,
+                composer_id TEXT NOT NULL,
+                repo TEXT NOT NULL,
+                branch TEXT,
+                head_sha TEXT,
+                loaded_scopes TEXT,
+                touched_files TEXT,
+                touched_subsystems TEXT,
+                recall_history TEXT,
+                policy_state TEXT NOT NULL DEFAULT 'hydrated',
+                last_seen_at DATETIME NOT NULL,
+                expires_at DATETIME
+            )
+        """)
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS sync_idempotency (
+                event_id TEXT PRIMARY KEY,
+                repo TEXT NOT NULL,
+                response_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+        """)
+
         # Create indexes
         indexes = [
             "CREATE INDEX IF NOT EXISTS idx_findings_repo_status ON reconcile_findings(repo, status)",
@@ -410,10 +449,15 @@ class MemoryDatabase:
             "CREATE INDEX IF NOT EXISTS idx_relationships_target ON code_relationships(target_entity_id)",
             "CREATE INDEX IF NOT EXISTS idx_git_commits_repo ON git_commits(repo)",
             "CREATE INDEX IF NOT EXISTS idx_reasoning_repo_commit ON edit_reasoning(repo, commit_hash)",
+            "CREATE INDEX IF NOT EXISTS idx_coding_sessions_composer ON coding_sessions(composer_id)",
+            "CREATE INDEX IF NOT EXISTS idx_coding_sessions_repo ON coding_sessions(repo)",
+            "CREATE INDEX IF NOT EXISTS idx_coding_sessions_expires ON coding_sessions(expires_at)",
         ]
 
         for index_sql in indexes:
             cursor.execute(index_sql)
+
+        ensure_node_integrity_triggers(cursor)
 
         self.conn.commit()
         self._fts_enabled = self._initialize_fts()
@@ -477,10 +521,24 @@ class MemoryDatabase:
         tokens = [t.replace('"', '""') for t in search.split() if t.strip()]
         return " OR ".join(f'"{t}"' for t in tokens)
 
+    @property
+    def conn(self) -> sqlite3.Connection:
+        if self._closed:
+            raise sqlite3.ProgrammingError("Cannot operate on a closed database.")
+        if not hasattr(self._local, "conn"):
+            c = sqlite3.connect(self.db_path, timeout=10.0)
+            c.row_factory = sqlite3.Row
+            c.execute("PRAGMA foreign_keys = ON")
+            c.execute("PRAGMA journal_mode = WAL")
+            c.execute("PRAGMA busy_timeout = 5000")
+            self._local.conn = c
+        return self._local.conn
+
     def close(self):
         """Close database connection."""
         if not self._closed:
-            self.conn.close()
+            if hasattr(self._local, "conn"):
+                self._local.conn.close()
             self._closed = True
             # Remove from tracked instances
             if self in _db_instances:
@@ -1020,7 +1078,8 @@ class MemoryDatabase:
                 git_context,
             ),
         )
-        self.conn.commit()
+        if not self._defer_commit:
+            self.conn.commit()
         return observation_id
 
     def list_observations(
@@ -1957,3 +2016,209 @@ class MemoryDatabase:
         )
         self.conn.commit()
         return cursor.rowcount
+
+    def create_coding_session(
+        self,
+        session_id: str,
+        composer_id: str,
+        repo: str,
+        branch: Optional[str] = None,
+        head_sha: Optional[str] = None,
+        expires_at: Optional[str] = None,
+    ) -> bool:
+        cursor = self.conn.cursor()
+        now_str = datetime.utcnow().isoformat()
+        if expires_at is None:
+            # Default 4h TTL
+            expires_at = (datetime.utcnow() + timedelta(hours=4)).isoformat()
+        try:
+            cursor.execute(
+                """
+                INSERT INTO coding_sessions (
+                    session_id, composer_id, repo, branch, head_sha,
+                    loaded_scopes, touched_files, touched_subsystems, recall_history,
+                    policy_state, last_seen_at, expires_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    session_id,
+                    composer_id,
+                    repo,
+                    branch,
+                    head_sha,
+                    "[]",
+                    "[]",
+                    "[]",
+                    "[]",
+                    "hydrated",
+                    now_str,
+                    expires_at,
+                ),
+            )
+            if not self._defer_commit:
+                self.conn.commit()
+            return True
+        except sqlite3.IntegrityError:
+            return False
+
+    def get_sync_idempotency(self, event_id: str) -> Optional[Dict[str, Any]]:
+        """Return cached sync response for a client event_id, if present."""
+        if not event_id:
+            return None
+        row = self.conn.execute(
+            "SELECT response_json FROM sync_idempotency WHERE event_id = ?",
+            (event_id,),
+        ).fetchone()
+        if not row:
+            return None
+        try:
+            return json.loads(row[0])
+        except json.JSONDecodeError:
+            return None
+
+    def put_sync_idempotency(
+        self,
+        event_id: str,
+        repo: str,
+        response: Dict[str, Any],
+    ) -> None:
+        """Persist sync response for idempotent replay (INSERT OR IGNORE)."""
+        if not event_id:
+            return
+        from datetime import datetime, timezone
+
+        payload = json.dumps(response, default=str)
+        now = datetime.now(timezone.utc).isoformat()
+        self.conn.execute(
+            """
+            INSERT OR IGNORE INTO sync_idempotency (event_id, repo, response_json, created_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (event_id, repo, payload, now),
+        )
+        if not self._defer_commit:
+            self.conn.commit()
+
+    def get_coding_session(
+        self,
+        composer_id: str,
+        repo: str,
+    ) -> Optional[Dict[str, Any]]:
+        cursor = self.conn.cursor()
+        cursor.execute(
+            """
+            SELECT * FROM coding_sessions
+            WHERE composer_id = ? AND repo = ?
+            """,
+            (composer_id, repo),
+        )
+        row = cursor.fetchone()
+        if not row:
+            return None
+        result = dict(row)
+        for k in ("loaded_scopes", "touched_files", "touched_subsystems", "recall_history"):
+            if result.get(k):
+                try:
+                    result[k] = json.loads(result[k])
+                except Exception:
+                    result[k] = []
+            else:
+                result[k] = []
+        return result
+
+    def get_coding_session_by_id(
+        self,
+        session_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "SELECT * FROM coding_sessions WHERE session_id = ?",
+            (session_id,),
+        )
+        row = cursor.fetchone()
+        if not row:
+            return None
+        result = dict(row)
+        for k in ("loaded_scopes", "touched_files", "touched_subsystems", "recall_history"):
+            if result.get(k):
+                try:
+                    result[k] = json.loads(result[k])
+                except Exception:
+                    result[k] = []
+            else:
+                result[k] = []
+        return result
+
+    def update_coding_session(
+        self,
+        session_id: str,
+        loaded_scopes: List[str],
+        touched_files: List[str],
+        touched_subsystems: List[str],
+        recall_history: List[str],
+        policy_state: str = "hydrated",
+        expires_at: Optional[str] = None,
+    ) -> bool:
+        cursor = self.conn.cursor()
+        now_str = datetime.utcnow().isoformat()
+        if expires_at is None:
+            expires_at = (datetime.utcnow() + timedelta(hours=4)).isoformat()
+        cursor.execute(
+            """
+            UPDATE coding_sessions SET
+                loaded_scopes = ?,
+                touched_files = ?,
+                touched_subsystems = ?,
+                recall_history = ?,
+                policy_state = ?,
+                last_seen_at = ?,
+                expires_at = ?
+            WHERE session_id = ?
+            """,
+            (
+                json.dumps(loaded_scopes),
+                json.dumps(touched_files),
+                json.dumps(touched_subsystems),
+                json.dumps(recall_history),
+                policy_state,
+                now_str,
+                expires_at,
+                session_id,
+            ),
+        )
+        if not self._defer_commit:
+            self.conn.commit()
+        return cursor.rowcount > 0
+
+    def list_expired_coding_sessions(self) -> List[Dict[str, Any]]:
+        cursor = self.conn.cursor()
+        now_str = datetime.utcnow().isoformat()
+        cursor.execute(
+            "SELECT * FROM coding_sessions WHERE expires_at < ?",
+            (now_str,),
+        )
+        rows = cursor.fetchall()
+        results = []
+        for row in rows:
+            result = dict(row)
+            for k in ("loaded_scopes", "touched_files", "touched_subsystems", "recall_history"):
+                if result.get(k):
+                    try:
+                        result[k] = json.loads(result[k])
+                    except Exception:
+                        result[k] = []
+                else:
+                    result[k] = []
+            results.append(result)
+        return results
+
+    def delete_coding_session(self, session_id: str, *, defer_commit: bool = False) -> bool:
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "DELETE FROM coding_sessions WHERE session_id = ?",
+            (session_id,),
+        )
+        if not defer_commit and not self._defer_commit:
+            from .sqlite_guard import commit_with_retry
+            commit_with_retry(self.conn)
+        return cursor.rowcount > 0

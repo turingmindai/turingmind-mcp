@@ -200,13 +200,15 @@ _prune_cache: tuple[float, list[dict]] = (0.0, [])
 _PRUNE_TTL_SECONDS = 300  # 5 minutes
 
 @app.get("/api/v2/decision-queue")
-def get_decision_queue(repo: str, limit: int = 20):
+def get_decision_queue(repo: str, limit: int = 20, scope: Optional[str] = None):
     """Return prioritized action items derived from graph gap analysis + security findings."""
     global _prune_cache
 
     if not repo:
         raise HTTPException(status_code=400, detail="repo is required")
     try:
+        from .profile_config import filter_decision_queue_gaps
+
         gaps = detect_graph_gaps(repo)
         
         # Merge in any security gaps from the latest scan cycle
@@ -241,16 +243,23 @@ def get_decision_queue(repo: str, limit: int = 20):
         except Exception as e:
             logger.warning(f"Reconcile findings merge failed (non-fatal): {e}")
 
+        gaps = filter_decision_queue_gaps(gaps, scope=scope)
+
         # Sort by severity (critical first)
         gaps.sort(key=lambda g: SEVERITY_ORDER.get(g.get("severity", "low"), 99))
+        effective_scope = scope
+        if not effective_scope:
+            from .profile_config import is_memory_profile, PROFILE_MEMORY, PROFILE_GOVERNED
+            effective_scope = PROFILE_MEMORY if is_memory_profile() else PROFILE_GOVERNED
         return {
             "queue": gaps[:limit],
             "total": len(gaps),
             "repo": repo,
+            "scope": effective_scope,
         }
     except Exception as e:
         logger.error(f"Error building decision queue: {e}")
-        return {"queue": [], "total": 0, "repo": repo}
+        return {"queue": [], "total": 0, "repo": repo, "scope": scope or "governed"}
 
 
 class ClusterMeta(BaseModel):
@@ -264,6 +273,27 @@ class SyncPayload(BaseModel):
     repo: str
     files: list[str]
     cluster: ClusterMeta | None = None
+    composer_id: Optional[str] = None
+    session_id: Optional[str] = None
+    branch: Optional[str] = None
+    head_sha: Optional[str] = None
+    workspace_root: Optional[str] = None
+    event_id: Optional[str] = None
+
+
+class SessionPatchPayload(BaseModel):
+    loaded_scopes: Optional[list[str]] = None
+    touched_files: Optional[list[str]] = None
+    touched_subsystems: Optional[list[str]] = None
+    recall_history: Optional[list[str]] = None
+    policy_state: Optional[str] = None
+
+
+class SessionEndPayload(BaseModel):
+    composer_id: Optional[str] = None
+    repo: Optional[str] = None
+    reason: str = "session_end"
+
 
 class CreateNodePayload(BaseModel):
     repo: str
@@ -928,10 +958,42 @@ def draft_finding(finding_id: str):
     return result
 
 
+def run_session_gc(db):
+    from .session_lifecycle import run_session_gc as _run_gc
+    return _run_gc(db)
+
+
+def require_serialized_write():
+    """FastAPI dependency: serialize mutating handlers against SQLite write lock."""
+    from .sqlite_guard import serialized_sqlite_write
+    with serialized_sqlite_write():
+        yield
+
+
+def _attach_mutating_route_guards() -> None:
+    """Attach write-lock dependency to all mutating /api/v2 routes."""
+    from fastapi import Depends
+    from fastapi.routing import APIRoute
+
+    guard = Depends(require_serialized_write)
+    for route in app.routes:
+        if not isinstance(route, APIRoute):
+            continue
+        if not route.path.startswith("/api/v2"):
+            continue
+        if not route.methods.intersection({"POST", "PUT", "PATCH", "DELETE"}):
+            continue
+        if guard not in route.dependencies:
+            route.dependencies.append(guard)
+
+
 @app.on_event("startup")
 async def _start_background_loops():
     """Start always-on background ingestion: reconcile + chat observation poll."""
     import asyncio
+
+    _attach_mutating_route_guards()
+    logger.info("SQLite write serializer attached to mutating /api/v2 routes")
 
     interval_min = float(os.environ.get("TURINGMIND_RECONCILE_INTERVAL_MIN", "30"))
     if interval_min > 0:
@@ -976,6 +1038,20 @@ async def _start_background_loops():
 
         asyncio.create_task(cloud_pull_loop())
         logger.info(f"Cloud memory pull loop started (every {pull_interval_min:g} min)")
+
+    async def session_gc_loop():
+        while True:
+            await asyncio.sleep(60)
+            try:
+                db = _memory_db()
+                stats = await asyncio.to_thread(run_session_gc, db)
+                if stats.get("archived") or stats.get("errors"):
+                    logger.info("Session GC: %s", stats)
+            except Exception as e:
+                logger.warning(f"Background session GC failed: {e}")
+
+    asyncio.create_task(session_gc_loop())
+    logger.info("Session GC loop started (every 60s)")
 
     from .chat_observation_poller import start_chat_observation_poller
     await start_chat_observation_poller(_memory_db)
@@ -1103,6 +1179,28 @@ def update_node(node_id: str, payload: UpdateNodePayload):
 
     return {"status": "updated" if changed else "unchanged", "node_id": node_id}
 
+
+class BootstrapIfEmptyPayload(BaseModel):
+    repo: str
+
+
+@app.post("/api/v2/graph/bootstrap-if-empty")
+def bootstrap_if_empty(payload: BootstrapIfEmptyPayload):
+    """Create default SpecNode skeleton when graph is empty (Governed onboarding)."""
+    if not payload.repo:
+        raise HTTPException(status_code=400, detail="repo is required")
+    from .control_plane import CognitionControlPlane
+    from .v2_engine.database import get_all_spec_nodes
+
+    db = _memory_db()
+    before = len(get_all_spec_nodes(payload.repo))
+    if before > 0:
+        return {"status": "skipped", "reason": "graph_not_empty", "node_count": before}
+    CognitionControlPlane.bootstrap_repo_if_empty(db, payload.repo)
+    after = len(get_all_spec_nodes(payload.repo))
+    return {"status": "bootstrapped", "node_count": after, "repo": payload.repo}
+
+
 @app.post("/api/v2/sync")
 def sync_codebase(payload: SyncPayload):
     """REST endpoint for sync_codebase — invalidate nodes containing changed files and cascade."""
@@ -1117,54 +1215,113 @@ def sync_codebase(payload: SyncPayload):
         logger.info(f"Sync cluster{cluster_label}: {payload.cluster.description}")
 
     try:
-        all_nodes = _all_nodes_for_repo(payload.repo)
-        changed_set = set(payload.files)
-        impacted_nodes = []
+        from .sync_service import run_sync
 
-        for node in all_nodes:
-            node_files = set(node.implementation.files)
-            overlap = changed_set.intersection(node_files)
-            if overlap:
-                old_conf = node.state.confidence
-                new_score = float(round(old_conf * 0.9, 4)) if old_conf > 0 else 0.0
+        db = _memory_db()
+        if payload.event_id:
+            cached = db.get_sync_idempotency(payload.event_id)
+            if cached is not None:
+                return {**cached, "idempotent_replay": True}
 
-                detail = f"Files modified: {', '.join(sorted(overlap))}"
-                if cluster_label:
-                    detail += cluster_label
+        cluster_meta = payload.cluster.model_dump() if payload.cluster else None
 
-                node.state.evidence.append(Evidence(
-                    kind="code_change",
-                    score=new_score,
-                    detail=detail,
-                    source="git_hook",
-                    origin_id=f"sync_{node.id}",
-                ))
-                node.state.confidence = recalculate_confidence(node)
-                node.state.status = SpecStatus.IN_PROGRESS if node.state.status == SpecStatus.VERIFIED else node.state.status
-                node.updated_at = _now()
-
-                save_spec_node(node)
-                impacted_nodes.append(node.id)
-
-        cascades = []
-        for nid in impacted_nodes:
-            res = cascade_blast_radius(nid, payload.repo)
-            if res.get("impacted_count", 0) > 0:
-                cascades.append(res)
-
-        result = {
-            "status": "synced",
-            "repo": payload.repo,
-            "direct_impact_count": len(impacted_nodes),
-            "direct_impact_nodes": impacted_nodes,
-            "cascades_triggered": len(cascades),
-        }
-        if payload.cluster:
-            result["cluster"] = payload.cluster.model_dump()
+        result = run_sync(
+            db,
+            repo=payload.repo,
+            files=payload.files,
+            composer_id=payload.composer_id,
+            session_id=payload.session_id,
+            branch=payload.branch,
+            head_sha=payload.head_sha,
+            workspace_root=payload.workspace_root,
+            cluster_meta=cluster_meta,
+            cluster_label=cluster_label,
+        )
+        if payload.event_id and isinstance(result, dict) and result.get("status") != "error":
+            db.put_sync_idempotency(payload.event_id, payload.repo, result)
         return result
     except Exception as e:
         logger.error(f"Error syncing codebase: {e}")
         return {"status": "error", "detail": str(e)}
+
+@app.get("/api/v2/session")
+def get_session(repo: str, composer_id: str):
+    db = _memory_db()
+    sess = db.get_coding_session(composer_id, repo)
+    if not sess:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return sess
+
+@app.patch("/api/v2/session/{session_id}")
+def patch_session(session_id: str, payload: SessionPatchPayload):
+    db = _memory_db()
+    from .control_plane import CognitionControlPlane
+    try:
+        return CognitionControlPlane.patch_session(
+            db=db,
+            session_id=session_id,
+            loaded_scopes=payload.loaded_scopes,
+            touched_files=payload.touched_files,
+            touched_subsystems=payload.touched_subsystems,
+            recall_history=payload.recall_history,
+            policy_state=payload.policy_state,
+        )
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+@app.post("/api/v2/session/{session_id}/heartbeat")
+def session_heartbeat(session_id: str):
+    db = _memory_db()
+    sess = db.get_coding_session_by_id(session_id)
+    if not sess:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    from .session_lifecycle import session_expires_at
+
+    expires_at = session_expires_at()
+    ok = db.update_coding_session(
+        session_id=session_id,
+        loaded_scopes=sess["loaded_scopes"],
+        touched_files=sess["touched_files"],
+        touched_subsystems=sess["touched_subsystems"],
+        recall_history=sess["recall_history"],
+        policy_state=sess["policy_state"],
+        expires_at=expires_at,
+    )
+    if not ok:
+        raise HTTPException(status_code=500, detail="Failed to heartbeat session")
+    return {"status": "ok", "expires_at": expires_at, "session_id": session_id}
+
+
+@app.post("/api/v2/session/{session_id}/end")
+def session_end_by_id(session_id: str, payload: SessionEndPayload | None = None):
+    db = _memory_db()
+    from .session_lifecycle import end_session_by_id
+
+    reason = payload.reason if payload else "session_end"
+    result = end_session_by_id(db, session_id, reason=reason)
+    if result["status"] == "not_found":
+        raise HTTPException(status_code=404, detail="Session not found")
+    return result
+
+
+@app.post("/api/v2/session/end")
+def session_end(payload: SessionEndPayload):
+    if not payload.composer_id or not payload.repo:
+        raise HTTPException(status_code=400, detail="composer_id and repo are required")
+    db = _memory_db()
+    from .session_lifecycle import end_session_by_composer
+
+    result = end_session_by_composer(
+        db,
+        payload.composer_id,
+        payload.repo,
+        reason=payload.reason,
+    )
+    if result["status"] == "not_found":
+        raise HTTPException(status_code=404, detail="Session not found")
+    return result
+
 
 @app.get("/api/v2/graph/nodes")
 def get_graph_nodes(repo: str, governance_tier: Optional[str] = None):

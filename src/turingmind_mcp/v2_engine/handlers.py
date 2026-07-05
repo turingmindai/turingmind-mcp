@@ -3,8 +3,8 @@ TuringMind v2 Engine — Tool Handlers
 Implements the 14 new constraint-graph MCP tools. Each function follows the
 (arguments: dict, context: ToolContext) -> list[TextContent] contract.
 
-These handlers are pure v2: they write exclusively to v2_memory.db via the
-v2_engine.database layer. They do not touch the legacy database.
+These handlers write to the unified store (``~/.turingmind/memory.db``) via
+v2_engine.database for SpecNodes and MemoryDatabase for operational memory.
 """
 
 from __future__ import annotations
@@ -12,10 +12,11 @@ from __future__ import annotations
 import datetime
 import json
 import re
+import sqlite3
 import uuid
 import logging
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 logger = logging.getLogger("turingmind-mcp")
 
@@ -1882,7 +1883,11 @@ def auto_classify_failure(node: SpecNode, node_map: dict[str, SpecNode]) -> Fail
     return FailureClassification.IMPLEMENTATION_BUG
 
 
-def cascade_blast_radius(origin_id: str, repo: str) -> dict:
+def cascade_blast_radius(
+    origin_id: str,
+    repo: str,
+    conn: Optional[sqlite3.Connection] = None,
+) -> dict:
     """Walk dependents[] recursively and apply distance-attenuated confidence
     penalties.  Returns a report of all affected nodes.
 
@@ -1894,7 +1899,7 @@ def cascade_blast_radius(origin_id: str, repo: str) -> dict:
     - Evidence eviction: trims to last 30 entries before saving to prevent
       unbounded JSON blob growth and keep recalculate_confidence efficient
     """
-    impacted_with_depth = get_impacted_subgraph_with_depth(origin_id)
+    impacted_with_depth = get_impacted_subgraph_with_depth(origin_id, conn=conn)
     if not impacted_with_depth:
         return {"origin": origin_id, "impacted_count": 0, "affected": [], "truncated": False}
 
@@ -1914,7 +1919,7 @@ def cascade_blast_radius(origin_id: str, repo: str) -> dict:
     nodes_to_save = []
 
     for node_id, depth in impacted_with_depth:
-        node = get_spec_node(node_id)
+        node = get_spec_node(node_id, conn=conn)
         if not node:
             continue
 
@@ -1962,7 +1967,7 @@ def cascade_blast_radius(origin_id: str, repo: str) -> dict:
 
     # Atomic batch save — if any write fails, the entire cascade is rolled back
     if nodes_to_save:
-        save_spec_nodes(nodes_to_save)
+        save_spec_nodes(nodes_to_save, conn=conn)
 
     result = {
         "origin": origin_id,
@@ -2241,8 +2246,29 @@ async def handle_get_decision_queue(args: dict, ctx: ToolContext) -> list[TextCo
     if not repo:
         return _err("repo is required")
     limit = int(args.get("limit", 10))
+    scope = args.get("scope")
+
+    from ..profile_config import filter_decision_queue_gaps
 
     gaps = detect_graph_gaps(repo)
+
+    # Merge pending reconciliation findings (promotion candidates,
+    # conflicts, stale memories, ungoverned files) so they surface to the agent
+    try:
+        db = _get_memory_db()
+        for f in db.list_findings(repo=repo, status="pending", limit=50):
+            gaps.append({
+                "gap_type": f["finding_type"],
+                "severity": f["severity"],
+                "node_id": f.get("node_id"),
+                "memory_id": f.get("memory_id"),
+                "finding_id": f["finding_id"],
+                "action": f["action"],
+            })
+    except Exception as e:
+        logger.warning(f"Reconcile findings merge failed (non-fatal) in MCP decision queue: {e}")
+
+    gaps = filter_decision_queue_gaps(gaps, scope=scope)
 
     # Severity to sort weight
     severity_weight = {
@@ -2264,6 +2290,7 @@ async def handle_get_decision_queue(args: dict, ctx: ToolContext) -> list[TextCo
         "decision_queue": top_items,
         "instruction": "Agent: Pick the TOP item from this queue, execute its 'action', then poll this queue again.",
     })
+
 
 
 async def handle_promote_node(args: dict, ctx: ToolContext) -> list[TextContent]:

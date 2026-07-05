@@ -492,12 +492,17 @@ class MemoryManager:
         return False
 
     def _similar_topic(self, content1: str, content2: str) -> bool:
-        """Check if two contents are about similar topics."""
-        # Extract keywords (simple version)
-        words1 = set(re.findall(r"\b\w+\b", content1.lower()))
-        words2 = set(re.findall(r"\b\w+\b", content2.lower()))
+        """Check if two contents are about similar topics, excluding common stopwords."""
+        stop_words = {
+            "a", "an", "the", "and", "or", "but", "if", "then", "else", "for", "to",
+            "in", "on", "at", "by", "with", "about", "is", "are", "was", "were",
+            "be", "been", "being", "have", "has", "had", "do", "does", "did",
+            "of", "this", "that", "these", "those", "should", "would", "could", "will"
+        }
+        words1 = {w for w in re.findall(r"\b\w+\b", content1.lower()) if w not in stop_words}
+        words2 = {w for w in re.findall(r"\b\w+\b", content2.lower()) if w not in stop_words}
 
-        # Check for significant overlap
+        # Check for significant overlap of meaningful terms
         common = words1.intersection(words2)
         return len(common) >= 3
 
@@ -584,6 +589,13 @@ class MemoryManager:
 
         if recall.ranking_enabled:
             unique = sort_entries_by_branch_rank(unique, recall)
+        else:
+            from .memory_ranker import entry_relevance_score
+
+            unique.sort(
+                key=lambda entry: entry_relevance_score(entry, normalized_files),
+                reverse=True,
+            )
 
         return unique[:limit]
 

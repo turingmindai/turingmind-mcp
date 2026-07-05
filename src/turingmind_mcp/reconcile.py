@@ -272,6 +272,7 @@ class ReconciliationEngine:
         stats.update(self.detect_missing_nodes(repo))
         stats.update(self.suggest_duplicate_merges(repo))
         stats.update(self.branch_lifecycle(repo))
+        stats.update(self.mine_chat_rules(repo))
         run_id = self.db.record_reconcile_run(repo, stats)
         stats["run_id"] = run_id
         logger.info(f"Reconciliation run {run_id} for {repo}: {stats}")
@@ -815,6 +816,68 @@ class ReconciliationEngine:
             "branch_promotions_suggested": promotions,
             "branch_archives_suggested": archives,
         }
+
+    # ── Pass 10: mine chat rules ──────────────────────────────────────────────
+    def mine_chat_rules(self, repo: str) -> Dict[str, int]:
+        """Pass 10: mine rule-steering patterns from raw chat exchanges."""
+        cursor = self.db.conn.cursor()
+        cursor.execute(
+            """
+            SELECT observation_id, content FROM observations
+            WHERE repo = ? AND event_type = 'chat_exchange' AND status = 'pending'
+            """,
+            (repo,)
+        )
+        rows = cursor.fetchall()
+        
+        suggested = 0
+        rule_markers = [
+            "always do", "never do", "don't do", "do not", 
+            "you should", "should be", "must be", "make sure to", 
+            "remember to", "convention is"
+        ]
+
+        for row in rows:
+            obs_id = row["observation_id"]
+            content = row["content"] or ""
+            
+            lines = content.splitlines()
+            for line in lines:
+                line_lower = line.lower()
+                if ("user: " in line or "assistant: " in line) and any(m in line_lower for m in rule_markers):
+                    clean_line = line.replace("user: ", "").replace("assistant: ", "").strip()
+                    if len(clean_line) < 15:
+                        continue
+                    
+                    action_msg = f"Promote chat instruction to rule: '{clean_line[:120]}'"
+                    dedup = _dedup_key("chat_promotion", repo, obs_id, clean_line[:40])
+                    
+                    finding_id = self.db.create_finding(
+                        repo=repo,
+                        finding_type="promotion_candidate",
+                        severity="medium",
+                        action=action_msg,
+                        dedup_key=dedup,
+                        evidence=[
+                            {"type": "observation_id", "content": obs_id},
+                            {"type": "chat_text", "content": clean_line}
+                        ]
+                    )
+                    if finding_id:
+                        suggested += 1
+        # Auto-dismiss noise patterns if queue > 50 (CP-SPEC-04 / TM-QUEUE-003)
+        pending_findings = self.db.list_findings(repo=repo, status="pending", limit=100)
+        if len(pending_findings) > 50:
+            dismissed_count = 0
+            for f in pending_findings:
+                if f.get("finding_type") in ("promotion_candidate", "duplicate_merge") and f.get("severity") in ("low", "medium"):
+                    self.db.resolve_finding(f["finding_id"], "dismissed")
+                    dismissed_count += 1
+            logger.info(f"Queue flooded ({len(pending_findings)} findings). Auto-dismissed {dismissed_count} findings.")
+
+        return {"chat_rules_suggested": suggested}
+
+
 
     def _propose_merge_promotions(
         self, repo: str, touched_memory_ids: set[str]

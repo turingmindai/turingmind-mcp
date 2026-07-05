@@ -24,6 +24,12 @@ logging.basicConfig(
 logger = logging.getLogger("turingmind-cli")
 
 
+def resolve_default_repo_from_cli() -> str:
+    from .v2_local_cli import resolve_default_repo
+
+    return resolve_default_repo()
+
+
 def setup_platform(platform: str, project_root: Path | None = None) -> int:
     """
     Setup TuringMind-MCP for a specific platform.
@@ -247,6 +253,8 @@ Examples:
   turingmind install-api-daemon      # macOS: background API server (launchd)
   turingmind validate claude_desktop # Validate configuration
   turingmind diagnose                 # Diagnose installation
+  turingmind queue [--repo org/repo]  # Decision queue (markdown)
+  turingmind queue pop [--repo org/repo]  # Top queue item for agents
   turingmind memory-assess --repo org/repo   # Live memory scorecard (Gate 2)
         """,
     )
@@ -317,6 +325,18 @@ Examples:
         help="install (default), uninstall, or status",
     )
 
+    queue_parent = argparse.ArgumentParser(add_help=False)
+    queue_parent.add_argument("--repo", help="Repository (owner/repo)")
+
+    queue_parser = subparsers.add_parser(
+        "queue",
+        parents=[queue_parent],
+        help="Decision queue (local API :8477)",
+    )
+    queue_parser.add_argument("--json", action="store_true", help="JSON output (list only)")
+    queue_sub = queue_parser.add_subparsers(dest="queue_cmd")
+    queue_sub.add_parser("pop", parents=[queue_parent], help="Show highest-priority queue item")
+
     args = parser.parse_args()
 
     if not args.command:
@@ -353,6 +373,25 @@ Examples:
         if action == "status":
             return status()
         return install()
+    elif args.command == "queue":
+        from .v2_local_cli import (
+            fetch_decision_queue,
+            format_queue_markdown,
+            format_queue_pop_markdown,
+            load_install_env_file,
+        )
+
+        load_install_env_file()
+        repo = args.repo or resolve_default_repo_from_cli()
+        data = fetch_decision_queue(repo)
+        if getattr(args, "queue_cmd", None) == "pop":
+            print(format_queue_pop_markdown(data), end="")
+        else:
+            if getattr(args, "json", False):
+                print(json.dumps(data, indent=2))
+            else:
+                print(format_queue_markdown(data), end="")
+        return 0
     else:
         parser.print_help()
         return 1

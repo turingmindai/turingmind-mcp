@@ -17,27 +17,23 @@ from turingmind_mcp.v2_engine.handlers import handle_run_verification
 from turingmind_mcp.tools.context import ToolContext
 
 @pytest.fixture
-def temp_env(tmp_path):
-    # Patch the v2 database path
-    v2_db_path = tmp_path / "v2_memory.db"
-    
-    # Patch the legacy database path
-    legacy_db_path = tmp_path / "legacy.db"
-    
-    with patch("turingmind_mcp.v2_engine.database.DB_PATH", str(v2_db_path)), \
-         patch("turingmind_mcp.v2_engine.database.DB_DIR", str(tmp_path)), \
-         patch("turingmind_mcp.v2_engine.handlers._memory_db_instance", None):
-        
-        # Initialize databases
-        init_db()
-        
-        # Mock legacy database to avoid sqlite connection issues
-        from turingmind_mcp.database import MemoryDatabase
-        legacy_db = MemoryDatabase(str(legacy_db_path))
-        
-        with patch("turingmind_mcp.v2_engine.handlers._get_memory_db", return_value=legacy_db):
-            yield legacy_db
-            legacy_db.close()
+def temp_env(tmp_path, monkeypatch):
+    unified_db = tmp_path / "unified.db"
+
+    monkeypatch.setenv("TURINGMIND_DB_PATH", str(unified_db))
+
+    import turingmind_mcp.v2_engine.database as v2db
+
+    monkeypatch.setattr(v2db, "DB_PATH", str(unified_db))
+
+    init_db()
+    from turingmind_mcp.database import MemoryDatabase
+
+    legacy_db = MemoryDatabase(str(unified_db))
+
+    with patch("turingmind_mcp.v2_engine.handlers._get_memory_db", return_value=legacy_db):
+        yield legacy_db
+        legacy_db.close()
 
 @pytest.mark.asyncio
 async def test_verification_failure_auto_classification(temp_env):

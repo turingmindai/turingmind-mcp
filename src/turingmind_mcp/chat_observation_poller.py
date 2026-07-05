@@ -56,9 +56,72 @@ from .observation_capture import record_chat_exchange_observation
 
 logger = logging.getLogger("turingmind-mcp.chat-poller")
 
+ACTIVE_AGENT_SESSIONS: dict[str, float] = {}
 
-def _resolve_default_repo() -> str:
-    """Git origin from process cwd first, then ~/.turingmind/env, then process env."""
+def register_active_composer(composer_id: str):
+    """Mark a composer ID as belonging to the active coding agent."""
+    global ACTIVE_AGENT_SESSIONS
+    ACTIVE_AGENT_SESSIONS[composer_id] = time.time()
+
+
+def _resolve_repo_from_vscdb(db_path: str) -> Optional[str]:
+    """Parse history.entries or similar to extract workspace files and get git repo origin."""
+    try:
+        import sqlite3
+        import json
+        import urllib.parse
+        
+        # Connect to the workspace DB
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        
+        # Check if ItemTable exists
+        table_check = cursor.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='ItemTable'"
+        ).fetchone()
+        if not table_check:
+            conn.close()
+            return None
+
+        cursor.execute("SELECT value FROM ItemTable WHERE key='history.entries'")
+        row = cursor.fetchone()
+        conn.close()
+        
+        if not row:
+            return None
+            
+        entries = json.loads(row["value"])
+        for entry in entries:
+            resource = entry.get("editor", {}).get("resource", "")
+            if resource.startswith("file://"):
+                file_path = urllib.parse.unquote(resource[7:])
+                # Find git root by walking up
+                curr_dir = os.path.dirname(file_path)
+                while curr_dir and curr_dir != "/":
+                    git_dir = os.path.join(curr_dir, ".git")
+                    if os.path.isdir(git_dir):
+                        url = subprocess.check_output(
+                            ["git", "remote", "get-url", "origin"],
+                            cwd=curr_dir,
+                            stderr=subprocess.DEVNULL,
+                        ).decode().strip()
+                        match = re.search(r"[:/]([^/:]+/[^/]+?)(\.git)?$", url)
+                        if match:
+                            return match.group(1)
+                    curr_dir = os.path.dirname(curr_dir)
+    except Exception as e:
+        logger.debug(f"Failed to resolve repo from vscdb: {e}")
+    return None
+
+
+def _resolve_default_repo(db_path: Optional[str] = None) -> str:
+    """Git origin from active workspace db first, then process cwd, then ~/.turingmind/env, then process env."""
+    if db_path:
+        repo_from_db = _resolve_repo_from_vscdb(db_path)
+        if repo_from_db:
+            return repo_from_db
+
     try:
         url = subprocess.check_output(
             ["git", "remote", "get-url", "origin"],
@@ -84,6 +147,7 @@ def _resolve_default_repo() -> str:
     return "local/workspace"
 
 
+
 def _check_observation_ready(
     db: MemoryDatabase,
 ) -> Optional[Dict[str, Any]]:
@@ -103,6 +167,12 @@ def _check_observation_ready(
         return None
 
     composer_id = most_recent["composerId"]
+
+    # Isolate chat mining to only those composers used by the active coding agent
+    if os.environ.get("TURINGMIND_CHAT_POLL_ISOLATED", "1") != "0":
+        if composer_id not in ACTIVE_AGENT_SESSIONS:
+            return None
+
     last_activity_at = most_recent["lastActivityAt"]
     exchange_state = get_last_exchange_state(db_path_str, composer_id)
     if not exchange_state:
@@ -187,6 +257,8 @@ def _poll_chat_observations_sync(
     if db_path is None:
         return {"recorded": 0}
 
+    dynamic_repo = _resolve_default_repo(str(db_path)) or repo
+
     cached = db.get_chat_capture_state(composer_id)
     last_ts = cached.get("lastObservationExchangeTimestamp", 0) if cached else 0
     full_metadata = extract_metadata(composer_id, str(db_path))
@@ -207,7 +279,7 @@ def _poll_chat_observations_sync(
 
     obs_id = record_chat_exchange_observation(
         db,
-        repo=repo,
+        repo=dynamic_repo,
         composer_id=composer_id,
         metadata=metadata,
     )
@@ -218,7 +290,7 @@ def _poll_chat_observations_sync(
     _advance_observation_cursor(db, composer_id, exchange_state)
     logger.info(
         "Chat observation [%s] composer=%s obs=%s",
-        repo,
+        dynamic_repo,
         composer_id[:8],
         obs_id[:8],
     )

@@ -37,6 +37,7 @@ TOOL_GROUPS = {
         "turingmind_resolve_conflict",
         "turingmind_log_reasoning",
         "turingmind_get_audit_trail",
+        "turingmind_get_decision_queue",
     },
     "v2_engine": [
         "turingmind_create_spec_node",
@@ -56,23 +57,21 @@ TOOL_GROUPS = {
         "turingmind_get_execution_state",
         "turingmind_ingest_runtime_signal",
         "turingmind_bootstrap_codebase",
-        "turingmind_get_decision_queue",
         "turingmind_sync_codebase",
         "turingmind_sync_cloud",
     ],
 }
 
-# ============================================================================
-# ENABLED TOOL GROUPS
-# ============================================================================
+MEMORY_PROFILE_GROUPS = "login,code_intelligence"
+GOVERNED_PROFILE_GROUPS = "login,code_intelligence,v2_engine"
 
-# Default: MINIMAL set (core workflow)
-DEFAULT_ENABLED_GROUPS = "login,code_intelligence,v2_engine"
-FULL_ENABLED_GROUPS = "login,code_intelligence,v2_engine"
+# Default: governed for existing installs; new installs set memory via turingmind-install.sh
+DEFAULT_ENABLED_GROUPS = GOVERNED_PROFILE_GROUPS
+FULL_ENABLED_GROUPS = GOVERNED_PROFILE_GROUPS
 
 
 def get_enabled_groups() -> Set[str]:
-    """Get the set of enabled tool groups from environment or default."""
+    """Get the set of enabled tool groups from environment or profile default."""
     env_groups = os.environ.get("TURINGMIND_ENABLED_TOOL_GROUPS", "")
     
     if env_groups.lower() == "all":
@@ -82,7 +81,11 @@ def get_enabled_groups() -> Set[str]:
         env_groups = DEFAULT_ENABLED_GROUPS
     
     if not env_groups:
-        env_groups = DEFAULT_ENABLED_GROUPS
+        try:
+            from .profile_config import default_tool_groups_for_profile
+            env_groups = default_tool_groups_for_profile()
+        except ImportError:
+            env_groups = DEFAULT_ENABLED_GROUPS
     
     return {g.strip() for g in env_groups.split(",") if g.strip()}
 
