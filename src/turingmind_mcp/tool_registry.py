@@ -339,12 +339,22 @@ Tool(
     name="turingmind_list_memory",
     description=(
         "List memory entries with filtering and pagination. "
-        "Supports filtering by category, status, scope, and security tags."
+        "Supports filtering by category, status, scope, and security tags. "
+        "Pass workspace_id or repos to union linked multi-root product repos."
     ),
     inputSchema={
         "type": "object",
         "properties": {
             "repo": {"type": "string", "description": "Repository (owner/repo)"},
+            "workspace_id": {
+                "type": "string",
+                "description": "Product/workspace key for multi-repo union",
+            },
+            "repos": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Linked repos to union (owner/repo)",
+            },
             "category": {
                 "type": "string",
                 "enum": ["repo_fact", "learned_pattern", "explicit_rule", "session_context", "all"],
@@ -376,7 +386,6 @@ Tool(
             "limit": {"type": "integer", "description": "Items per page", "default": 50},
             "search": {"type": "string", "description": "Search content"},
         },
-        "required": ["repo"],
     },
 ),
 Tool(
@@ -470,15 +479,25 @@ Tool(
 Tool(
     name="turingmind_ground",
     description=(
-        "One-shot memory grounding for a repo: explicit rules, high-confidence "
-        "learned patterns, curated working-set session cards, and top decision-queue "
-        "actions. Prefer this over separate list_memory + get_decision_queue calls "
-        "at session start. Context may also be in .turingmind/recalled.md."
+        "One-shot memory grounding for a repo or multi-root workspace: explicit rules, "
+        "high-confidence learned patterns, curated working-set session cards, and top "
+        "decision-queue actions. Pass workspace_id or repos to union linked product "
+        "repos (patterns stay tagged with source repo). Prefer over separate "
+        "list_memory + get_decision_queue. Context may also be in .turingmind/recalled.md."
     ),
     inputSchema={
         "type": "object",
         "properties": {
-            "repo": {"type": "string", "description": "Repository (owner/repo)"},
+            "repo": {"type": "string", "description": "Primary repository (owner/repo)"},
+            "workspace_id": {
+                "type": "string",
+                "description": "Product/workspace key (looks up ~/.turingmind/workspaces.json)",
+            },
+            "repos": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Linked repos to union for recall (owner/repo)",
+            },
             "files": {
                 "type": "array",
                 "items": {"type": "string"},
@@ -505,7 +524,6 @@ Tool(
                 "default": "memory",
             },
         },
-        "required": ["repo"],
     },
 ),
 Tool(

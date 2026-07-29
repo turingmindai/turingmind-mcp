@@ -88,7 +88,42 @@ def test_filter_hides_low_promotion_noise(monkeypatch):
     filtered = filter_decision_queue_gaps(gaps, scope="memory")
     types = {g["gap_type"] for g in filtered}
     assert "memory_conflict" in types
+    assert "promotion_candidate" not in types
     assert not any(g.get("severity") == "low" for g in filtered)
+
+
+def test_detect_conflicts_requires_heterogeneous_pair(memory_db, tier_repo):
+    mgr = MemoryManager(memory_db)
+    rule_a = mgr.create_explicit_rule(
+        repo=tier_repo,
+        content="Always use async/await for network calls",
+        scope="repo",
+    )
+    rule_b = mgr.create_explicit_rule(
+        repo=tier_repo,
+        content="Never use async/await for network calls",
+        scope="repo",
+    )
+    assert mgr.detect_conflicts(tier_repo, rule_b["memory_id"]) == []
+
+    pat_id = memory_db.create_memory_entry(
+        repo=tier_repo,
+        memory_type="learned_pattern",
+        content="Never use async/await for network calls",
+        scope="repo",
+        confidence=0.8,
+        status="active",
+    )
+    conflicts = mgr.detect_conflicts(tier_repo, pat_id)
+    assert len(conflicts) > 0
+    peer_ids = {
+        (c.get("memory_1") or {}).get("memory_id")
+        for c in conflicts
+    } | {
+        (c.get("memory_2") or {}).get("memory_id")
+        for c in conflicts
+    }
+    assert rule_a["memory_id"] in peer_ids
 
 
 def test_expire_cluster_session_context(memory_db, tier_repo):
@@ -110,6 +145,34 @@ def test_expire_cluster_session_context(memory_db, tier_repo):
     assert stats["cluster_session_context_expired"] >= 1
     assert memory_db.get_memory_entry(junk_id)["status"] == "deprecated"
     assert memory_db.get_memory_entry(good_id)["status"] == "active"
+
+
+def test_auto_resolve_conflicts_with_deprecated_peer(memory_db, tier_repo):
+    mgr = MemoryManager(memory_db)
+    rule = mgr.create_explicit_rule(
+        repo=tier_repo,
+        content="Always prefer coverage language over NO CONFIG",
+        scope="repo",
+    )
+    junk_id, _ = mgr.create_session_context(
+        repo=tier_repo,
+        content="5 non-code file(s) — no graph impact — files: docs/a.md",
+        scope="repo",
+        evidence=[],
+    )
+    memory_db.create_conflict(
+        repo=tier_repo,
+        memory_id_1=rule["memory_id"],
+        memory_id_2=junk_id,
+        conflict_type="contradiction",
+        severity="high",
+        description="rule vs cluster junk",
+    )
+    memory_db.update_memory_entry(junk_id, status="deprecated")
+    engine = ReconciliationEngine(memory_db)
+    stats = engine.aggregate_conflicts(tier_repo)
+    assert stats["conflicts_auto_cleared"] >= 1
+    assert stats["conflicts_open"] == 0
 
 
 def test_compose_ground(memory_db, tier_repo):

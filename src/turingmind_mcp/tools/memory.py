@@ -76,8 +76,17 @@ def register(registry: dict) -> None:
 
 async def handle_list_memory(arguments: dict, ctx: ToolContext) -> list[TextContent]:
     repo = arguments.get("repo", "")
-    if not repo:
-        return [TextContent(type="text", text="❌ **Missing required field:** `repo`")]
+    workspace_id = arguments.get("workspace_id")
+    repos_arg = arguments.get("repos") or []
+    if isinstance(repos_arg, str):
+        repos_arg = [r.strip() for r in repos_arg.split(",") if r.strip()]
+    if not repo and not workspace_id and not repos_arg:
+        return [
+            TextContent(
+                type="text",
+                text="❌ **Missing required field:** `repo` (or `workspace_id` / `repos`)",
+            )
+        ]
     category = arguments.get("category", "all")
     status = arguments.get("status", "all")
     scope = arguments.get("scope")
@@ -90,29 +99,62 @@ async def handle_list_memory(arguments: dict, ctx: ToolContext) -> list[TextCont
     if not ctx.get_db:
         return [TextContent(type="text", text="❌ **Database not available**")]
     try:
-        db = ctx.get_db()
-        entries = db.list_memory_entries(
-            repo=repo,
-            memory_type=category if category != "all" else None,
-            status=status if status != "all" else None,
-            scope=scope,
-            branch=branch,
-            include_other_branches=include_other_branches,
-            page=page,
-            limit=limit,
-            search=search,
+        from turingmind_mcp.workspace import merge_entry_lists, resolve_workspace
+
+        ws = resolve_workspace(
+            workspace_id=workspace_id,
+            repos=repos_arg,
+            primary_repo=repo or None,
         )
+        targets = [r for r in ws.repos if r] or ([repo] if repo else [])
+        db = ctx.get_db()
+        try:
+            page_n = max(1, int(page or 1))
+        except (TypeError, ValueError):
+            page_n = 1
+        try:
+            limit_n = max(1, int(limit or 50))
+        except (TypeError, ValueError):
+            limit_n = 50
+        # Fetch enough per repo to page after merge (cap to keep queries bounded).
+        fetch_limit = min(max(limit_n * page_n, limit_n), 500)
+        batches = []
+        for r in targets:
+            rows = db.list_memory_entries(
+                repo=r,
+                memory_type=category if category != "all" else None,
+                status=status if status != "all" else None,
+                scope=scope,
+                branch=branch if r == (ws.primary_repo or repo) else None,
+                include_other_branches=include_other_branches,
+                page=1,
+                limit=fetch_limit,
+                search=search,
+            )
+            batch = []
+            for e in rows:
+                e = dict(e)
+                e["repo"] = r
+                batch.append(e)
+            batches.append(batch)
+        merged = merge_entry_lists(batches, limit=fetch_limit * max(1, len(targets)))
         if security_tag:
-            entries = [
-                e for e in entries
+            merged = [
+                e for e in merged
                 if e.get("security_tags") and security_tag in e.get("security_tags", [])
             ]
+        total = len(merged)
+        start = (page_n - 1) * limit_n
+        entries = merged[start : start + limit_n]
         # Machine-parseable JSON: agents need memory_id to round-trip into
         # get_memory / save_memory, and full content to act on the entry.
         payload = {
-            "total": len(entries),
-            "page": page,
-            "limit": limit,
+            "total": total,
+            "page": page_n,
+            "limit": limit_n,
+            "repo": ws.primary_repo or repo,
+            "repos": targets,
+            "workspace_id": ws.workspace_id,
             "entries": [
                 {
                     "memory_id": e["memory_id"],
@@ -121,6 +163,7 @@ async def handle_list_memory(arguments: dict, ctx: ToolContext) -> list[TextCont
                     "content": e["content"],
                     "scope": e["scope"],
                     "confidence": e["confidence"],
+                    "repo": e.get("repo"),
                     "branch": e.get("branch"),
                     "head_sha": e.get("head_sha"),
                     "scope_tier": e.get("scope_tier"),
@@ -218,6 +261,19 @@ async def handle_save_memory(arguments: dict, ctx: ToolContext) -> list[TextCont
                 return [
                     TextContent(type="text", text=f"❌ **Memory entry not found:** `{memory_id}`")
                 ]
+            # Promoting a candidate → resolve linked promotion finding(s).
+            new_status = arguments.get("status")
+            if new_status == "active":
+                finding_id = arguments.get("finding_id")
+                if finding_id:
+                    db.resolve_finding(finding_id, "actioned")
+                else:
+                    for finding in db.list_findings(repo=repo, status="pending", limit=100):
+                        if (
+                            finding.get("memory_id") == memory_id
+                            and finding.get("finding_type") == "promotion_candidate"
+                        ):
+                            db.resolve_finding(finding["finding_id"], "actioned")
         else:
             if memory_type == "explicit_rule":
                 result = memory_manager.create_explicit_rule(
@@ -323,9 +379,18 @@ async def handle_delete_memory(arguments: dict, ctx: ToolContext) -> list[TextCo
 
 async def handle_ground(arguments: dict, ctx: ToolContext) -> list[TextContent]:
     """One-shot grounding: rules + patterns + working set + top actions."""
-    repo = arguments.get("repo", "")
-    if not repo:
-        return [TextContent(type="text", text="❌ **Missing required field:** `repo`")]
+    repo = arguments.get("repo") or ""
+    workspace_id = arguments.get("workspace_id")
+    repos_arg = arguments.get("repos") or []
+    if isinstance(repos_arg, str):
+        repos_arg = [r.strip() for r in repos_arg.split(",") if r.strip()]
+    if not repo and not workspace_id and not repos_arg:
+        return [
+            TextContent(
+                type="text",
+                text="❌ **Missing required field:** `repo` (or `workspace_id` / `repos`)",
+            )
+        ]
     if not ctx.get_memory_manager:
         return [TextContent(type="text", text="❌ **Memory manager not available**")]
 
@@ -357,6 +422,7 @@ async def handle_ground(arguments: dict, ctx: ToolContext) -> list[TextContent]:
                         "memory_id": f.get("memory_id"),
                         "finding_id": f["finding_id"],
                         "action": f["action"],
+                        "repo": repo,
                     })
             except Exception:
                 pass
@@ -366,7 +432,9 @@ async def handle_ground(arguments: dict, ctx: ToolContext) -> list[TextContent]:
     try:
         payload = compose_ground(
             ctx.get_memory_manager(),
-            repo=repo,
+            repo=repo or None,
+            repos=repos_arg or None,
+            workspace_id=workspace_id,
             files=list(files),
             query=query,
             limit=limit,

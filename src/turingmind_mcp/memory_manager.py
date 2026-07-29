@@ -454,6 +454,11 @@ class MemoryManager:
         ]
 
         for candidate in candidates:
+            # Strict cross-type only: explicit_rule ↔ learned_pattern
+            # (not rule↔rule or pattern↔pattern).
+            pair = {new_entry.get("type"), candidate.get("type")}
+            if pair != {"explicit_rule", "learned_pattern"}:
+                continue
             conflict_type = self._analyze_conflict(new_entry, candidate)
             if conflict_type:
                 conflict_id = self.db.create_conflict(

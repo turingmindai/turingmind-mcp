@@ -152,6 +152,8 @@ _GENERIC_PROMOTION_MARKERS = (
     "non-code file(s)",
     "non-code edit:",
     "refactor burst:",
+    "files in",
+    "module(s) over",
 )
 
 # Active session_context shaped like edit-cluster telemetry — expire on reconcile.
@@ -940,9 +942,34 @@ class ReconciliationEngine:
         return {"memories_decayed": decayed, "stale_flagged": stale}
 
     # ── Pass 6: conflict aggregator ──────────────────────────────────────────
+    def _auto_resolve_stale_conflicts(self, repo: str) -> int:
+        """Drop conflicts where either peer is already deprecated/deleted.
+
+        Common after cluster-session_context hygiene: rule vs junk remains
+        open even though the junk card is gone.
+        """
+        conflicts = self.db.get_conflicts(repo, unresolved_only=True)
+        cleared = 0
+        for c in conflicts:
+            a = self.db.get_memory_entry(c["memory_id_1"])
+            b = self.db.get_memory_entry(c["memory_id_2"])
+            a_status = (a or {}).get("status") or "missing"
+            b_status = (b or {}).get("status") or "missing"
+            if a_status in {"deprecated", "deleted", "missing"} or b_status in {
+                "deprecated",
+                "deleted",
+                "missing",
+            }:
+                if self.db.resolve_conflict(
+                    c["conflict_id"], "auto_drop_inactive_peer"
+                ):
+                    cleared += 1
+        return cleared
+
     def aggregate_conflicts(self, repo: str) -> Dict[str, int]:
         """Unresolved conflict flags exist in the database but nobody sees
         them. Surface each as a decision-queue finding."""
+        auto_cleared = self._auto_resolve_stale_conflicts(repo)
         conflicts = self.db.get_conflicts(repo, unresolved_only=True)
         surfaced = 0
         for c in conflicts:
@@ -961,7 +988,11 @@ class ReconciliationEngine:
             )
             if created:
                 surfaced += 1
-        return {"conflicts_open": len(conflicts), "conflicts_surfaced": surfaced}
+        return {
+            "conflicts_open": len(conflicts),
+            "conflicts_surfaced": surfaced,
+            "conflicts_auto_cleared": auto_cleared,
+        }
 
     # ── Pass 7: missing-node detector ────────────────────────────────────────
     def detect_missing_nodes(self, repo: str) -> Dict[str, int]:

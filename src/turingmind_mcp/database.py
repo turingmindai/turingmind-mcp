@@ -493,7 +493,8 @@ class MemoryDatabase:
             """)
             cursor.execute("""
                 CREATE TRIGGER memory_fts_ad AFTER DELETE ON memory_entries BEGIN
-                    INSERT INTO memory_fts(memory_fts, rowid, content) VALUES ('delete', old.rowid, old.content);
+                    INSERT INTO memory_fts(memory_fts, rowid, content)
+                    SELECT 'delete', old.rowid, old.content WHERE old.type != 'session_context';
                 END
             """)
             # session_context is never indexed — skip FTS delete for those rows

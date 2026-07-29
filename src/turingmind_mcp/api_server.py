@@ -199,67 +199,110 @@ _security_gaps_cache: list[dict] = []
 _prune_cache: tuple[float, list[dict]] = (0.0, [])
 _PRUNE_TTL_SECONDS = 300  # 5 minutes
 
-@app.get("/api/v2/decision-queue")
-def get_decision_queue(repo: str, limit: int = 20, scope: Optional[str] = None):
-    """Return prioritized action items derived from graph gap analysis + security findings."""
+def _decision_queue_for_repo(repo: str, *, scope: Optional[str] = None) -> list[dict]:
+    """Build unfiltered-then-scoped gaps for a single repo (shared by queue API)."""
     global _prune_cache
+    from .profile_config import filter_decision_queue_gaps
 
-    if not repo:
-        raise HTTPException(status_code=400, detail="repo is required")
-    try:
-        from .profile_config import filter_decision_queue_gaps
+    gaps = detect_graph_gaps(repo)
 
-        gaps = detect_graph_gaps(repo)
-        
-        # Merge in any security gaps from the latest scan cycle
+    for scanner in _scanner_cache.values():
+        last_result = scanner.run_security_cycle(repo)
+        if last_result.gaps_injected:
+            gaps.extend(last_result.gaps_injected)
+
+    import time as _time
+    now = _time.time()
+    if now - _prune_cache[0] > _PRUNE_TTL_SECONDS:
+        prune_gaps: list[dict] = []
         for scanner in _scanner_cache.values():
-            last_result = scanner.run_security_cycle(repo)
-            if last_result.gaps_injected:
-                gaps.extend(last_result.gaps_injected)
+            prune_gaps.extend(scanner.prune_rules())
+        _prune_cache = (now, prune_gaps)
+    gaps.extend(_prune_cache[1])
 
-        # X-3: Merge in rule health gaps from prune_rules() with TTL cache
-        import time as _time
-        now = _time.time()
-        if now - _prune_cache[0] > _PRUNE_TTL_SECONDS:
-            prune_gaps: list[dict] = []
-            for scanner in _scanner_cache.values():
-                prune_gaps.extend(scanner.prune_rules())
-            _prune_cache = (now, prune_gaps)
-        gaps.extend(_prune_cache[1])
+    try:
+        for f in _memory_db().list_findings(repo=repo, status="pending", limit=50):
+            gaps.append({
+                "gap_type": f["finding_type"],
+                "severity": f["severity"],
+                "node_id": f.get("node_id"),
+                "memory_id": f.get("memory_id"),
+                "finding_id": f["finding_id"],
+                "action": f["action"],
+                "repo": repo,
+            })
+    except Exception as e:
+        logger.warning(f"Reconcile findings merge failed (non-fatal): {e}")
 
-        # Merge pending reconciliation findings (promotion candidates,
-        # conflicts, stale memories, ungoverned files) so the engine's
-        # proposals surface where humans and agents already look.
-        try:
-            for f in _memory_db().list_findings(repo=repo, status="pending", limit=50):
-                gaps.append({
-                    "gap_type": f["finding_type"],
-                    "severity": f["severity"],
-                    "node_id": f.get("node_id"),
-                    "memory_id": f.get("memory_id"),
-                    "finding_id": f["finding_id"],
-                    "action": f["action"],
-                })
-        except Exception as e:
-            logger.warning(f"Reconcile findings merge failed (non-fatal): {e}")
+    return filter_decision_queue_gaps(gaps, scope=scope)
 
-        gaps = filter_decision_queue_gaps(gaps, scope=scope)
 
-        # Sort by severity (critical first)
+@app.get("/api/v2/decision-queue")
+def get_decision_queue(
+    repo: Optional[str] = None,
+    repos: str = "",
+    workspace_id: Optional[str] = None,
+    limit: int = 20,
+    scope: Optional[str] = None,
+):
+    """Return prioritized action items derived from graph gap analysis + security findings.
+
+    Optional ``workspace_id`` / ``repos`` unions linked multi-root product repos.
+    """
+    from .workspace import resolve_workspace
+
+    repo_list = [r.strip() for r in repos.split(",") if r.strip()]
+    ws = resolve_workspace(workspace_id=workspace_id, repos=repo_list, primary_repo=repo)
+    targets = [r for r in ws.repos if r and not r.startswith("workspace/")]
+    if not targets and repo:
+        targets = [repo]
+    if not targets:
+        raise HTTPException(
+            status_code=400,
+            detail="repo, repos, or workspace_id with linked repos is required",
+        )
+
+    try:
+        gaps: list[dict] = []
+        for r in targets:
+            for g in _decision_queue_for_repo(r, scope=scope):
+                item = dict(g)
+                item.setdefault("repo", r)
+                gaps.append(item)
+
         gaps.sort(key=lambda g: SEVERITY_ORDER.get(g.get("severity", "low"), 99))
+        # Dedupe across repos
+        seen = set()
+        deduped = []
+        for g in gaps:
+            key = g.get("finding_id") or f"{g.get('repo')}|{g.get('action')}"
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(g)
+
         effective_scope = scope
         if not effective_scope:
             from .profile_config import is_memory_profile, PROFILE_MEMORY, PROFILE_GOVERNED
             effective_scope = PROFILE_MEMORY if is_memory_profile() else PROFILE_GOVERNED
         return {
-            "queue": gaps[:limit],
-            "total": len(gaps),
-            "repo": repo,
+            "queue": deduped[:limit],
+            "total": len(deduped),
+            "repo": ws.primary_repo or targets[0],
+            "repos": targets,
+            "workspace_id": ws.workspace_id,
             "scope": effective_scope,
         }
     except Exception as e:
         logger.error(f"Error building decision queue: {e}")
-        return {"queue": [], "total": 0, "repo": repo, "scope": scope or "governed"}
+        return {
+            "queue": [],
+            "total": 0,
+            "repo": repo or (targets[0] if targets else ""),
+            "repos": targets,
+            "workspace_id": workspace_id,
+            "scope": scope or "governed",
+        }
 
 
 class ClusterMeta(BaseModel):
@@ -1002,7 +1045,9 @@ def propose_commit_candidates(payload: CommitCandidatePayload):
 
 @app.get("/api/v2/ground")
 def get_ground(
-    repo: str,
+    repo: Optional[str] = None,
+    repos: str = "",
+    workspace_id: Optional[str] = None,
     files: str = "",
     query: str = "",
     limit: int = 10,
@@ -1011,9 +1056,17 @@ def get_ground(
     head: Optional[str] = None,
     dirty: Optional[bool] = None,
 ):
-    """One-shot grounding: rules + patterns + working set + top actions."""
-    if not repo:
-        raise HTTPException(status_code=400, detail="repo is required")
+    """One-shot grounding: rules + patterns + working set + top actions.
+
+    Pass ``workspace_id`` and/or comma-separated ``repos`` to union linked
+    multi-root product repos. Patterns stay tagged with source repo.
+    """
+    repo_list = [r.strip() for r in repos.split(",") if r.strip()]
+    if not repo and not repo_list and not workspace_id:
+        raise HTTPException(
+            status_code=400,
+            detail="repo, repos, or workspace_id is required",
+        )
     from .grounding import compose_ground
 
     file_paths = [f.strip() for f in files.split(",") if f.strip()]
@@ -1025,6 +1078,8 @@ def get_ground(
         return compose_ground(
             _memory_manager(),
             repo=repo,
+            repos=repo_list or None,
+            workspace_id=workspace_id,
             files=file_paths,
             query=query or None,
             limit=limit,
@@ -1034,6 +1089,8 @@ def get_ground(
             dirty=dirty,
             decision_queue_builder=_queue_builder,
         )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         logger.exception("Ground compose failed")
         raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")

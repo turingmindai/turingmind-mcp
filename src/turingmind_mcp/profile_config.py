@@ -104,9 +104,15 @@ def default_tool_groups_for_profile(profile: Optional[str] = None) -> str:
 
 
 def _is_agent_queue_noise(gap: dict) -> bool:
-    """True when a gap should not train agents (low/generic telemetry)."""
+    """True when a gap should not train agents (low/generic telemetry).
+
+    ``promotion_candidate`` items are confirmed via stop followup / Distiller
+    review — keep them out of the agent-facing queue so it stays actionable.
+    """
     gap_type = gap.get("gap_type") or gap.get("finding_type") or ""
     severity = (gap.get("severity") or "low").lower()
+    if gap_type == "promotion_candidate" and severity in ("low", "medium"):
+        return True
     if gap_type in _AGENT_QUEUE_HIDE_LOW and severity in ("low", "medium"):
         action = (gap.get("action") or "").lower()
         if any(marker in action for marker in _GENERIC_QUEUE_ACTION_MARKERS):
