@@ -256,6 +256,7 @@ Examples:
   turingmind queue [--repo org/repo]  # Decision queue (markdown)
   turingmind queue pop [--repo org/repo]  # Top queue item for agents
   turingmind memory-assess --repo org/repo   # Live memory scorecard (Gate 2)
+  turingmind memory-status [--repo org/repo] # Pending obs, queue, rules snapshot
         """,
     )
 
@@ -312,6 +313,13 @@ Examples:
         help="Leave probe memories in the database",
     )
 
+    status_parser = subparsers.add_parser(
+        "memory-status",
+        help="Snapshot pending observations, queue, and rules from ~/.turingmind/memory.db",
+    )
+    status_parser.add_argument("--repo", help="Repository (owner/repo); default all repos")
+    status_parser.add_argument("--json", action="store_true", help="JSON output")
+
     # macOS launchd daemon for V2 API (Cursor plugin hooks)
     daemon_parser = subparsers.add_parser(
         "install-api-daemon",
@@ -364,6 +372,12 @@ Examples:
             return 1
         print(format_report(report, as_json=args.json))
         return 1 if any(layer.status == "fail" for layer in report.layers) else 0
+    elif args.command == "memory-status":
+        from .memory_status import collect_memory_status, format_status_report
+
+        report = collect_memory_status(repo=args.repo)
+        print(format_status_report(report, as_json=args.json))
+        return 0
     elif args.command == "install-api-daemon":
         from .daemon_setup import install, status, uninstall
 

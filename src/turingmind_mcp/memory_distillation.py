@@ -191,3 +191,169 @@ async def draft_finding_async(
 def draft_finding(db: MemoryDatabase, finding_id: str) -> Dict[str, Any]:
     """Sync wrapper for REST/CLI callers."""
     return asyncio.run(draft_finding_async(db, finding_id))
+
+
+_SKIP_COMMIT_PREFIXES = (
+    "wip",
+    "tmp",
+    "temp",
+    "chore:",
+    "style:",
+    "format",
+    "merge ",
+    "merge branch",
+)
+
+
+def _commit_worth_promoting(message: str, files: List[str]) -> bool:
+    msg = (message or "").strip()
+    if len(msg) < 12:
+        return False
+    lower = msg.lower()
+    if any(lower.startswith(p) for p in _SKIP_COMMIT_PREFIXES):
+        return False
+    code_files = [
+        f
+        for f in (files or [])
+        if f
+        and not f.endswith((".md", ".txt", ".json", ".yml", ".yaml", ".lock"))
+        and ".ds_store" not in f.lower()
+    ]
+    return bool(code_files) or len(msg) >= 40
+
+
+def _heuristic_commit_drafts(message: str, files: List[str]) -> List[Dict[str, str]]:
+    """Deterministic 0–2 draft patterns from commit message + paths (no LLM)."""
+    msg = scrub_secrets((message or "").strip()) or ""
+    if not msg:
+        return []
+    # Prefer first code file as scope; else package/dir of first path
+    scope = "repo"
+    for f in files or []:
+        if f.endswith((".py", ".js", ".ts", ".tsx", ".jsx", ".go", ".rs", ".java")):
+            scope = f
+            break
+    if scope == "repo" and files:
+        parts = files[0].replace("\\", "/").split("/")
+        if len(parts) > 1:
+            scope = "/".join(parts[:-1]) or "repo"
+
+    drafts = [
+        {
+            "content": f"From commit: {msg[:280]}",
+            "scope": scope,
+        }
+    ]
+    # Second candidate only when commit spans a clear package + message is rich
+    dirs = {
+        "/".join(f.replace("\\", "/").split("/")[:-1])
+        for f in (files or [])
+        if "/" in f.replace("\\", "/")
+    }
+    if len(dirs) == 1 and len(msg) >= 60:
+        only = next(iter(dirs))
+        if only and only != scope:
+            drafts.append(
+                {
+                    "content": f"Commit touched `{only}`: {msg[:200]}",
+                    "scope": only,
+                }
+            )
+    return drafts[:2]
+
+
+def propose_commit_candidates(
+    db: MemoryDatabase,
+    *,
+    repo: str,
+    message: str,
+    files: Optional[List[str]] = None,
+    branch: Optional[str] = None,
+    head_sha: Optional[str] = None,
+    use_llm: bool = False,
+) -> Dict[str, Any]:
+    """Create 0–2 ``learned_pattern`` candidates + promotion queue items from a commit.
+
+    Extends the existing distillation surface — does not auto-activate.
+    """
+    import hashlib
+
+    files = list(files or [])
+    if not _commit_worth_promoting(message, files):
+        return {
+            "repo": repo,
+            "candidates": [],
+            "skipped": True,
+            "reason": "commit_not_worth_promoting",
+        }
+
+    drafts = _heuristic_commit_drafts(message, files)
+    if use_llm and distillation_enabled() and drafts:
+        try:
+            prompt = (
+                "Write ONE concise learned_pattern (1-2 sentences) from this commit.\n"
+                f"Message: {message[:400]}\n"
+                f"Files: {', '.join(files[:15])}\n"
+                "Output ONLY the pattern text."
+            )
+            raw = asyncio.run(_call_llm(prompt))
+            text = scrub_secrets(raw.strip().strip('"')) or ""
+            if text:
+                drafts[0]["content"] = text
+        except Exception as exc:
+            logger.warning("Commit LLM distill failed; using heuristic: %s", exc)
+
+    candidates: List[Dict[str, Any]] = []
+    for draft in drafts:
+        content = draft["content"]
+        scope = draft["scope"]
+        dedup = hashlib.sha256(f"commit|{repo}|{content[:120]}".encode()).hexdigest()[:16]
+        # Skip if identical candidate already pending
+        existing = db.list_findings(repo=repo, status="pending", limit=50)
+        if any(
+            f.get("dedup_key") == dedup or (f.get("action") or "").find(content[:80]) >= 0
+            for f in existing
+            if f.get("finding_type") == "promotion_candidate"
+        ):
+            continue
+
+        memory_id = db.create_memory_entry(
+            repo=repo,
+            memory_type="learned_pattern",
+            content=content,
+            scope=scope,
+            confidence=0.45,
+            status="candidate",
+            created_by="distill:commit",
+            branch=branch,
+            head_sha=head_sha,
+        )
+        finding_id = db.create_finding(
+            repo=repo,
+            finding_type="promotion_candidate",
+            severity="medium",
+            action=f"Promote commit-derived pattern? {content[:200]}",
+            dedup_key=dedup,
+            evidence=[
+                {"type": "commit_message", "content": (message or "")[:300]},
+                {"type": "files", "content": ", ".join(files[:20])},
+            ],
+            memory_id=memory_id,
+        )
+        candidates.append(
+            {
+                "memory_id": memory_id,
+                "finding_id": finding_id,
+                "content": content,
+                "scope": scope,
+                "status": "candidate",
+            }
+        )
+
+    return {
+        "repo": repo,
+        "candidates": candidates,
+        "skipped": False,
+        "review_required": True,
+        "message": "Candidates only — not active. Confirm via promote or stop-hook follow-up.",
+    }

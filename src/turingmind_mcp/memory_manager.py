@@ -17,11 +17,13 @@ import uuid
 from collections import Counter
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from .database import MemoryDatabase
 
 logger = logging.getLogger("turingmind-mcp")
+
+SESSION_CONTEXT_TTL_HOURS = 20
 
 
 class MemoryManager:
@@ -224,6 +226,10 @@ class MemoryManager:
         security_tags: Optional[List[str]] = None,
         requires_approval: bool = False,
         created_by: Optional[str] = None,
+        branch: Optional[str] = None,
+        head_sha: Optional[str] = None,
+        git_dirty: int = 0,
+        scope_tier: str = "repo",
     ) -> Dict[str, Any]:
         """Create an explicit rule."""
         status = "pending" if requires_approval else "active"
@@ -238,6 +244,10 @@ class MemoryManager:
             yaml_definition=yaml_definition,
             security_tags=security_tags,
             created_by=created_by,
+            branch=branch,
+            head_sha=head_sha,
+            git_dirty=git_dirty,
+            scope_tier=scope_tier,
         )
 
         # Create approval request if needed
@@ -333,14 +343,30 @@ class MemoryManager:
         content: str,
         scope: str,
         evidence: List[Dict[str, Any]],
-        expires_in_hours: int = 24,
+        expires_in_hours: int = SESSION_CONTEXT_TTL_HOURS,
         branch: Optional[str] = None,
         head_sha: Optional[str] = None,
         git_dirty: int = 0,
         scope_tier: str = "repo",
-    ) -> str:
-        """Create ephemeral session context."""
+    ) -> Tuple[str, bool]:
+        """Create ephemeral session context.
+
+        Returns:
+            (memory_id, deduped): existing row when repo+content+scope match;
+            deduped is True when no new row was inserted.
+        """
         expires_at = datetime.now() + timedelta(hours=expires_in_hours)
+
+        existing = self.db.find_active_session_context(repo, content, scope)
+        if existing:
+            self.db.touch_session_context(existing["memory_id"], expires_at)
+            logger.info(
+                "Session context dedupe skipped for repo=%s scope=%s (memory_id=%s)",
+                repo,
+                scope,
+                existing["memory_id"],
+            )
+            return existing["memory_id"], True
 
         memory_id = self.db.create_memory_entry(
             repo=repo,
@@ -355,7 +381,6 @@ class MemoryManager:
             scope_tier=scope_tier,
         )
 
-        # Add evidence
         for ev in evidence:
             self.db.add_evidence(
                 memory_id,
@@ -365,7 +390,7 @@ class MemoryManager:
                 line_number=ev.get("line"),
             )
 
-        return memory_id
+        return memory_id, False
 
     def get_session_context(
         self, repo: str, include_expired: bool = False
@@ -397,11 +422,19 @@ class MemoryManager:
 
         return contexts
 
-    # Conflict Detection
+    # Conflict Detection — product truth only (never telemetry/session junk).
+    _CONFLICT_ELIGIBLE_TYPES = frozenset({"explicit_rule", "learned_pattern"})
+
     def detect_conflicts(self, repo: str, new_memory_id: str) -> List[Dict[str, Any]]:
-        """Detect conflicts with existing memory entries."""
+        """Detect conflicts with existing memory entries.
+
+        Only pairs ``explicit_rule`` ↔ ``learned_pattern``. Session/edit-cluster
+        telemetry must never enter the conflict graph.
+        """
         new_entry = self.db.get_memory_entry(new_memory_id)
         if not new_entry:
+            return []
+        if new_entry.get("type") not in self._CONFLICT_ELIGIBLE_TYPES:
             return []
 
         conflicts = []
@@ -412,6 +445,7 @@ class MemoryManager:
             c
             for c in candidates
             if c["memory_id"] != new_memory_id
+            and c.get("type") in self._CONFLICT_ELIGIBLE_TYPES
             and (
                 c["scope"] == new_entry["scope"]
                 or c["scope"] == "repo"

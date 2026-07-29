@@ -33,6 +33,7 @@ TOOL_GROUPS = {
         "turingmind_save_memory",
         "turingmind_list_memory",
         "turingmind_delete_memory",
+        "turingmind_ground",
         "turingmind_detect_conflicts",
         "turingmind_resolve_conflict",
         "turingmind_log_reasoning",

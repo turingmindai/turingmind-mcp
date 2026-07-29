@@ -3,10 +3,63 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
+from typing import Any, Dict, Optional
 
 from mcp.types import TextContent
 
 from .context import ToolContext
+
+
+def _git_fields_for_mcp_save(
+    ctx: ToolContext,
+    arguments: Optional[dict] = None,
+) -> Dict[str, Any]:
+    """Attach current git branch/HEAD to MCP saves (parity with HTTP /api/v2/memory).
+
+    Prefer optional ``arguments.git`` blob; else collect from workspace via
+    ``ctx.get_repo_path`` / ``TURINGMIND_WORKSPACE_DIR`` / cwd.
+    """
+    from turingmind_mcp.git_context import (
+        collect_git_context,
+        git_context_from_payload,
+        git_fields_for_storage,
+        normalize_scope_tier_write,
+    )
+
+    args = arguments or {}
+    raw_git = args.get("git")
+    if isinstance(raw_git, dict) and raw_git:
+        try:
+            git_ctx = git_context_from_payload(
+                {
+                    "branch": raw_git.get("branch"),
+                    "head": raw_git.get("head") or raw_git.get("head_sha"),
+                    "dirty": bool(raw_git.get("dirty", False)),
+                    "default_branch": raw_git.get("default_branch"),
+                }
+            )
+            fields = git_fields_for_storage(git_ctx)
+            fields["scope_tier"] = normalize_scope_tier_write(
+                fields["branch"],
+                bool(fields["git_dirty"]),
+                raw_git.get("scope_tier"),
+            )
+            return fields
+        except ValueError as exc:
+            ctx.logger.warning("MCP save_memory ignored invalid git blob: %s", exc)
+
+    workspace: Optional[Path] = None
+    if ctx.get_repo_path:
+        try:
+            repo_path = ctx.get_repo_path()
+            if repo_path:
+                workspace = Path(str(repo_path))
+        except Exception as exc:  # noqa: BLE001 — never fail save on path helper
+            ctx.logger.debug("get_repo_path failed during save_memory: %s", exc)
+
+    git_ctx = collect_git_context(workspace)
+    return git_fields_for_storage(git_ctx)
 
 
 def register(registry: dict) -> None:
@@ -16,6 +69,7 @@ def register(registry: dict) -> None:
     registry["turingmind_delete_memory"] = handle_delete_memory
     registry["turingmind_detect_conflicts"] = handle_detect_conflicts
     registry["turingmind_resolve_conflict"] = handle_resolve_conflict
+    registry["turingmind_ground"] = handle_ground
     # NOTE: simulate_impact, explain_decision, get_memory_stats remain
     # unregistered — no v2 tool definitions, not exposed to agents.
 
@@ -149,6 +203,7 @@ async def handle_save_memory(arguments: dict, ctx: ToolContext) -> list[TextCont
         memory_manager = ctx.get_memory_manager()
         memory_id = arguments.get("memory_id")
         db = ctx.get_db()
+        git_fields = _git_fields_for_mcp_save(ctx, arguments)
         if memory_id:
             success = db.update_memory_entry(
                 memory_id=memory_id,
@@ -171,14 +226,22 @@ async def handle_save_memory(arguments: dict, ctx: ToolContext) -> list[TextCont
                     scope=scope,
                     yaml_definition=arguments.get("yaml_definition"),
                     security_tags=arguments.get("security_tags"),
+                    branch=git_fields["branch"],
+                    head_sha=git_fields["head_sha"],
+                    git_dirty=git_fields["git_dirty"],
+                    scope_tier=git_fields["scope_tier"],
                 )
                 memory_id = result["memory_id"]
             elif memory_type == "session_context":
-                memory_id = memory_manager.create_session_context(
+                memory_id, _deduped = memory_manager.create_session_context(
                     repo=repo,
                     content=content,
                     scope=scope,
                     evidence=arguments.get("evidence", []),
+                    branch=git_fields["branch"],
+                    head_sha=git_fields["head_sha"],
+                    git_dirty=git_fields["git_dirty"],
+                    scope_tier=git_fields["scope_tier"],
                 )
             else:
                 memory_id = db.create_memory_entry(
@@ -190,22 +253,35 @@ async def handle_save_memory(arguments: dict, ctx: ToolContext) -> list[TextCont
                     security_tags=arguments.get("security_tags"),
                     yaml_definition=arguments.get("yaml_definition"),
                     node_id=arguments.get("node_id"),
+                    branch=git_fields["branch"],
+                    head_sha=git_fields["head_sha"],
+                    git_dirty=git_fields["git_dirty"],
+                    scope_tier=git_fields["scope_tier"],
                 )
         if arguments.get("evidence"):
-            for ev in arguments["evidence"]:
-                db.add_evidence(
-                    memory_id=memory_id,
-                    evidence_type=ev.get("type", "manual"),
-                    content=ev.get("content", ""),
-                    file_path=ev.get("file"),
-                    line_number=ev.get("line"),
-                )
+            # session_context already stores evidence on create — avoid duplicates.
+            skip_evidence = (
+                memory_type == "session_context" and not arguments.get("memory_id")
+            )
+            if not skip_evidence:
+                for ev in arguments["evidence"]:
+                    db.add_evidence(
+                        memory_id=memory_id,
+                        evidence_type=ev.get("type", "manual"),
+                        content=ev.get("content", ""),
+                        file_path=ev.get("file"),
+                        line_number=ev.get("line"),
+                    )
         payload = {
             "status": "saved",
             "memory_id": memory_id,
             "type": memory_type,
             "content": content,
             "scope": scope,
+            "branch": git_fields.get("branch"),
+            "head_sha": git_fields.get("head_sha"),
+            "scope_tier": git_fields.get("scope_tier"),
+            "git_dirty": bool(git_fields.get("git_dirty")),
         }
         return [TextContent(type="text", text=json.dumps(payload, indent=2))]
     except Exception as e:
@@ -242,6 +318,67 @@ async def handle_delete_memory(arguments: dict, ctx: ToolContext) -> list[TextCo
         ]
     except Exception as e:
         ctx.logger.exception("Delete memory failed")
+        return [TextContent(type="text", text=f"❌ **Failed:** {type(e).__name__}: {e}")]
+
+
+async def handle_ground(arguments: dict, ctx: ToolContext) -> list[TextContent]:
+    """One-shot grounding: rules + patterns + working set + top actions."""
+    repo = arguments.get("repo", "")
+    if not repo:
+        return [TextContent(type="text", text="❌ **Missing required field:** `repo`")]
+    if not ctx.get_memory_manager:
+        return [TextContent(type="text", text="❌ **Memory manager not available**")]
+
+    files = arguments.get("files") or []
+    if isinstance(files, str):
+        files = [f.strip() for f in files.split(",") if f.strip()]
+    query = arguments.get("query") or arguments.get("search")
+    limit = int(arguments.get("limit", 10))
+    queue_limit = int(arguments.get("queue_limit", 5))
+
+    from turingmind_mcp.grounding import compose_ground
+    from turingmind_mcp.profile_config import filter_decision_queue_gaps
+
+    def _queue_builder(*, repo: str, limit: int = 15):
+        gaps: list = []
+        try:
+            from turingmind_mcp.v2_engine.handlers import detect_graph_gaps
+
+            gaps.extend(detect_graph_gaps(repo))
+        except Exception:
+            pass
+        if ctx.get_db:
+            try:
+                for f in ctx.get_db().list_findings(repo=repo, status="pending", limit=50):
+                    gaps.append({
+                        "gap_type": f["finding_type"],
+                        "severity": f["severity"],
+                        "node_id": f.get("node_id"),
+                        "memory_id": f.get("memory_id"),
+                        "finding_id": f["finding_id"],
+                        "action": f["action"],
+                    })
+            except Exception:
+                pass
+        gaps = filter_decision_queue_gaps(gaps, scope=arguments.get("scope") or "memory")
+        return {"queue": gaps[:limit]}
+
+    try:
+        payload = compose_ground(
+            ctx.get_memory_manager(),
+            repo=repo,
+            files=list(files),
+            query=query,
+            limit=limit,
+            queue_limit=queue_limit,
+            branch=arguments.get("branch"),
+            head=arguments.get("head"),
+            dirty=arguments.get("dirty"),
+            decision_queue_builder=_queue_builder,
+        )
+        return [TextContent(type="text", text=json.dumps(payload, indent=2))]
+    except Exception as e:
+        ctx.logger.exception("Ground failed")
         return [TextContent(type="text", text=f"❌ **Failed:** {type(e).__name__}: {e}")]
 
 

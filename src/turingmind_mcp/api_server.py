@@ -393,7 +393,7 @@ def capture_intent(payload: IntentPayload):
             + "; ".join(r.text for r in payload.records[:20]),
             scope="repo",
             evidence=[{"type": "intent", "content": payload.source_file}],
-        )
+        )[0]
     except Exception as e:
         logger.warning(f"Intent memory write failed (non-fatal): {e}")
 
@@ -485,12 +485,15 @@ def save_memory(payload: MemorySavePayload):
     if not payload.repo or not payload.content or not payload.type:
         raise HTTPException(status_code=400, detail="repo, type, and content are required")
 
+    from .memory_manager import SESSION_CONTEXT_TTL_HOURS
+
     db = _memory_db()
     manager = _memory_manager()
     reason = "; ".join(
         str(e.get("content", "")) for e in payload.evidence if e.get("content")
     ) or None
     git_fields = _git_storage_fields(payload.git)
+    deduped = False
 
     try:
         if payload.type == "learned_pattern":
@@ -501,12 +504,12 @@ def save_memory(payload: MemorySavePayload):
                 reason=reason,
             )
         elif payload.type == "session_context":
-            memory_id = manager.create_session_context(
+            memory_id, deduped = manager.create_session_context(
                 repo=payload.repo,
                 content=payload.content,
                 scope=payload.scope,
                 evidence=payload.evidence,
-                expires_in_hours=payload.ttl_hours or 24,
+                expires_in_hours=payload.ttl_hours or SESSION_CONTEXT_TTL_HOURS,
                 branch=git_fields["branch"],
                 head_sha=git_fields["head_sha"],
                 git_dirty=git_fields["git_dirty"],
@@ -548,7 +551,12 @@ def save_memory(payload: MemorySavePayload):
         except Exception as e:
             logger.warning(f"Memory node link failed (non-fatal): {e}")
 
-    return {"status": "saved", "memory_id": memory_id, "type": payload.type, "repo": payload.repo}
+    return {
+        "status": "duplicate_skipped" if payload.type == "session_context" and deduped else "saved",
+        "memory_id": memory_id,
+        "type": payload.type,
+        "repo": payload.repo,
+    }
 
 
 @app.get("/api/v2/memory")
@@ -958,6 +966,79 @@ def draft_finding(finding_id: str):
     return result
 
 
+class CommitCandidatePayload(BaseModel):
+    repo: str
+    message: str = ""
+    files: list[str] = []
+    branch: Optional[str] = None
+    head: Optional[str] = None
+    use_llm: bool = False
+
+
+@app.post("/api/v2/reconcile/commit-candidates")
+def propose_commit_candidates(payload: CommitCandidatePayload):
+    """Extend distillation: propose 0–2 learned_pattern candidates from a commit.
+
+    Does not activate — agents/humans promote via existing queue flows.
+    """
+    if not payload.repo:
+        raise HTTPException(status_code=400, detail="repo is required")
+    from .memory_distillation import propose_commit_candidates as propose
+
+    try:
+        return propose(
+            _memory_db(),
+            repo=payload.repo,
+            message=payload.message,
+            files=payload.files,
+            branch=payload.branch,
+            head_sha=payload.head,
+            use_llm=payload.use_llm,
+        )
+    except Exception as e:
+        logger.exception("Commit candidate proposal failed")
+        raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
+
+
+@app.get("/api/v2/ground")
+def get_ground(
+    repo: str,
+    files: str = "",
+    query: str = "",
+    limit: int = 10,
+    queue_limit: int = 5,
+    branch: Optional[str] = None,
+    head: Optional[str] = None,
+    dirty: Optional[bool] = None,
+):
+    """One-shot grounding: rules + patterns + working set + top actions."""
+    if not repo:
+        raise HTTPException(status_code=400, detail="repo is required")
+    from .grounding import compose_ground
+
+    file_paths = [f.strip() for f in files.split(",") if f.strip()]
+
+    def _queue_builder(*, repo: str, limit: int = 15):
+        return get_decision_queue(repo=repo, limit=limit, scope="memory")
+
+    try:
+        return compose_ground(
+            _memory_manager(),
+            repo=repo,
+            files=file_paths,
+            query=query or None,
+            limit=limit,
+            queue_limit=queue_limit,
+            branch=branch,
+            head=head,
+            dirty=dirty,
+            decision_queue_builder=_queue_builder,
+        )
+    except Exception as e:
+        logger.exception("Ground compose failed")
+        raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
+
+
 def run_session_gc(db):
     from .session_lifecycle import run_session_gc as _run_gc
     return _run_gc(db)
@@ -1040,11 +1121,12 @@ async def _start_background_loops():
         logger.info(f"Cloud memory pull loop started (every {pull_interval_min:g} min)")
 
     async def session_gc_loop():
+        from .sqlite_guard import run_serialized_write
         while True:
             await asyncio.sleep(60)
             try:
                 db = _memory_db()
-                stats = await asyncio.to_thread(run_session_gc, db)
+                stats = await asyncio.to_thread(run_serialized_write, run_session_gc, db)
                 if stats.get("archived") or stats.get("errors"):
                     logger.info("Session GC: %s", stats)
             except Exception as e:

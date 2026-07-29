@@ -258,6 +258,23 @@ class TestMemorySearchFTS(unittest.TestCase):
         results = self.db.list_memory_entries("test/repo", search="kubernetes")
         self.assertEqual(len(results), 0)
 
+    def test_search_excludes_session_context(self):
+        """Ephemeral session_context must not pollute FTS recall."""
+        self.db.create_memory_entry(
+            repo="test/repo",
+            memory_type="session_context",
+            content="Unique ephemeral session blob about kubernetes styling",
+            scope="repo",
+            status="active",
+        )
+        results = self.db.list_memory_entries("test/repo", search="kubernetes styling")
+        self.assertEqual(len(results), 0)
+
+        explicit = self.db.list_memory_entries(
+            "test/repo", search="kubernetes", memory_type="session_context"
+        )
+        self.assertEqual(len(explicit), 1)
+
     def test_search_reflects_updates(self):
         """FTS index should stay in sync after content updates."""
         memory_id = self.db.create_memory_entry(
@@ -298,10 +315,15 @@ class TestMemorySearchFTS(unittest.TestCase):
 
     def test_fts_query_quotes_syntax(self):
         """Special FTS characters must not inject query syntax."""
-        # Would raise sqlite3.OperationalError if unquoted
+        self.db.create_memory_entry(
+            repo="test/repo",
+            memory_type="explicit_rule",
+            content="Login page styling uses shared theme tokens",
+            scope="repo",
+        )
         results = self.db.list_memory_entries("test/repo", search='NEAR( "login" *')
         contents = [r["content"] for r in results]
-        self.assertIn("Working on the login page styling", contents)
+        self.assertIn("Login page styling uses shared theme tokens", contents)
 
 
 class TestObservations(unittest.TestCase):

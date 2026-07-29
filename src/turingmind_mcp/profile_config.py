@@ -37,6 +37,27 @@ MEMORY_QUEUE_GAP_TYPES = frozenset(
     }
 )
 
+# Agent-facing queue: hide low-value noise that trains agents to ignore Memory.
+_AGENT_QUEUE_HIDE_LOW = frozenset(
+    {
+        "promotion_candidate",
+        "duplicate_merge",
+        "semantic_duplicate",
+        "stale_memory",
+        "invalidation_decay",
+        "scope_churn",
+    }
+)
+
+_GENERIC_QUEUE_ACTION_MARKERS = (
+    "non-code edit",
+    "no graph impact",
+    "likely a refactor",
+    "likely a targeted fix",
+    "refactor burst",
+    ".ds_store",
+)
+
 MEMORY_PROFILE_GROUPS = "login,code_intelligence"
 GOVERNED_PROFILE_GROUPS = "login,code_intelligence,v2_engine"
 
@@ -82,6 +103,19 @@ def default_tool_groups_for_profile(profile: Optional[str] = None) -> str:
     return GOVERNED_PROFILE_GROUPS
 
 
+def _is_agent_queue_noise(gap: dict) -> bool:
+    """True when a gap should not train agents (low/generic telemetry)."""
+    gap_type = gap.get("gap_type") or gap.get("finding_type") or ""
+    severity = (gap.get("severity") or "low").lower()
+    if gap_type in _AGENT_QUEUE_HIDE_LOW and severity in ("low", "medium"):
+        action = (gap.get("action") or "").lower()
+        if any(marker in action for marker in _GENERIC_QUEUE_ACTION_MARKERS):
+            return True
+        if severity == "low":
+            return True
+    return False
+
+
 def filter_decision_queue_gaps(
     gaps: Iterable[dict],
     *,
@@ -97,6 +131,8 @@ def filter_decision_queue_gaps(
     for gap in gaps:
         gap_type = gap.get("gap_type") or gap.get("finding_type") or ""
         if gap_type in GRAPH_GAP_TYPES:
+            continue
+        if _is_agent_queue_noise(gap):
             continue
         if gap_type in MEMORY_QUEUE_GAP_TYPES:
             filtered.append(gap)

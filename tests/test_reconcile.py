@@ -4,6 +4,7 @@ import os
 import shutil
 import tempfile
 import unittest
+import uuid
 from pathlib import Path
 from unittest import mock
 
@@ -13,6 +14,7 @@ from turingmind_mcp.reconcile import (
     RECURRENCE_THRESHOLD,
     SCOPE_CHURN_THRESHOLD,
     ReconciliationEngine,
+    is_low_value_promotion_cluster,
     repos_with_activity,
     _extract_revert_files,
     _scope_matches_file,
@@ -33,18 +35,21 @@ class ReconcileTestCase(unittest.TestCase):
 
 
 class TestRecurrenceMiner(ReconcileTestCase):
-    def _add_observations(self, count: int, content: str):
+    def _add_observations(self, count: int, content: str, **kwargs):
         for _ in range(count):
             self.db.create_observation(
                 repo=REPO, event_type="edit_cluster", content=content,
                 source="cursor-hook",
+                **kwargs,
             )
 
     def test_recurring_observations_become_candidate(self):
         """N similar observations mine one candidate pattern + queue finding."""
+        content = "targeted_fix/high: jwt validation fix in src/auth/jwt_middleware.py"
         self._add_observations(
             RECURRENCE_THRESHOLD,
-            "targeted_fix/high: 1 code file changed in src/auth/jwt_middleware.py",
+            content,
+            evidence=[{"type": "files", "content": "src/auth/jwt_middleware.py"}],
         )
         stats = self.engine.mine_recurrence(REPO)
         self.assertEqual(stats["patterns_mined"], 1)
@@ -82,7 +87,11 @@ class TestRecurrenceMiner(ReconcileTestCase):
 
     def test_rerun_is_idempotent(self):
         """A second run must not mine the same pattern twice."""
-        self._add_observations(RECURRENCE_THRESHOLD, "repeated fix in payment flow")
+        self._add_observations(
+            RECURRENCE_THRESHOLD,
+            "targeted_fix/high: payment flow fix in src/payments/handler.py",
+            evidence=[{"type": "files", "content": "src/payments/handler.py"}],
+        )
         self.engine.mine_recurrence(REPO)
         stats2 = self.engine.mine_recurrence(REPO)
         self.assertEqual(stats2["patterns_mined"], 0)
@@ -90,6 +99,68 @@ class TestRecurrenceMiner(ReconcileTestCase):
             repo=REPO, memory_type="learned_pattern", status="candidate"
         )
         self.assertEqual(len(candidates), 1)
+
+    def test_refactor_burst_not_promoted(self):
+        content = "refactor_burst/low: 42 files across 4 module(s) in 0s — likely a refactor"
+        self._add_observations(RECURRENCE_THRESHOLD, content)
+        stats = self.engine.mine_recurrence(REPO)
+        self.assertEqual(stats["patterns_mined"], 0)
+        self.assertEqual(stats["observations_rejected_noise"], RECURRENCE_THRESHOLD)
+        self.assertEqual(self.db.list_findings(repo=REPO), [])
+
+    def test_non_code_not_promoted(self):
+        content = "non_code/low: non-code edit: README.md"
+        self._add_observations(RECURRENCE_THRESHOLD, content)
+        stats = self.engine.mine_recurrence(REPO)
+        self.assertEqual(stats["patterns_mined"], 0)
+        self.assertEqual(stats["observations_rejected_noise"], RECURRENCE_THRESHOLD)
+
+    def test_bulk_edit_not_promoted(self):
+        content = "cross_module/high: 8 files across 3 module(s) — cross-cutting change"
+        self._add_observations(RECURRENCE_THRESHOLD, content)
+        stats = self.engine.mine_recurrence(REPO)
+        self.assertEqual(stats["patterns_mined"], 0)
+        self.assertGreaterEqual(stats["observations_rejected_noise"], RECURRENCE_THRESHOLD)
+
+    def test_git_churn_not_promoted(self):
+        content = "git churn: path 'src/hot.py' modified since last reconcile (HEAD abc12345)"
+        for _ in range(RECURRENCE_THRESHOLD):
+            self.db.create_observation(
+                repo=REPO, event_type="git_churn", content=content, source="git-churn",
+            )
+        stats = self.engine.mine_recurrence(REPO)
+        self.assertEqual(stats["patterns_mined"], 0)
+        self.assertEqual(stats["observations_rejected_noise"], RECURRENCE_THRESHOLD)
+
+    def test_generic_edit_cluster_not_promoted(self):
+        content = "targeted_fix/high: 1 code file(s) changed — likely a targeted fix or remediation"
+        self._add_observations(RECURRENCE_THRESHOLD, content)
+        stats = self.engine.mine_recurrence(REPO)
+        self.assertEqual(stats["patterns_mined"], 0)
+        self.assertEqual(stats["observations_rejected_noise"], RECURRENCE_THRESHOLD)
+
+    def test_same_file_recurrence_still_promoted(self):
+        """Same file in evidence across cluster → valid promotion candidate."""
+        content = "targeted_fix/high: 1 code file(s) changed — likely a targeted fix or remediation"
+        self._add_observations(
+            RECURRENCE_THRESHOLD,
+            content,
+            evidence=[{"type": "files", "content": "src/auth/jwt_middleware.py"}],
+        )
+        stats = self.engine.mine_recurrence(REPO)
+        self.assertEqual(stats["patterns_mined"], 1)
+        self.assertEqual(stats.get("observations_rejected_noise", 0), 0)
+
+    def test_is_low_value_promotion_cluster_unit(self):
+        exemplar = {"event_type": "edit_cluster", "content": "refactor_burst/low: big refactor"}
+        self.assertTrue(is_low_value_promotion_cluster(exemplar, [exemplar]))
+        good = {
+            "event_type": "edit_cluster",
+            "content": "targeted_fix/high: fix",
+            "evidence": [{"type": "files", "content": "src/a.py"}],
+        }
+        cluster = [good] * RECURRENCE_THRESHOLD
+        self.assertFalse(is_low_value_promotion_cluster(good, cluster))
 
 
 class TestConfidenceDecay(ReconcileTestCase):
@@ -209,6 +280,79 @@ class TestRunAndStats(ReconcileTestCase):
         )
         self.assertEqual(set(repos_with_activity(self.db)), {"repo/a", "repo/b"})
 
+    def test_run_batches_pending_observations(self):
+        batch_repo = "test/batch"
+        for _ in range(60):
+            self.db.create_observation(
+                repo=batch_repo,
+                event_type="edit_cluster",
+                content=uuid.uuid4().hex,
+            )
+        with mock.patch.dict(os.environ, {"TURINGMIND_RECONCILE_OBS_BATCH": "10"}):
+            stats = self.engine.run(batch_repo)
+        self.assertEqual(stats["observations_total_pending"], 60)
+        self.assertEqual(stats["observations_batch_limit"], 10)
+        self.assertEqual(stats["observations_batch_processed"], 10)
+        self.assertEqual(stats["observations_remaining"], 60)
+
+    def test_mine_recurrence_respects_batch_limit(self):
+        batch_repo = "test/fifo"
+        for _ in range(15):
+            self.db.create_observation(
+                repo=batch_repo,
+                event_type="edit_cluster",
+                content=f"{uuid.uuid4().hex}-fifo",
+            )
+        stats = self.engine.mine_recurrence(batch_repo, batch_limit=5)
+        self.assertEqual(stats["observations_batch_processed"], 5)
+        self.assertEqual(self.db.count_observations(batch_repo, "pending"), 15)
+
+
+class TestStalePendingObservations(ReconcileTestCase):
+    def test_expire_stale_pending_observations(self):
+        repo = "test/stale"
+        oid = self.db.create_observation(
+            repo=repo, event_type="edit_cluster", content="old singleton",
+        )
+        self.db.conn.execute(
+            "UPDATE observations SET created_at = datetime('now', '-48 hours') WHERE observation_id = ?",
+            (oid,),
+        )
+        self.db.conn.commit()
+        expired = self.db.expire_stale_pending_observations(repo, 24)
+        self.assertEqual(expired, 1)
+        self.assertEqual(self.db.count_observations(repo, "pending"), 0)
+
+    def test_unclustered_pending_rejected_after_cutoff(self):
+        repo = "test/unclustered"
+        oid = self.db.create_observation(
+            repo=repo, event_type="edit_cluster", content="solo old obs",
+        )
+        self.db.conn.execute(
+            "UPDATE observations SET created_at = datetime('now', '-48 hours') WHERE observation_id = ?",
+            (oid,),
+        )
+        self.db.conn.commit()
+        with mock.patch.dict(os.environ, {"TURINGMIND_UNCLUSTERED_PENDING_HOURS": "24"}):
+            stats = self.engine.mine_recurrence(repo, batch_limit=10)
+        self.assertEqual(stats["observations_rejected_unclustered"], 1)
+        self.assertEqual(self.db.count_observations(repo, "pending"), 0)
+
+    def test_prune_stale_in_full_run(self):
+        repo = "test/prune-run"
+        oid = self.db.create_observation(
+            repo=repo, event_type="edit_cluster", content="week old",
+        )
+        self.db.conn.execute(
+            "UPDATE observations SET created_at = datetime('now', '-200 hours') WHERE observation_id = ?",
+            (oid,),
+        )
+        self.db.conn.commit()
+        with mock.patch.dict(os.environ, {"TURINGMIND_STALE_PENDING_OBS_HOURS": "168"}):
+            stats = self.engine.run(repo)
+        self.assertEqual(stats["observations_expired_stale"], 1)
+        self.assertEqual(self.db.count_observations(repo, "pending"), 0)
+
 
 class TestScopeMatching(unittest.TestCase):
     def test_scope_matches_file_paths(self):
@@ -290,7 +434,24 @@ class TestInvalidationDecay(ReconcileTestCase):
 
 
 class TestVerificationReinforcement(ReconcileTestCase):
+    def _seed_spec_node(self, node_id: str = "node-1", repo: str = REPO) -> None:
+        from turingmind_mcp.unified_schema import initialize_v2_schema
+
+        cursor = self.db.conn.cursor()
+        initialize_v2_schema(cursor)
+        cursor.execute(
+            """
+            INSERT OR IGNORE INTO spec_nodes (
+                id, repo, level, surface_type, status, stage, confidence,
+                data, created_at, updated_at
+            ) VALUES (?, ?, 'L1_FILE', 'internal', 'verified', 'verified', 1.0, '{}', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            """,
+            (node_id, repo),
+        )
+        self.db.conn.commit()
+
     def test_success_obs_reinforces_node_memory(self):
+        self._seed_spec_node()
         mem_id = self.db.create_memory_entry(
             repo=REPO, memory_type="learned_pattern",
             content="failure then fix", scope="src/x.py", confidence=0.5,

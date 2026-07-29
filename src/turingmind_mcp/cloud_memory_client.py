@@ -101,14 +101,17 @@ async def _post_cloud_sync(
 
 
 def _merge_pull_stats(db: Any, repo: str, body: Dict[str, Any]) -> Dict[str, Any]:
-    pulled = body.get("pulled") or []
-    merge_stats = db.apply_cloud_memory_rows(repo, pulled) if pulled else {
-        "memories_applied": 0,
-        "tombstones_applied": 0,
-    }
-    last_pull = body.get("last_cloud_pull_at")
-    if last_pull:
-        db.set_repo_sync_state(repo, last_cloud_pull_at=last_pull)
+    from .sqlite_guard import serialized_sqlite_write
+
+    with serialized_sqlite_write():
+        pulled = body.get("pulled") or []
+        merge_stats = db.apply_cloud_memory_rows(repo, pulled) if pulled else {
+            "memories_applied": 0,
+            "tombstones_applied": 0,
+        }
+        last_pull = body.get("last_cloud_pull_at")
+        if last_pull:
+            db.set_repo_sync_state(repo, last_cloud_pull_at=last_pull)
     return {
         "memories_pulled": body.get("memories_pulled", len(pulled)),
         "memories_applied": merge_stats.get("memories_applied", 0),

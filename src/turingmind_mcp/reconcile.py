@@ -36,7 +36,7 @@ import json
 import logging
 import os
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -73,6 +73,98 @@ SUCCESS_REINFORCEMENT_CAP = 0.95
 STALE_BRANCH_DAYS = 30
 EVENT_MERGE_COMMIT = "merge_commit"
 PROMOTABLE_MEMORY_TYPES = frozenset({"learned_pattern", "explicit_rule"})
+MAX_PROMOTION_FILE_COUNT = 5
+DEFAULT_RECONCILE_OBS_BATCH = 50
+DEFAULT_GIT_CHURN_INGEST_CAP = 25
+DEFAULT_STALE_PENDING_OBS_HOURS = 168  # 7 days
+DEFAULT_UNCLUSTERED_PENDING_HOURS = 24
+
+
+def reconcile_observation_batch_size() -> int:
+    """Max pending observations processed per reconcile run (FIFO)."""
+    raw = os.environ.get("TURINGMIND_RECONCILE_OBS_BATCH", "")
+    if raw.strip():
+        try:
+            return max(1, int(raw))
+        except ValueError:
+            logger.warning("Invalid TURINGMIND_RECONCILE_OBS_BATCH=%r; using default", raw)
+    return DEFAULT_RECONCILE_OBS_BATCH
+
+
+def git_churn_ingest_cap() -> int:
+    """Max git_churn draft observations created per invalidation pass."""
+    raw = os.environ.get("TURINGMIND_RECONCILE_GIT_CHURN_CAP", "")
+    if raw.strip():
+        try:
+            return max(0, int(raw))
+        except ValueError:
+            logger.warning("Invalid TURINGMIND_RECONCILE_GIT_CHURN_CAP=%r; using default", raw)
+    return DEFAULT_GIT_CHURN_INGEST_CAP
+
+
+def stale_pending_obs_hours() -> int:
+    """Reject pending observations older than this (0 disables)."""
+    raw = os.environ.get("TURINGMIND_STALE_PENDING_OBS_HOURS", "")
+    if raw.strip():
+        try:
+            return max(0, int(raw))
+        except ValueError:
+            logger.warning("Invalid TURINGMIND_STALE_PENDING_OBS_HOURS=%r; using default", raw)
+    return DEFAULT_STALE_PENDING_OBS_HOURS
+
+
+def unclustered_pending_hours() -> int:
+    """Reject singleton batch observations older than this after mining."""
+    raw = os.environ.get("TURINGMIND_UNCLUSTERED_PENDING_HOURS", "")
+    if raw.strip():
+        try:
+            return max(0, int(raw))
+        except ValueError:
+            logger.warning("Invalid TURINGMIND_UNCLUSTERED_PENDING_HOURS=%r; using default", raw)
+    return DEFAULT_UNCLUSTERED_PENDING_HOURS
+
+
+def _parse_observation_timestamp(value: Optional[str]) -> Optional[datetime]:
+    if not value:
+        return None
+    text = str(value).strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        try:
+            parsed = datetime.strptime(text, "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+# Observation content prefixes that must never become promotion candidates.
+_LOW_VALUE_CLUSTER_TYPES = frozenset({"refactor_burst", "non_code"})
+_GENERIC_PROMOTION_MARKERS = (
+    "likely a refactor",
+    "likely a targeted fix",
+    "no graph impact",
+    "code file(s) changed",
+    "files across",
+    "non-code file(s)",
+    "non-code edit:",
+    "refactor burst:",
+)
+
+# Active session_context shaped like edit-cluster telemetry — expire on reconcile.
+_CLUSTER_SESSION_CONTEXT_MARKERS = _GENERIC_PROMOTION_MARKERS + (
+    "non-code edit",
+    "edit_cluster",
+    "targeted_fix/",
+    "cross_module/",
+    "development/",
+    "refactor_burst/",
+    "non_code/",
+)
+MAX_ACTIVE_SESSION_CONTEXT = 20
 
 # SPEC-BR-07: documented lifecycle finding types (no ad-hoc strings)
 LIFECYCLE_FINDING_TYPES = frozenset({"branch_promotion", "archive_branch_memories"})
@@ -96,6 +188,87 @@ def _similarity(a: frozenset, b: frozenset) -> float:
 
 def _dedup_key(*parts: str) -> str:
     return hashlib.sha256("|".join(parts).encode()).hexdigest()[:16]
+
+
+def _parse_cluster_type(content: str) -> Optional[str]:
+    """Extract edit_cluster type prefix (e.g. targeted_fix from 'targeted_fix/high: ...')."""
+    match = re.match(r"^([\w_]+)/", content or "")
+    return match.group(1) if match else None
+
+
+def _observation_evidence_list(obs: dict) -> List[Dict[str, Any]]:
+    """Normalize observation evidence to a list of dicts."""
+    evidence = obs.get("evidence") or []
+    if isinstance(evidence, str):
+        try:
+            evidence = json.loads(evidence)
+        except (json.JSONDecodeError, TypeError):
+            return []
+    return evidence if isinstance(evidence, list) else []
+
+
+def _single_file_from_obs(obs: dict) -> Optional[str]:
+    """Return the sole file path when observation evidence lists exactly one file."""
+    for ev in _observation_evidence_list(obs):
+        if ev.get("type") != "files":
+            continue
+        raw = ev.get("content") or ""
+        files = [p.strip() for p in raw.split(",") if p.strip()]
+        if len(files) == 1:
+            return files[0]
+    return None
+
+
+def _cluster_single_file_target(cluster: List[dict]) -> Optional[str]:
+    """When every observation in a cluster targets the same file, return that path."""
+    paths: List[str] = []
+    for obs in cluster:
+        path = _single_file_from_obs(obs)
+        if not path:
+            return None
+        paths.append(path)
+    unique = set(paths)
+    return paths[0] if len(unique) == 1 else None
+
+
+def _estimated_file_count(obs: dict) -> int:
+    """Estimate number of files involved from observation content or evidence."""
+    content = obs.get("content") or ""
+    for pattern in (
+        r"(\d+)\s+files?\s+across",
+        r"(\d+)\s+code file",
+        r"(\d+)\s+non-code file",
+    ):
+        match = re.search(pattern, content, re.IGNORECASE)
+        if match:
+            return int(match.group(1))
+
+    for ev in _observation_evidence_list(obs):
+        if ev.get("type") == "files" and ev.get("content"):
+            files = [p.strip() for p in ev["content"].split(",") if p.strip()]
+            if files:
+                return len(files)
+    return 1
+
+
+def is_low_value_promotion_cluster(exemplar: dict, cluster: List[dict]) -> bool:
+    """True when a recurring cluster should not surface a promotion candidate."""
+    if _cluster_single_file_target(cluster):
+        return False
+
+    event_type = (exemplar.get("event_type") or "").lower()
+    if event_type == "git_churn":
+        return True
+
+    cluster_type = _parse_cluster_type(exemplar.get("content") or "")
+    if cluster_type in _LOW_VALUE_CLUSTER_TYPES:
+        return True
+
+    if _estimated_file_count(exemplar) > MAX_PROMOTION_FILE_COUNT:
+        return True
+
+    content_lower = (exemplar.get("content") or "").lower()
+    return any(marker in content_lower for marker in _GENERIC_PROMOTION_MARKERS)
 
 
 def _observation_branch_key(obs: dict) -> str:
@@ -258,14 +431,58 @@ class ReconciliationEngine:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    def expire_cluster_session_context(self, repo: str) -> Dict[str, int]:
+        """Deprecate edit-cluster-shaped session_context and LRU-cap active cards."""
+        rows = self.db.list_memory_entries(
+            repo, memory_type="session_context", status="active", page=1, limit=500
+        )
+        # Newest first for LRU
+        rows = sorted(rows, key=lambda r: r.get("created_at") or "", reverse=True)
+
+        junk_ids: List[str] = []
+        kept: List[str] = []
+        for row in rows:
+            content_lower = (row.get("content") or "").lower()
+            if any(m in content_lower for m in _CLUSTER_SESSION_CONTEXT_MARKERS):
+                junk_ids.append(row["memory_id"])
+            else:
+                kept.append(row["memory_id"])
+
+        overflow = kept[MAX_ACTIVE_SESSION_CONTEXT:]
+        deprecate_ids = junk_ids + overflow
+        for mid in deprecate_ids:
+            self.db.update_memory_entry(mid, status="deprecated")
+        return {
+            "cluster_session_context_expired": len(junk_ids),
+            "session_context_lru_trimmed": len(overflow),
+        }
+
     def run(self, repo: str) -> Dict[str, Any]:
+        batch_limit = reconcile_observation_batch_size()
+        total_pending = self.db.count_observations(repo=repo, status="pending")
+        try:
+            expired = self.db.cleanup_expired_context()
+        except Exception:
+            logger.warning("Expired-context cleanup skipped during reconcile", exc_info=True)
+            expired = 0
+
         stats: Dict[str, Any] = {
             "repo": repo,
             "started_at": datetime.now(timezone.utc).isoformat(),
+            "observations_total_pending": total_pending,
+            "observations_batch_limit": batch_limit,
+            "session_context_expired": expired,
         }
-        stats.update(self.mine_recurrence(repo))
+        try:
+            stats.update(self.expire_cluster_session_context(repo))
+        except Exception:
+            logger.warning("Cluster session_context hygiene skipped", exc_info=True)
+            stats["cluster_session_context_expired"] = 0
+            stats["session_context_lru_trimmed"] = 0
+        stats.update(self.prune_stale_pending_observations(repo))
+        stats.update(self.mine_recurrence(repo, batch_limit=batch_limit))
         stats.update(self.apply_revert_penalties(repo))
-        stats.update(self.apply_invalidation_decay(repo))
+        stats.update(self.apply_invalidation_decay(repo, batch_limit=batch_limit))
         stats.update(self.reinforce_verification_success(repo))
         stats.update(self.decay_confidence(repo))
         stats.update(self.aggregate_conflicts(repo))
@@ -273,10 +490,19 @@ class ReconciliationEngine:
         stats.update(self.suggest_duplicate_merges(repo))
         stats.update(self.branch_lifecycle(repo))
         stats.update(self.mine_chat_rules(repo))
+        stats["observations_remaining"] = self.db.count_observations(repo=repo, status="pending")
         run_id = self.db.record_reconcile_run(repo, stats)
         stats["run_id"] = run_id
         logger.info(f"Reconciliation run {run_id} for {repo}: {stats}")
         return stats
+
+    def prune_stale_pending_observations(self, repo: str) -> Dict[str, int]:
+        """Reject pending observations that exceeded the stale age threshold."""
+        hours = stale_pending_obs_hours()
+        if hours <= 0:
+            return {"observations_expired_stale": 0}
+        expired = self.db.expire_stale_pending_observations(repo, hours)
+        return {"observations_expired_stale": expired}
 
     def _observations_match(
         self,
@@ -292,13 +518,16 @@ class ReconciliationEngine:
         return _similarity(_tokens(obs["content"]), _tokens(exemplar["content"])) >= SIMILARITY_THRESHOLD
 
     # ── Pass 1: recurrence miner ─────────────────────────────────────────────
-    def mine_recurrence(self, repo: str) -> Dict[str, int]:
+    def mine_recurrence(self, repo: str, *, batch_limit: Optional[int] = None) -> Dict[str, int]:
         """Cluster pending observations by lexical Jaccard or embedding similarity.
 
         Groups that recur RECURRENCE_THRESHOLD+ times become a learned_pattern
         *candidate* (never active directly) plus a promotion finding on the queue.
         """
-        pending = self.db.list_observations(repo=repo, status="pending", limit=500)
+        limit = batch_limit if batch_limit is not None else reconcile_observation_batch_size()
+        pending = self.db.list_observations(
+            repo=repo, status="pending", limit=limit, order="asc"
+        )
         pending = sorted(pending, key=lambda o: o.get("created_at") or "")
         embed_method, vec_map = build_observation_vectors(pending)
 
@@ -322,10 +551,16 @@ class ReconciliationEngine:
 
         candidates = 0
         accepted = 0
+        rejected_noise = 0
         for cluster in clusters:
             if len(cluster) < RECURRENCE_THRESHOLD:
                 continue
             exemplar = cluster[0]
+            if is_low_value_promotion_cluster(exemplar, cluster):
+                for obs in cluster:
+                    self.db.resolve_observation(obs["observation_id"], "rejected")
+                    rejected_noise += 1
+                continue
             git_fields = _git_fields_for_mined_candidate(exemplar)
             content = (
                 f"Recurring {exemplar.get('event_type', 'activity')} ({len(cluster)}x): "
@@ -367,10 +602,28 @@ class ReconciliationEngine:
             )
             candidates += 1
 
+        rejected_unclustered = 0
+        unclustered_cutoff = datetime.now(timezone.utc) - timedelta(
+            hours=unclustered_pending_hours()
+        )
+        if unclustered_pending_hours() > 0:
+            for cluster in clusters:
+                if len(cluster) >= RECURRENCE_THRESHOLD:
+                    continue
+                for obs in cluster:
+                    created = _parse_observation_timestamp(obs.get("created_at"))
+                    if created is None or created >= unclustered_cutoff:
+                        continue
+                    self.db.resolve_observation(obs["observation_id"], "rejected")
+                    rejected_unclustered += 1
+
         return {
             "observations_pending": len(pending),
+            "observations_batch_processed": len(pending),
             "patterns_mined": candidates,
             "observations_accepted": accepted,
+            "observations_rejected_noise": rejected_noise,
+            "observations_rejected_unclustered": rejected_unclustered,
         }
 
     # ── Pass 2: revert scope penalty ─────────────────────────────────────────
@@ -442,7 +695,8 @@ class ReconciliationEngine:
             return 0
 
         created = 0
-        for path in sorted(snapshot.all_touched)[:100]:
+        cap = git_churn_ingest_cap()
+        for path in sorted(snapshot.all_touched)[:cap]:
             content = (
                 f"git churn: path '{path}' modified or deleted since last reconcile "
                 f"(HEAD {snapshot.head[:8]})"
@@ -458,8 +712,9 @@ class ReconciliationEngine:
             created += 1
         return created
 
-    def apply_invalidation_decay(self, repo: str) -> Dict[str, int]:
+    def apply_invalidation_decay(self, repo: str, *, batch_limit: Optional[int] = None) -> Dict[str, int]:
         """Penalize memories tied to deleted files or scopes under heavy churn."""
+        obs_cap = batch_limit if batch_limit is not None else reconcile_observation_batch_size()
         workspace = resolve_git_workspace(_workspace_root())
         git_ctx = collect_git_context(workspace)
         current_branch = git_ctx.branch if git_ctx else None
@@ -481,7 +736,7 @@ class ReconciliationEngine:
 
         scoped = self._active_scoped_memories(repo)
         edit_obs = self.db.list_observations(
-            repo=repo, status="pending", event_type="edit_cluster", limit=500
+            repo=repo, status="pending", event_type="edit_cluster", limit=obs_cap, order="asc"
         )
 
         missing_file = 0
@@ -823,8 +1078,10 @@ class ReconciliationEngine:
         cursor = self.db.conn.cursor()
         cursor.execute(
             """
-            SELECT observation_id, content FROM observations
-            WHERE repo = ? AND event_type = 'chat_exchange' AND status = 'pending'
+            SELECT observation_id, content, event_type FROM observations
+            WHERE repo = ?
+              AND event_type IN ('chat_exchange', 'agent_turn')
+              AND status = 'pending'
             """,
             (repo,)
         )
@@ -834,18 +1091,35 @@ class ReconciliationEngine:
         rule_markers = [
             "always do", "never do", "don't do", "do not", 
             "you should", "should be", "must be", "make sure to", 
-            "remember to", "convention is"
+            "remember to", "convention is",
+            # agent_turn fact tags + common decision phrasing
+            "[user_preference]", "[constraint]", "[design_decision]",
+            "always ", "never ", "must not", "hard constraint",
         ]
 
         for row in rows:
             obs_id = row["observation_id"]
             content = row["content"] or ""
+            event_type = row["event_type"] or "chat_exchange"
             
             lines = content.splitlines()
             for line in lines:
                 line_lower = line.lower()
-                if ("user: " in line or "assistant: " in line) and any(m in line_lower for m in rule_markers):
-                    clean_line = line.replace("user: ", "").replace("assistant: ", "").strip()
+                is_turn_line = (
+                    "user: " in line_lower
+                    or "assistant: " in line_lower
+                    or line_lower.startswith("[user_preference]")
+                    or line_lower.startswith("[constraint]")
+                    or line_lower.startswith("[design_decision]")
+                    or line_lower.startswith("[gotcha]")
+                    or line_lower.startswith("[root_cause]")
+                )
+                if is_turn_line and any(m in line_lower for m in rule_markers):
+                    clean_line = (
+                        line.replace("user: ", "")
+                        .replace("assistant: ", "")
+                        .strip()
+                    )
                     if len(clean_line) < 15:
                         continue
                     
@@ -860,7 +1134,8 @@ class ReconciliationEngine:
                         dedup_key=dedup,
                         evidence=[
                             {"type": "observation_id", "content": obs_id},
-                            {"type": "chat_text", "content": clean_line}
+                            {"type": "chat_text", "content": clean_line},
+                            {"type": "event_type", "content": event_type},
                         ]
                     )
                     if finding_id:
@@ -1157,7 +1432,10 @@ def apply_finding_resolution(
 
 def reconcile_repo(db: MemoryDatabase, repo: str) -> Dict[str, Any]:
     """Convenience entry point used by the API endpoint and background loop."""
-    return ReconciliationEngine(db).run(repo)
+    from .sqlite_guard import serialized_sqlite_write
+
+    with serialized_sqlite_write():
+        return ReconciliationEngine(db).run(repo)
 
 
 def repos_with_activity(db: MemoryDatabase) -> List[str]:

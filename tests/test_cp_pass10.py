@@ -72,3 +72,27 @@ def test_cp_pass10_e2e_promotion(memory_db, tier_repo):
     resolved_findings = db.list_findings(tier_repo, status="actioned")
     assert len(resolved_findings) == 1
     assert resolved_findings[0]["finding_id"] == finding_id
+
+
+def test_cp_pass10_mines_agent_turn_fact_tags(memory_db, tier_repo):
+    """Per-turn agent_turn observations with fact tags become promotion candidates."""
+    db = memory_db
+
+    db.create_observation(
+        repo=tier_repo,
+        event_type="agent_turn",
+        content=(
+            "user: Never auto-cross-write learning into memory.\n"
+            "assistant: Agreed — that is a hard constraint for P7 vs P6.\n"
+            "facts: user_preference, constraint\n"
+            "[constraint] Never auto-cross-write learning into memory."
+        ),
+        confidence=0.35,
+    )
+
+    engine = ReconciliationEngine(db)
+    stats = engine.run(tier_repo)
+
+    assert stats.get("chat_rules_suggested", 0) >= 1
+    findings = db.list_findings(tier_repo, status="pending")
+    assert any(f["finding_type"] == "promotion_candidate" for f in findings)

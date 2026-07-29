@@ -246,6 +246,17 @@ def _poll_chat_observations_sync(
     session_start_time: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Sync poll body — run via asyncio.to_thread from the poller loop."""
+    from .sqlite_guard import serialized_sqlite_write
+
+    with serialized_sqlite_write():
+        return _poll_chat_observations_sync_locked(db, repo, session_start_time)
+
+
+def _poll_chat_observations_sync_locked(
+    db: MemoryDatabase,
+    repo: str,
+    session_start_time: Optional[int] = None,
+) -> Dict[str, Any]:
     ready = _check_observation_ready(db)
     if not ready:
         return {"recorded": 0}

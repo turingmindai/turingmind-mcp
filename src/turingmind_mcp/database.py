@@ -483,22 +483,38 @@ class MemoryDatabase:
                     content_rowid='rowid'
                 )
             """)
+            for trigger_name in ("memory_fts_ai", "memory_fts_au", "memory_fts_ad"):
+                cursor.execute(f"DROP TRIGGER IF EXISTS {trigger_name}")
             cursor.execute("""
-                CREATE TRIGGER IF NOT EXISTS memory_fts_ai AFTER INSERT ON memory_entries BEGIN
-                    INSERT INTO memory_fts(rowid, content) VALUES (new.rowid, new.content);
+                CREATE TRIGGER memory_fts_ai AFTER INSERT ON memory_entries BEGIN
+                    INSERT INTO memory_fts(rowid, content)
+                    SELECT new.rowid, new.content WHERE new.type != 'session_context';
                 END
             """)
             cursor.execute("""
-                CREATE TRIGGER IF NOT EXISTS memory_fts_ad AFTER DELETE ON memory_entries BEGIN
+                CREATE TRIGGER memory_fts_ad AFTER DELETE ON memory_entries BEGIN
                     INSERT INTO memory_fts(memory_fts, rowid, content) VALUES ('delete', old.rowid, old.content);
                 END
             """)
+            # session_context is never indexed — skip FTS delete for those rows
+            # (deleting a missing FTS rowid can corrupt the external-content index).
             cursor.execute("""
-                CREATE TRIGGER IF NOT EXISTS memory_fts_au AFTER UPDATE OF content ON memory_entries BEGIN
-                    INSERT INTO memory_fts(memory_fts, rowid, content) VALUES ('delete', old.rowid, old.content);
-                    INSERT INTO memory_fts(rowid, content) VALUES (new.rowid, new.content);
+                CREATE TRIGGER memory_fts_au AFTER UPDATE OF content, type, status ON memory_entries BEGIN
+                    INSERT INTO memory_fts(memory_fts, rowid, content)
+                    SELECT 'delete', old.rowid, old.content WHERE old.type != 'session_context';
+                    INSERT INTO memory_fts(rowid, content)
+                    SELECT new.rowid, new.content WHERE new.type != 'session_context';
                 END
             """)
+            try:
+                cursor.execute("""
+                    INSERT INTO memory_fts(memory_fts, rowid, content)
+                    SELECT 'delete', m.rowid, m.content
+                    FROM memory_entries m WHERE m.type = 'session_context'
+                """)
+            except sqlite3.DatabaseError as e:
+                logger.warning("FTS session_context purge skipped: %s", e)
+                self.repair_memory_fts(cursor)
 
             # Backfill entries created before the FTS table existed
             if not existed:
@@ -509,6 +525,21 @@ class MemoryDatabase:
         except sqlite3.OperationalError as e:
             logger.warning(f"FTS5 unavailable, memory search falls back to LIKE: {e}")
             self.conn.rollback()
+            return False
+
+    def repair_memory_fts(self, cursor: Optional[Any] = None) -> bool:
+        """Rebuild the FTS5 index from memory_entries after corruption or drift."""
+        cur = cursor or self.conn.cursor()
+        try:
+            cur.execute("INSERT INTO memory_fts(memory_fts) VALUES ('rebuild')")
+            if cursor is None:
+                self.conn.commit()
+            logger.info("Rebuilt memory_fts index from memory_entries")
+            return True
+        except sqlite3.DatabaseError as exc:
+            logger.warning("FTS rebuild failed: %s", exc)
+            if cursor is None:
+                self.conn.rollback()
             return False
 
     @staticmethod
@@ -637,6 +668,43 @@ class MemoryDatabase:
             result["security_tags"] = json.loads(result["security_tags"])
         return result
 
+    def find_active_session_context(
+        self, repo: str, content: str, scope: str
+    ) -> Optional[Dict[str, Any]]:
+        """Return an active, non-expired session_context with exact repo+content+scope."""
+        cursor = self.conn.cursor()
+        cursor.execute(
+            """
+            SELECT * FROM memory_entries
+            WHERE repo = ? AND type = 'session_context' AND status = 'active'
+              AND content = ? AND scope = ?
+              AND (expires_at IS NULL OR expires_at > datetime('now'))
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            (repo, content, scope),
+        )
+        row = cursor.fetchone()
+        if not row:
+            return None
+        result = dict(row)
+        if result.get("security_tags"):
+            result["security_tags"] = json.loads(result["security_tags"])
+        return result
+
+    def touch_session_context(self, memory_id: str, expires_at: datetime) -> None:
+        """Refresh expiry for an existing session_context (dedupe hit)."""
+        cursor = self.conn.cursor()
+        cursor.execute(
+            """
+            UPDATE memory_entries
+            SET expires_at = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE memory_id = ?
+            """,
+            (expires_at.isoformat(), memory_id),
+        )
+        self.conn.commit()
+
     def upsert_memory_embedding(
         self,
         memory_id: str,
@@ -695,7 +763,11 @@ class MemoryDatabase:
         cursor = self.conn.cursor()
         offset = (page - 1) * limit
 
-        use_fts = bool(search) and getattr(self, "_fts_enabled", False)
+        use_fts = (
+            bool(search)
+            and getattr(self, "_fts_enabled", False)
+            and memory_type != "session_context"
+        )
 
         if use_fts:
             query = """
@@ -721,6 +793,9 @@ class MemoryDatabase:
         if scope:
             query += f" AND ({prefix}scope = ? OR {prefix}scope = 'repo')"
             params.append(scope)
+
+        if search and memory_type != "session_context":
+            query += f" AND {prefix}type != 'session_context'"
 
         from .git_context import branch_memory_ranking_enabled
 
@@ -1082,12 +1157,33 @@ class MemoryDatabase:
             self.conn.commit()
         return observation_id
 
+    def count_observations(
+        self,
+        repo: str,
+        status: Optional[str] = "pending",
+        event_type: Optional[str] = None,
+    ) -> int:
+        """Count observations matching repo/status/event_type filters."""
+        cursor = self.conn.cursor()
+        query = "SELECT COUNT(*) FROM observations WHERE repo = ?"
+        params: List[Any] = [repo]
+        if status and status != "all":
+            query += " AND status = ?"
+            params.append(status)
+        if event_type:
+            query += " AND event_type = ?"
+            params.append(event_type)
+        cursor.execute(query, params)
+        row = cursor.fetchone()
+        return int(row[0]) if row else 0
+
     def list_observations(
         self,
         repo: str,
         status: Optional[str] = "pending",
         event_type: Optional[str] = None,
         limit: int = 100,
+        order: str = "desc",
     ) -> List[Dict[str, Any]]:
         """List observations, defaulting to those awaiting reconciliation."""
         cursor = self.conn.cursor()
@@ -1099,7 +1195,8 @@ class MemoryDatabase:
         if event_type:
             query += " AND event_type = ?"
             params.append(event_type)
-        query += " ORDER BY created_at DESC LIMIT ?"
+        direction = "ASC" if order.lower() == "asc" else "DESC"
+        query += f" ORDER BY created_at {direction} LIMIT ?"
         params.append(limit)
         cursor.execute(query, params)
         results = []
@@ -1134,6 +1231,24 @@ class MemoryDatabase:
         )
         self.conn.commit()
         return cursor.rowcount > 0
+
+    def expire_stale_pending_observations(self, repo: str, max_age_hours: int) -> int:
+        """Reject pending observations older than max_age_hours (never promoted)."""
+        if max_age_hours <= 0:
+            return 0
+        cursor = self.conn.cursor()
+        cursor.execute(
+            """
+            UPDATE observations
+            SET status = 'rejected', reconciled_at = CURRENT_TIMESTAMP
+            WHERE repo = ?
+                AND status = 'pending'
+                AND created_at < datetime('now', ?)
+            """,
+            (repo, f"-{int(max_age_hours)} hours"),
+        )
+        self.conn.commit()
+        return cursor.rowcount
 
     # Reconciliation Findings / Runs
     def create_finding(

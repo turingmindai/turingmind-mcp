@@ -468,6 +468,47 @@ Tool(
     },
 ),
 Tool(
+    name="turingmind_ground",
+    description=(
+        "One-shot memory grounding for a repo: explicit rules, high-confidence "
+        "learned patterns, curated working-set session cards, and top decision-queue "
+        "actions. Prefer this over separate list_memory + get_decision_queue calls "
+        "at session start. Context may also be in .turingmind/recalled.md."
+    ),
+    inputSchema={
+        "type": "object",
+        "properties": {
+            "repo": {"type": "string", "description": "Repository (owner/repo)"},
+            "files": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Optional files about to be touched (scopes recall)",
+            },
+            "query": {
+                "type": "string",
+                "description": "Optional search keywords to rank memories",
+            },
+            "limit": {
+                "type": "integer",
+                "description": "Max rules/patterns each (default 10)",
+                "default": 10,
+            },
+            "queue_limit": {
+                "type": "integer",
+                "description": "Max decision-queue actions (default 5)",
+                "default": 5,
+            },
+            "scope": {
+                "type": "string",
+                "enum": ["memory", "governed"],
+                "description": "Decision-queue scope filter",
+                "default": "memory",
+            },
+        },
+        "required": ["repo"],
+    },
+),
+Tool(
     name="turingmind_detect_conflicts",
     description=(
         "Detect conflicts between memory entries. "

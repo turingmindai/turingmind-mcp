@@ -58,7 +58,7 @@ async def handle_get_edit_reasoning(arguments: dict, ctx: ToolContext) -> list[T
                             "file": file_path,
                         }
                     ],
-                )
+                )[0]
         if commit_hash:
             db.save_edit_reasoning(
                 repo=repo,

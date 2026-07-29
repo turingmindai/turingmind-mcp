@@ -67,7 +67,7 @@ class TestMemoryManager(unittest.TestCase):
 
     def test_create_session_context(self):
         """Test creating session context."""
-        memory_id = self.manager.create_session_context(
+        memory_id, deduped = self.manager.create_session_context(
             repo="test/repo",
             content="Working on authentication feature",
             scope="auth.py",
@@ -81,9 +81,46 @@ class TestMemoryManager(unittest.TestCase):
         )
 
         self.assertIsNotNone(memory_id)
+        self.assertFalse(deduped)
         entry = self.db.get_memory_entry(memory_id)
         self.assertEqual(entry["type"], "session_context")
         self.assertIsNotNone(entry.get("expires_at"))
+
+    def test_create_session_context_dedupes_identical_writes(self):
+        """Identical repo+content+scope must not create a second row."""
+        content = "1 code file(s) changed — files: auth.py"
+        scope = "auth.py"
+        id1, _ = self.manager.create_session_context(
+            repo="test/repo",
+            content=content,
+            scope=scope,
+            evidence=[],
+        )
+        id2, deduped = self.manager.create_session_context(
+            repo="test/repo",
+            content=content,
+            scope=scope,
+            evidence=[],
+        )
+        self.assertEqual(id1, id2)
+        self.assertTrue(deduped)
+        active = self.db.list_memory_entries(
+            repo="test/repo", memory_type="session_context", status="active"
+        )
+        matching = [e for e in active if e["content"] == content and e["scope"] == scope]
+        self.assertEqual(len(matching), 1)
+
+    def test_create_session_context_allows_different_scope(self):
+        """Same content with different scope is a distinct session note."""
+        content = "1 code file(s) changed — files: auth.py"
+        id1, _ = self.manager.create_session_context(
+            repo="test/repo", content=content, scope="auth.py", evidence=[]
+        )
+        id2, deduped = self.manager.create_session_context(
+            repo="test/repo", content=content, scope="other.py", evidence=[]
+        )
+        self.assertNotEqual(id1, id2)
+        self.assertFalse(deduped)
 
     def test_detect_conflicts(self):
         """Test conflict detection."""

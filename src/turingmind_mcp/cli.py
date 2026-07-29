@@ -161,7 +161,7 @@ def store_edit_reasoning(
                                 "file": file_path,
                             }
                         ],
-                    )
+                    )[0]
                 except Exception as e:
                     print(f"⚠️  Warning: Failed to create session context for {file_path}: {e}", file=sys.stderr)
                     # Continue processing other files

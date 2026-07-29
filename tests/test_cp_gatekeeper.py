@@ -12,6 +12,9 @@ async def test_cp_gatekeeper_policy_interceptor(memory_db, tier_repo, monkeypatc
     # Override singleton db inside server module
     import turingmind_mcp.server as mcp_server
     monkeypatch.setattr(mcp_server, "_db_instance", memory_db)
+    # Spec tools require governed groups (memory profile hides them).
+    monkeypatch.setenv("TURINGMIND_PROFILE", "governed")
+    monkeypatch.setenv("TURINGMIND_ENABLED_TOOL_GROUPS", "login,code_intelligence,v2_engine")
     
     composer_id = f"composer-gk-{uuid.uuid4()}"
     session_id = str(uuid.uuid4())

@@ -449,13 +449,29 @@ def check_control_plane_policies(repo: str, db: MemoryDatabase) -> Optional[str]
     except Exception as e:
         logger.debug(f"Failed to check session policy: {e}")
 
-    # 2. Check for unresolved pending findings (TM-QUEUE-003)
+    # 2. Unresolved *actionable* criticals only (TM-QUEUE-003).
+    # Do not warn on queue length — length floods were caused by telemetry noise.
+    _QUEUE_NOISE_TYPES = frozenset({
+        "promotion_candidate",
+        "duplicate_merge",
+        "semantic_duplicate",
+        "stale_memory",
+        "invalidation_decay",
+        "scope_churn",
+        "archive_branch_memories",
+    })
     try:
         findings = db.list_findings(repo=repo, status="pending")
-        if len(findings) > 0:
-            has_critical = any(f.get("severity") == "critical" for f in findings)
-            if has_critical or len(findings) >= 50:
-                warnings.append("⚠️ **TuringMind Policy Warning [TM-QUEUE-003]:** Active findings queue threshold exceeded or unresolved critical findings exist.")
+        has_actionable_critical = any(
+            f.get("severity") == "critical"
+            and (f.get("finding_type") or "") not in _QUEUE_NOISE_TYPES
+            for f in findings
+        )
+        if has_actionable_critical:
+            warnings.append(
+                "⚠️ **TuringMind Policy Warning [TM-QUEUE-003]:** "
+                "Unresolved actionable critical finding(s) in the decision queue."
+            )
     except Exception as e:
         logger.debug(f"Failed to check findings queue policy: {e}")
 

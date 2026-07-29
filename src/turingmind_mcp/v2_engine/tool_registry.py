@@ -38,6 +38,7 @@ _GOLDEN_NAMES = {
     "turingmind_save_memory",
     "turingmind_list_memory",
     "turingmind_delete_memory",
+    "turingmind_ground",
     "turingmind_detect_conflicts",
     "turingmind_resolve_conflict",
     # Audit trail — enterprise trust and agent debugging

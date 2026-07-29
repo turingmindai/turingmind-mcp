@@ -50,3 +50,9 @@ def serialized_sqlite_write() -> Generator[None, None, None]:
     """Hold the process-wide write lock for mutating API handlers."""
     with WRITE_LOCK:
         yield
+
+
+def run_serialized_write(func, /, *args, **kwargs):
+    """Run a mutating callable under the process-wide SQLite write lock."""
+    with serialized_sqlite_write():
+        return func(*args, **kwargs)

@@ -42,6 +42,7 @@ logger = logging.getLogger("turingmind-mcp.observation-capture")
 # ── Event types (stable contract for reconcile passes) ───────────────────────
 # Reconciliation can filter/group on these without parsing free-text content.
 EVENT_CHAT_EXCHANGE = "chat_exchange"
+EVENT_AGENT_TURN = "agent_turn"
 EVENT_VERIFICATION_SUCCESS = "verification_success"
 EVENT_GIT_REVERT = "git_revert"
 EVENT_PRE_PUSH_HIGH = "pre_push_high_gap"
