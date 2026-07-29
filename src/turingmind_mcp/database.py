@@ -266,6 +266,24 @@ class MemoryDatabase:
             )
         """)
 
+        # Turn-scoped edit contracts (IDE-agnostic path scope)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS edit_scopes (
+                scope_id TEXT PRIMARY KEY,
+                repo TEXT NOT NULL,
+                conversation_id TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL,
+                source TEXT,
+                intent TEXT,
+                prefixes TEXT,
+                modules TEXT,
+                files TEXT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(repo, conversation_id)
+            )
+        """)
+
         # Observations Table — draft beliefs captured by hooks/plugins.
         # These are hypotheses, not truth: reconciliation passes (or an
         # explicit accept) promote them into memory_entries; until then they
@@ -449,6 +467,7 @@ class MemoryDatabase:
             "CREATE INDEX IF NOT EXISTS idx_relationships_target ON code_relationships(target_entity_id)",
             "CREATE INDEX IF NOT EXISTS idx_git_commits_repo ON git_commits(repo)",
             "CREATE INDEX IF NOT EXISTS idx_reasoning_repo_commit ON edit_reasoning(repo, commit_hash)",
+            "CREATE INDEX IF NOT EXISTS idx_edit_scopes_repo ON edit_scopes(repo, updated_at)",
             "CREATE INDEX IF NOT EXISTS idx_coding_sessions_composer ON coding_sessions(composer_id)",
             "CREATE INDEX IF NOT EXISTS idx_coding_sessions_repo ON coding_sessions(repo)",
             "CREATE INDEX IF NOT EXISTS idx_coding_sessions_expires ON coding_sessions(expires_at)",
@@ -2059,6 +2078,105 @@ class MemoryDatabase:
             (repo, commit_hash),
         )
         self.conn.commit()
+
+    # Edit scope contracts (turn-scoped path scope)
+    def upsert_edit_scope(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Insert or replace an edit-scope contract for repo + conversation."""
+        repo = payload["repo"]
+        conversation_id = (payload.get("conversation_id") or "").strip()
+        scope_id = payload.get("scope_id") or str(uuid.uuid4())
+        cursor = self.conn.cursor()
+        existing = cursor.execute(
+            """
+            SELECT scope_id FROM edit_scopes
+            WHERE repo = ? AND conversation_id = ?
+            """,
+            (repo, conversation_id),
+        ).fetchone()
+        if existing:
+            scope_id = existing["scope_id"]
+            cursor.execute(
+                """
+                UPDATE edit_scopes SET
+                    status = ?, source = ?, intent = ?,
+                    prefixes = ?, modules = ?, files = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE scope_id = ?
+                """,
+                (
+                    payload.get("status") or "declared",
+                    payload.get("source"),
+                    payload.get("intent"),
+                    json.dumps(payload.get("prefixes") or []),
+                    json.dumps(payload.get("modules") or []),
+                    json.dumps(payload.get("files") or []),
+                    scope_id,
+                ),
+            )
+        else:
+            cursor.execute(
+                """
+                INSERT INTO edit_scopes (
+                    scope_id, repo, conversation_id, status, source, intent,
+                    prefixes, modules, files
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    scope_id,
+                    repo,
+                    conversation_id,
+                    payload.get("status") or "declared",
+                    payload.get("source"),
+                    payload.get("intent"),
+                    json.dumps(payload.get("prefixes") or []),
+                    json.dumps(payload.get("modules") or []),
+                    json.dumps(payload.get("files") or []),
+                ),
+            )
+        self.conn.commit()
+        stored = self.get_edit_scope(repo=repo, conversation_id=conversation_id or None)
+        return stored or {"scope_id": scope_id, **payload}
+
+    def get_edit_scope(
+        self,
+        *,
+        repo: str,
+        conversation_id: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Load edit scope for repo. Falls back to repo-default ('') conversation."""
+        cursor = self.conn.cursor()
+        conv = (conversation_id or "").strip()
+        row = cursor.execute(
+            """
+            SELECT * FROM edit_scopes
+            WHERE repo = ? AND conversation_id = ?
+            """,
+            (repo, conv),
+        ).fetchone()
+        if not row and conv:
+            row = cursor.execute(
+                """
+                SELECT * FROM edit_scopes
+                WHERE repo = ? AND conversation_id = ''
+                ORDER BY updated_at DESC LIMIT 1
+                """,
+                (repo,),
+            ).fetchone()
+        if not row:
+            return None
+        data = dict(row)
+        for key in ("prefixes", "modules", "files"):
+            raw = data.get(key)
+            if isinstance(raw, str):
+                try:
+                    data[key] = json.loads(raw)
+                except (json.JSONDecodeError, TypeError):
+                    data[key] = []
+            elif raw is None:
+                data[key] = []
+        if data.get("conversation_id") == "":
+            data["conversation_id"] = None
+        return data
 
     # Edit Reasoning Operations
     def save_edit_reasoning(

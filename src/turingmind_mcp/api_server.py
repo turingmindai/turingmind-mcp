@@ -1043,6 +1043,116 @@ def propose_commit_candidates(payload: CommitCandidatePayload):
         raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
 
 
+class EditScopePayload(BaseModel):
+    repo: str
+    status: str = "declared"
+    intent: str = ""
+    prefixes: list[str] = []
+    modules: list[str] = []
+    files: list[str] = []
+    paths: list[str] = []
+    prompt: str = ""
+    attachments: list[str] = []
+    conversation_id: Optional[str] = None
+    source: str = "api"
+
+
+class EditScopeCheckPayload(BaseModel):
+    repo: str
+    files: list[str] = []
+    cluster_type: Optional[str] = None
+    cluster_severity: Optional[str] = None
+    conversation_id: Optional[str] = None
+    ensure_provisional: bool = False
+
+
+@app.put("/api/v2/edit-scope")
+def put_edit_scope(payload: EditScopePayload):
+    """Declare/seed/amend the turn-scoped edit path contract (IDE-agnostic)."""
+    if not payload.repo:
+        raise HTTPException(status_code=400, detail="repo is required")
+    from .edit_scope import (
+        build_scope_payload,
+        declare_scope,
+        seed_scope_from_prompt,
+    )
+
+    try:
+        db = _memory_db()
+        if payload.prompt and not (payload.prefixes or payload.files or payload.modules or payload.paths):
+            body = seed_scope_from_prompt(
+                repo=payload.repo,
+                prompt=payload.prompt,
+                attachments=payload.attachments,
+                conversation_id=payload.conversation_id,
+            )
+            if payload.status:
+                body["status"] = payload.status
+            if payload.source:
+                body["source"] = payload.source
+        else:
+            body = build_scope_payload(
+                repo=payload.repo,
+                status=payload.status,
+                intent=payload.intent,
+                prefixes=payload.prefixes or None,
+                modules=payload.modules or None,
+                files=payload.files or None,
+                paths=payload.paths or None,
+                source=payload.source or "api",
+                conversation_id=payload.conversation_id,
+            )
+        scope = declare_scope(db, body)
+        return {"status": "ok", "scope": scope}
+    except Exception as e:
+        logger.exception("edit-scope put failed")
+        raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
+
+
+@app.get("/api/v2/edit-scope")
+def get_edit_scope_api(
+    repo: str,
+    conversation_id: Optional[str] = None,
+):
+    """Fetch the current edit-scope contract for a repo."""
+    if not repo:
+        raise HTTPException(status_code=400, detail="repo is required")
+    from .edit_scope import get_scope
+
+    try:
+        scope = get_scope(
+            _memory_db(),
+            repo=repo,
+            conversation_id=conversation_id,
+        )
+        return {"repo": repo, "scope": scope}
+    except Exception as e:
+        logger.exception("edit-scope get failed")
+        raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
+
+
+@app.post("/api/v2/edit-scope/check")
+def check_edit_scope_api(payload: EditScopeCheckPayload):
+    """Check edited files against the stored edit-scope contract."""
+    if not payload.repo:
+        raise HTTPException(status_code=400, detail="repo is required")
+    from .edit_scope import check_against_store
+
+    try:
+        return check_against_store(
+            _memory_db(),
+            repo=payload.repo,
+            files=payload.files,
+            conversation_id=payload.conversation_id,
+            cluster_type=payload.cluster_type,
+            cluster_severity=payload.cluster_severity,
+            ensure_provisional=payload.ensure_provisional,
+        )
+    except Exception as e:
+        logger.exception("edit-scope check failed")
+        raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
+
+
 @app.get("/api/v2/ground")
 def get_ground(
     repo: Optional[str] = None,

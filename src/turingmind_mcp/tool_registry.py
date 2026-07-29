@@ -477,6 +477,121 @@ Tool(
     },
 ),
 Tool(
+    name="turingmind_declare_edit_scope",
+    description=(
+        "Declare or amend the turn-scoped edit path contract for a repo. "
+        "Lock intent + in-scope prefixes/files/modules before expanding edits. "
+        "Does not block native Write — hosts check via turingmind_check_edit_scope. "
+        "Pass prompt to seed from text, or explicit prefixes/files/modules/paths."
+    ),
+    inputSchema={
+        "type": "object",
+        "properties": {
+            "repo": {"type": "string", "description": "Repository (owner/repo)"},
+            "status": {
+                "type": "string",
+                "enum": ["undeclared", "seeded", "provisional", "declared", "amended"],
+                "description": "Contract strength (default declared)",
+                "default": "declared",
+            },
+            "intent": {"type": "string", "description": "One-line change-set goal"},
+            "prefixes": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "In-scope directory prefixes (e.g. src/auth/)",
+            },
+            "modules": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "In-scope module keys (e.g. src/auth)",
+            },
+            "files": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Exact in-scope file paths",
+            },
+            "paths": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Paths to derive prefixes/modules/files from",
+            },
+            "prompt": {
+                "type": "string",
+                "description": "Optional user prompt to seed paths from",
+            },
+            "attachments": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Optional attachment paths for seeding",
+            },
+            "conversation_id": {
+                "type": "string",
+                "description": "Optional chat/composer id for per-turn scope",
+            },
+            "source": {
+                "type": "string",
+                "description": "Who declared (mcp, prompt_seed, agent, …)",
+            },
+        },
+        "required": ["repo"],
+    },
+),
+Tool(
+    name="turingmind_get_edit_scope",
+    description=(
+        "Get the current turn-scoped edit path contract for a repo "
+        "(optional conversation_id)."
+    ),
+    inputSchema={
+        "type": "object",
+        "properties": {
+            "repo": {"type": "string", "description": "Repository (owner/repo)"},
+            "conversation_id": {
+                "type": "string",
+                "description": "Optional chat/composer id",
+            },
+        },
+        "required": ["repo"],
+    },
+),
+Tool(
+    name="turingmind_check_edit_scope",
+    description=(
+        "Check whether edited files breach the turn-scoped edit contract. "
+        "Returns breached=true with out_of_scope paths or undeclared-wide reason. "
+        "IDE-agnostic — call after a host's edit cluster or before expanding scope."
+    ),
+    inputSchema={
+        "type": "object",
+        "properties": {
+            "repo": {"type": "string", "description": "Repository (owner/repo)"},
+            "files": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Edited file paths to check",
+            },
+            "cluster_type": {
+                "type": "string",
+                "description": "Optional classifyCluster type (cross_module, …)",
+            },
+            "cluster_severity": {
+                "type": "string",
+                "description": "Optional cluster severity",
+            },
+            "conversation_id": {
+                "type": "string",
+                "description": "Optional chat/composer id",
+            },
+            "ensure_provisional": {
+                "type": "boolean",
+                "description": "If no contract, seed provisional from first files",
+                "default": False,
+            },
+        },
+        "required": ["repo", "files"],
+    },
+),
+Tool(
     name="turingmind_ground",
     description=(
         "One-shot memory grounding for a repo or multi-root workspace: explicit rules, "
