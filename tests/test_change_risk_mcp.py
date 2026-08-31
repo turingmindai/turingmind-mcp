@@ -38,15 +38,17 @@ class FakeClient:
         return self.response
 
 
-def _ctx(client: FakeClient) -> ToolContext:
-    return ToolContext(
-        client=client,
-        api_url="http://test",
-        headers={"Authorization": "Bearer test"},
-        logger=logging.getLogger("test_change_risk_mcp"),
-        save_api_key=lambda *_a, **_k: "",
-        version="test",
-    )
+def _ctx(client: FakeClient, **kwargs: Any) -> ToolContext:
+    defaults: dict[str, Any] = {
+        "client": client,
+        "api_url": "http://test",
+        "headers": {"Authorization": "Bearer test"},
+        "logger": logging.getLogger("test_change_risk_mcp"),
+        "save_api_key": lambda *_a, **_k: "",
+        "version": "test",
+    }
+    defaults.update(kwargs)
+    return ToolContext(**defaults)
 
 
 @pytest.mark.asyncio
@@ -116,3 +118,36 @@ def test_register_names():
     assert "evaluate_change_risk" in registry
     assert "turingmind_evaluate_change_risk" in registry
     assert "record_change_event" in registry
+
+
+@pytest.mark.asyncio
+async def test_evaluate_uses_get_config_key_when_headers_and_env_empty(monkeypatch):
+    """Local handler path passes headers={} and often has no process env key."""
+    monkeypatch.delenv("TURINGMIND_API_KEY", raising=False)
+    client = FakeClient(FakeResponse(200, {"advisory": True}))
+    listed = await handle_evaluate_change_risk(
+        {"repo": "acme/pay"},
+        _ctx(
+            client,
+            headers={},
+            get_config=lambda: ("http://from-config", "tmk_from_config"),
+        ),
+    )
+    body = json.loads(listed[0].text)
+    assert body["advisory"] is True
+    assert client.calls[0]["headers"]["Authorization"] == "Bearer tmk_from_config"
+
+
+@pytest.mark.asyncio
+async def test_evaluate_env_key_wins_over_get_config(monkeypatch):
+    monkeypatch.setenv("TURINGMIND_API_KEY", "tmk_from_env")
+    client = FakeClient(FakeResponse(200, {"advisory": True}))
+    await handle_evaluate_change_risk(
+        {"repo": "acme/pay"},
+        _ctx(
+            client,
+            headers={},
+            get_config=lambda: ("http://from-config", "tmk_from_config"),
+        ),
+    )
+    assert client.calls[0]["headers"]["Authorization"] == "Bearer tmk_from_env"

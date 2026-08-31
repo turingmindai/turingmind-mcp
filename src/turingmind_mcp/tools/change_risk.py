@@ -23,21 +23,51 @@ def register(registry: dict) -> None:
         registry[name] = handle_record_change_event
 
 
+def _config_pair(ctx: ToolContext) -> tuple[str, str]:
+    """Return ``(api_url, api_key)`` from ``ctx.get_config`` if present."""
+    getter = getattr(ctx, "get_config", None)
+    if not callable(getter):
+        return "", ""
+    try:
+        pair = getter()
+    except Exception:
+        return "", ""
+    if not pair:
+        return "", ""
+    url, key = pair[0], pair[1] if len(pair) > 1 else ""
+    return str(url or "").strip(), str(key or "").strip()
+
+
 def _api_base(ctx: ToolContext) -> str:
+    cfg_url, _cfg_key = _config_pair(ctx)
     for candidate in (
         getattr(ctx, "api_url", None),
         os.environ.get("TURINGMIND_API_URL"),
         os.environ.get("TURINGMIND_LOCAL_API_URL"),
+        cfg_url,
     ):
         if candidate and str(candidate).strip():
             return str(candidate).rstrip("/")
     return "http://127.0.0.1:8477"
 
 
+def _api_key(ctx: ToolContext) -> str:
+    """Env first, then ``~/.turingmind/config`` via ``ctx.get_config``.
+
+    The stdio local-handler path passes empty ``headers``, so process env
+    alone is not enough for Cursor MCP.
+    """
+    env_key = os.environ.get("TURINGMIND_API_KEY", "").strip()
+    if env_key:
+        return env_key
+    _cfg_url, cfg_key = _config_pair(ctx)
+    return cfg_key
+
+
 def _headers(ctx: ToolContext) -> dict[str, str]:
     headers = dict(getattr(ctx, "headers", None) or {})
     if "Authorization" not in headers and "authorization" not in headers:
-        api_key = os.environ.get("TURINGMIND_API_KEY", "").strip()
+        api_key = _api_key(ctx)
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
     headers.setdefault("Accept", "application/json")
