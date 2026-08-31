@@ -17,7 +17,16 @@ HANDLERS: dict[str, ToolHandler] = {}
 
 def register_all() -> None:
     """Import all tool modules so they register their handlers."""
-    from . import auth, code_index, code_review, edit_scope_tools, edit_tools, login, memory
+    from . import (
+        auth,
+        cloud_v2,
+        code_index,
+        code_review,
+        edit_scope_tools,
+        edit_tools,
+        login,
+        memory,
+    )
     from ..v2_engine import handlers as v2_handlers
 
     login.register(HANDLERS)
@@ -29,6 +38,8 @@ def register_all() -> None:
     edit_scope_tools.register(HANDLERS)
     # v2 Constraint Engine — registered last so v2 tools take precedence
     v2_handlers.register(HANDLERS)
+    # HTTP /api/v2 wrappers after v2 so Lane C names are not overwritten
+    cloud_v2.register(HANDLERS)
 
 
 def get_handler(name: str) -> ToolHandler | None:

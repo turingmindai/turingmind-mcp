@@ -577,6 +577,74 @@ V2_TOOLS: list[Tool] = [
             "required": ["repo"],
         },
     ),
+    Tool(
+        name="check_specnode_contract",
+        description=(
+            "HTTP GET TURINGMIND_API_URL/api/v2/graph/nodes/{node_id}?repo= — "
+            "return the SpecNode contract and whether invariants are present. "
+            "Does not read local SQLite or Mongo."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "repo": {"type": "string", "description": "Repository (owner/repo)"},
+                "node_id": {"type": "string", "description": "SpecNode ID"},
+            },
+            "required": ["repo", "node_id"],
+        },
+    ),
+    Tool(
+        name="turingmind_check_specnode_contract",
+        description=(
+            "Alias of check_specnode_contract. HTTP GET /api/v2/graph/nodes/{node_id}."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "repo": {"type": "string", "description": "Repository (owner/repo)"},
+                "node_id": {"type": "string", "description": "SpecNode ID"},
+            },
+            "required": ["repo", "node_id"],
+        },
+    ),
+    Tool(
+        name="query_repo_memory",
+        description=(
+            "HTTP GET TURINGMIND_API_URL/api/v2/memory?repo=&search=&type=&limit= — "
+            "recall cloud/local v2 memory. Does not reimplement Mongo."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "repo": {"type": "string", "description": "Repository (owner/repo)"},
+                "search": {"type": "string", "description": "Full-text search query"},
+                "type": {
+                    "type": "string",
+                    "description": "Memory category (explicit_rule, learned_pattern, …)",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Max results (default 10)",
+                    "default": 10,
+                },
+            },
+            "required": ["repo"],
+        },
+    ),
+    Tool(
+        name="turingmind_query_repo_memory",
+        description="Alias of query_repo_memory. HTTP GET /api/v2/memory.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "repo": {"type": "string", "description": "Repository (owner/repo)"},
+                "search": {"type": "string", "description": "Full-text search query"},
+                "type": {"type": "string", "description": "Memory category"},
+                "limit": {"type": "integer", "description": "Max results", "default": 10},
+            },
+            "required": ["repo"],
+        },
+    ),
     # ──────────────────────────────────────────────────────────────────────────
     # PHASE 2.5b: SECURITY RULE LIFECYCLE
     # ──────────────────────────────────────────────────────────────────────────
