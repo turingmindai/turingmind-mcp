@@ -774,6 +774,56 @@ V2_TOOLS: list[Tool] = [
             "required": ["node_id", "intent_justification"],
         },
     ),
+    Tool(
+        name="turingmind_evaluate_change_risk",
+        description=(
+            "HTTP: POST /api/v2/change-risk/evaluate. Returns an advisory "
+            "Change Risk Certificate. Does not merge pull requests. "
+            "Probability is a fraction in [0, 1]; expected loss = P × exposure."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "repo": {"type": "string", "description": "Repository (owner/repo)"},
+                "diff": {"type": "string", "description": "Optional unified diff"},
+                "files": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Repo-relative paths (optional if diff is set)",
+                },
+                "env": {
+                    "type": "string",
+                    "description": "Target environment: dev, staging, or prod",
+                },
+                "persist": {
+                    "type": "boolean",
+                    "description": "If true, also write a change_events ledger row",
+                },
+            },
+            "required": ["repo"],
+        },
+    ),
+    Tool(
+        name="turingmind_record_change_event",
+        description=(
+            "HTTP: POST /api/v2/change-events. Persist a predicted change event "
+            "for later outcome calibration. Does not underwrite or merge."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "repo": {"type": "string", "description": "Repository (owner/repo)"},
+                "change_id": {"type": "string"},
+                "agent_id": {"type": "string"},
+                "predicted_loss": {"type": "number", "description": "Expected loss USD"},
+                "decision": {
+                    "type": "string",
+                    "enum": ["AUTO_APPROVE", "REVIEW_REQUIRED", "BLOCKED"],
+                },
+            },
+            "required": ["repo"],
+        },
+    ),
 ]
 
 # ──────────────────────────────────────────────────────────────────────────────

@@ -64,10 +64,16 @@ TOOL_GROUPS = {
         "query_repo_memory",
         "turingmind_query_repo_memory",
     ],
+    "change_risk": {
+        "evaluate_change_risk",
+        "turingmind_evaluate_change_risk",
+        "record_change_event",
+        "turingmind_record_change_event",
+    },
 }
 
 MEMORY_PROFILE_GROUPS = "login,code_intelligence"
-GOVERNED_PROFILE_GROUPS = "login,code_intelligence,v2_engine"
+GOVERNED_PROFILE_GROUPS = "login,code_intelligence,v2_engine,change_risk"
 
 # Default: governed for existing installs; new installs set memory via turingmind-install.sh
 DEFAULT_ENABLED_GROUPS = GOVERNED_PROFILE_GROUPS
