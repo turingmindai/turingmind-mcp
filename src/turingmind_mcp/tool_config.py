@@ -59,6 +59,10 @@ TOOL_GROUPS = {
         "turingmind_bootstrap_codebase",
         "turingmind_sync_codebase",
         "turingmind_sync_cloud",
+        "check_specnode_contract",
+        "turingmind_check_specnode_contract",
+        "query_repo_memory",
+        "turingmind_query_repo_memory",
     ],
 }
 
